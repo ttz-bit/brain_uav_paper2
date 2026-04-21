@@ -6,12 +6,13 @@ import math
 import numpy as np
 
 from paper2.common.types import AircraftState, NoFlyZoneState, TargetTruthState
+from paper2.env_adapter.env_types import EnvObservation, EnvStepInfo, EnvStepResult
 from paper2.env_adapter.scene_sampler import EpisodeInit, sample_episode_init
 from paper2.env_adapter.target_dynamics import (
     TargetMotionInternalState,
     propagate_target_truth,
 )
-from paper2.env_adapter.termination import check_termination
+from paper2.env_adapter.termination import check_termination, is_out_of_area
 
 
 class DynamicTargetEnvPhase1A:
@@ -27,7 +28,7 @@ class DynamicTargetEnvPhase1A:
         self._target_internal: TargetMotionInternalState | None = None
         self._zones: list[NoFlyZoneState] = []
 
-    def reset(self, seed: int | None = None) -> dict[str, Any]:
+    def reset(self, seed: int | None = None) -> EnvObservation:
         if seed is not None:
             self._rng = np.random.default_rng(int(seed))
 
@@ -39,7 +40,7 @@ class DynamicTargetEnvPhase1A:
         self._zones = init_state.no_fly_zones
         return self._build_obs()
 
-    def step(self, action: Any) -> tuple[dict[str, Any], float, bool, dict[str, Any]]:
+    def step(self, action: Any) -> EnvStepResult:
         self._assert_ready()
         action_vec = np.asarray(action, dtype=float).reshape(-1)
         if action_vec.size != 2:
@@ -88,12 +89,20 @@ class DynamicTargetEnvPhase1A:
         )
         dist = float(np.linalg.norm(self._aircraft.pos_world - self._target_truth.pos_world))
         reward = -dist
-        info = {
-            "reason": reason,
-            "distance_to_target": dist,
-            "mode": self._target_truth.motion_mode,
-        }
-        return self._build_obs(), reward, done, info
+        crop_valid = self.get_truth_crop_valid_flag()
+        info = EnvStepInfo(
+            reason=reason,
+            distance_to_target=dist,
+            mode=self._target_truth.motion_mode,
+            crop_valid_flag=crop_valid,
+            target_out_of_bounds=(reason == "target_out_of_bounds"),
+        )
+        return EnvStepResult(
+            observation=self._build_obs(),
+            reward=reward,
+            done=done,
+            info=info,
+        )
 
     def get_aircraft_state(self) -> AircraftState:
         self._assert_ready()
@@ -116,12 +125,17 @@ class DynamicTargetEnvPhase1A:
         center = self._target_truth.pos_world + self._target_truth.vel_world * horizon
         return center.astype(float)
 
-    def _build_obs(self) -> dict[str, Any]:
-        return {
-            "aircraft_pos_world": self.get_aircraft_state().pos_world.copy(),
-            "target_pos_world": self.get_target_truth().pos_world.copy(),
-            "truth_crop_center_world": self.get_truth_crop_center_world().copy(),
-        }
+    def get_truth_crop_valid_flag(self) -> bool:
+        center = self.get_truth_crop_center_world()
+        return not is_out_of_area(center, self._cfg["area"])
+
+    def _build_obs(self) -> EnvObservation:
+        return EnvObservation(
+            aircraft_pos_world=self.get_aircraft_state().pos_world.copy(),
+            target_pos_world=self.get_target_truth().pos_world.copy(),
+            truth_crop_center_world=self.get_truth_crop_center_world().copy(),
+            crop_valid_flag=self.get_truth_crop_valid_flag(),
+        )
 
     def _assert_ready(self) -> None:
         if self._aircraft is None or self._target_truth is None or self._target_internal is None:
