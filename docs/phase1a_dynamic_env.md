@@ -43,3 +43,9 @@ This stage is considered complete when:
 - `scripts/run_phase1a_sanity.py`
 
 Both should pass before moving to phase2 data/render integration work.
+
+`run_phase1a_sanity.py` provides hard-gated acceptance with explicit thresholds,
+writes `outputs/eval/phase1a_sanity/acceptance.json`, and exits with:
+
+- `0` for PASS
+- `1` for FAIL
