@@ -49,3 +49,6 @@ writes `outputs/eval/phase1a_sanity/acceptance.json`, and exits with:
 
 - `0` for PASS
 - `1` for FAIL
+
+Default acceptance profile is `easy` (`--acceptance-profile easy`), and
+`--acceptance-profile full` is kept as a stress profile for reporting.

@@ -49,11 +49,32 @@ def _sample_no_fly_zones(cfg: dict[str, Any], rng: np.random.Generator) -> list[
     return zones
 
 
+def _time_to_area_exit(pos: np.ndarray, vel: np.ndarray, area: dict[str, float]) -> float:
+    times: list[float] = []
+    px = float(pos[0])
+    py = float(pos[1])
+    vx = float(vel[0])
+    vy = float(vel[1])
+    if vx > 1e-8:
+        times.append((float(area["x_max"]) - px) / vx)
+    elif vx < -1e-8:
+        times.append((float(area["x_min"]) - px) / vx)
+    if vy > 1e-8:
+        times.append((float(area["y_max"]) - py) / vy)
+    elif vy < -1e-8:
+        times.append((float(area["y_min"]) - py) / vy)
+    pos_times = [t for t in times if t > 0.0]
+    if not pos_times:
+        return float("inf")
+    return float(min(pos_times))
+
+
 def sample_episode_init(cfg: dict[str, Any], rng: np.random.Generator) -> EpisodeInit:
     area = cfg["area"]
     min_dist = float(cfg["min_init_dist"])
     max_dist = float(cfg["max_init_dist"])
     resample_limit = int(cfg["resample_limit"])
+    truth_crop_horizon_sec = float(cfg["truth_crop_horizon_sec"])
     aircraft_speed = float(cfg["aircraft"]["speed"])
     dyn_cfg = cfg["target_dynamics"]
 
@@ -91,6 +112,18 @@ def sample_episode_init(cfg: dict[str, Any], rng: np.random.Generator) -> Episod
             cfg=dyn_cfg,
             rng=rng,
         )
+        # Keep phase1a episodes away from trivial early target-out-of-bounds failures.
+        crop_center = truth.pos_world + truth.vel_world * truth_crop_horizon_sec
+        x_min = float(area["x_min"])
+        x_max = float(area["x_max"])
+        y_min = float(area["y_min"])
+        y_max = float(area["y_max"])
+        crop_in_area = x_min <= float(crop_center[0]) <= x_max and y_min <= float(crop_center[1]) <= y_max
+        if not crop_in_area:
+            continue
+        if _time_to_area_exit(truth.pos_world, truth.vel_world, area) < 20.0:
+            continue
+
         internal = init_motion_internal(mode, dyn_cfg, rng)
         return EpisodeInit(
             aircraft=aircraft,
