@@ -1,0 +1,19 @@
+dataset:
+  image_size: 128
+  in_channels: 3
+  num_workers: 0
+
+task:
+  name: "single_target_localization"
+  output_dim: 2
+
+train:
+  batch_size: 16
+  epochs: 20
+  lr: 0.001
+  weight_decay: 0.0001
+
+model:
+  ann_name: "ann_tracker_net"
+  snn_name: "snn_tracker_net"
+  snn_T: 4

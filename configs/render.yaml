@@ -1,0 +1,16 @@
+render:
+  patch_size: 128
+  channels: 3
+  pad_mode: "constant"
+
+projection:
+  crop_center_policy: "target_center"
+  gsd: null
+
+synthetic:
+  num_samples_train: 1000
+  num_samples_val: 200
+  num_samples_test: 200
+  max_distractors: 3
+  blur_prob: 0.2
+  noise_prob: 0.3

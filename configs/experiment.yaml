@@ -1,0 +1,68 @@
+experiment:
+  name: "paper2_phase0b_freeze"
+  current_stage: "phase0b_experiment_protocol_freeze"
+
+modes:
+  public_validation:
+    enabled: true
+    description: "公开数据外部视觉验证，不进入闭环规划"
+  synthetic_visual:
+    enabled: true
+    description: "自建 synthetic 图像数据，用于视觉训练与预验证"
+  closed_loop:
+    enabled: false
+    description: "等待论文1物理口径修正后接入正式闭环"
+
+splits:
+  synthetic:
+    train_ratio: 0.70
+    val_ratio: 0.15
+    test_ratio: 0.15
+  public:
+    follow_official_split: true
+
+seeds:
+  global_seed: 42
+  synthetic_generation_seed: 123
+  training_seeds: [1, 2, 3]
+
+outputs:
+  synth_dir: "outputs/synth"
+  train_dir: "outputs/train"
+  eval_dir: "outputs/eval"
+
+record_format:
+  metadata_format: "jsonl"
+  image_ext: ".png"
+
+metrics:
+  visual:
+    - "detection_rate"
+    - "center_l2_error"
+    - "bbox_iou"
+  tracking:
+    - "obs_conf"
+    - "obs_age"
+  planning_future:
+    - "success_rate"
+    - "path_length_ratio"
+    - "min_clearance"
+    - "inference_latency"
+    - "effective_compute"
+
+freeze_policy:
+  frozen_now:
+    - "project_structure"
+    - "schema_keys"
+    - "state_interface_names"
+    - "observation_interface_names"
+    - "evaluation_mode_names"
+    - "output_directory_convention"
+    - "split_definition_logic"
+  not_frozen_yet:
+    - "final_world_unit"
+    - "final_dt"
+    - "final_speed"
+    - "final_no_fly_zone_radius_range"
+    - "final_render_gsd"
+    - "final_closed_loop_metrics_formula"
