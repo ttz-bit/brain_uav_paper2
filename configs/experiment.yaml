@@ -1,6 +1,6 @@
 experiment:
-  name: "paper2_phase0b_freeze"
-  current_stage: "phase0b_experiment_protocol_freeze"
+  name: "paper2_phase1a_dynamic_env"
+  current_stage: "phase1a_dynamic_env_acceptance"
 
 modes:
   public_validation:
@@ -59,6 +59,9 @@ freeze_policy:
     - "evaluation_mode_names"
     - "output_directory_convention"
     - "split_definition_logic"
+    - "phase1a_env_protocol_with_truth_crop_center"
+    - "phase1a_termination_reason_names"
+    - "phase1a_max_steps_as_single_step_budget"
   not_frozen_yet:
     - "final_world_unit"
     - "final_dt"
@@ -66,3 +69,4 @@ freeze_policy:
     - "final_no_fly_zone_radius_range"
     - "final_render_gsd"
     - "final_closed_loop_metrics_formula"
+    - "phase2_render_crop_policy_wiring"
