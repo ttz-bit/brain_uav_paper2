@@ -25,6 +25,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-size", type=int, default=128, help="Square crop size")
     parser.add_argument("--max-sequences", type=int, default=None, help="Process first N sequences only")
     parser.add_argument("--qc-per-split", type=int, default=30, help="Save at most N QC samples per split")
+    parser.add_argument(
+        "--length-mismatch-policy",
+        type=str,
+        default="truncate",
+        choices=["truncate", "skip", "fail"],
+        help="How to handle frame/annotation length mismatch per sequence",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite crops/manifests")
     return parser.parse_args()
 
@@ -153,12 +160,30 @@ def _build_unified_record(
         "gsd": None,
         "world_unit": None,
         "split": split,
-        "source_track": f"seadronessee_sot/{split}/{sequence_id}",
+        "source_track": f"seadronessee_sot/{sequence_id}",
         "meta": {
             "mot_source_relpath": raw_rel,
         },
     }
     return record
+
+
+def resolve_length_mismatch_policy(
+    num_frames: int, num_annotations: int, policy: str
+) -> tuple[str, int, int, int]:
+    extra_frames = max(0, num_frames - num_annotations)
+    extra_annotations = max(0, num_annotations - num_frames)
+    if num_frames == num_annotations:
+        return "aligned", num_frames, extra_frames, extra_annotations
+
+    if policy == "fail":
+        raise RuntimeError(f"Length mismatch: {num_frames} frames vs {num_annotations} annotations")
+    if policy == "skip":
+        return "skip", 0, extra_frames, extra_annotations
+    if policy == "truncate":
+        return "truncate", min(num_frames, num_annotations), extra_frames, extra_annotations
+
+    raise ValueError(f"Unsupported length mismatch policy: {policy}")
 
 
 def process_split(
@@ -168,6 +193,7 @@ def process_split(
     crop_size: int,
     max_sequences: int | None,
     qc_per_split: int,
+    length_mismatch_policy: str,
     overwrite: bool,
 ) -> tuple[dict[str, Any], set[str]]:
     json_path = raw_root / "sot" / f"SeaDronesSee_{split}.json"
@@ -201,8 +227,10 @@ def process_split(
         "schema_errors": 0,
         "boundary_crop_count": 0,
         "length_mismatch_sequences": 0,
+        "length_mismatch_sequences_skipped": 0,
         "length_mismatch_total_extra_frames": 0,
         "length_mismatch_total_extra_annotations": 0,
+        "length_mismatch_policy": length_mismatch_policy,
     }
 
     for seq_id in tqdm(seq_ids, desc=f"Processing {split}"):
@@ -218,6 +246,7 @@ def process_split(
             raise FileNotFoundError(f"Missing annotation file: {ann_path}")
 
         ann_lines = read_lines(ann_path)
+        pair_count = len(seq_items)
         if len(seq_items) != len(ann_lines):
             mismatches.append(
                 {
@@ -228,17 +257,32 @@ def process_split(
                     "frames_minus_annotations": len(seq_items) - len(ann_lines),
                 }
             )
-            summary["length_mismatch_sequences"] += 1
-            if len(seq_items) > len(ann_lines):
-                summary["length_mismatch_total_extra_frames"] += len(seq_items) - len(ann_lines)
-            else:
-                summary["length_mismatch_total_extra_annotations"] += len(ann_lines) - len(seq_items)
+            action, pair_count, extra_frames, extra_annotations = resolve_length_mismatch_policy(
+                len(seq_items), len(ann_lines), length_mismatch_policy
+            )
+            if action == "truncate":
+                summary["length_mismatch_sequences"] += 1
+                summary["length_mismatch_total_extra_frames"] += extra_frames
+                summary["length_mismatch_total_extra_annotations"] += extra_annotations
+            elif action == "skip":
+                summary["length_mismatch_sequences_skipped"] += 1
+                summary["length_mismatch_total_extra_frames"] += extra_frames
+                summary["length_mismatch_total_extra_annotations"] += extra_annotations
+                print(
+                    f"[WARN] Length mismatch split={split}, seq={seq_id}: "
+                    f"{len(seq_items)} frames vs {len(ann_lines)} annotations, skipped by policy."
+                )
+                continue
+
             print(
                 f"[WARN] Length mismatch split={split}, seq={seq_id}: "
                 f"{len(seq_items)} frames vs {len(ann_lines)} annotations."
             )
 
-        pair_count = min(len(seq_items), len(ann_lines))
+        if length_mismatch_policy == "truncate":
+            pair_count = min(len(seq_items), len(ann_lines))
+        elif len(seq_items) != len(ann_lines):
+            pair_count = min(len(seq_items), len(ann_lines))
         if pair_count == 0:
             continue
         summary["num_sequences"] += 1
@@ -379,6 +423,7 @@ def main() -> None:
             crop_size=args.crop_size,
             max_sequences=args.max_sequences,
             qc_per_split=args.qc_per_split,
+            length_mismatch_policy=args.length_mismatch_policy,
             overwrite=args.overwrite,
         )
         split_to_sequences[split] = seqs
