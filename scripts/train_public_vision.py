@@ -22,14 +22,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project-root", type=str, default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument("--max-samples", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--steps", type=int, default=80)
+    parser.add_argument("--steps", type=int, default=400)
     parser.add_argument("--learning-rate", type=float, default=1e-2)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--out-dir",
         type=str,
-        default=str(Path(__file__).resolve().parents[1] / "outputs" / "train" / "smoke_public_vision"),
+        default=str(Path(__file__).resolve().parents[1] / "outputs" / "train" / "public_vision"),
     )
     return parser.parse_args()
 
@@ -152,7 +152,7 @@ def main() -> None:
         cv2.imwrite(str(vis_dir / f"sample_{rank:02d}.jpg"), vis)
 
     report = {
-        "task": "smoke_public_vision",
+        "task": "train_public_vision",
         "dataset": "SeaDronesSee",
         "split": args.split,
         "num_samples": int(n),

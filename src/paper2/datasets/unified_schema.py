@@ -10,6 +10,10 @@ REQUIRED_KEYS = [
     "crop_size",
     "center_px",
     "bbox_xywh",
+    "center_px_crop",
+    "bbox_xywh_crop",
+    "crop_origin_xy",
+    "crop_box_xyxy",
     "visible",
     "occluded",
     "truncated",
@@ -73,12 +77,18 @@ def validate_record(record: dict) -> None:
     ow, oh = _require_pair(record, "orig_image_size")
     cw, ch = _require_pair(record, "crop_size")
     cx, cy = _require_pair(record, "center_px")
+    cx_crop, cy_crop = _require_pair(record, "center_px_crop")
+    crop_ox, crop_oy = _require_pair(record, "crop_origin_xy")
     if ow <= 0 or oh <= 0:
         _fail("orig_image_size must be positive")
     if cw <= 0 or ch <= 0:
         _fail("crop_size must be positive")
     if cx < 0 or cx >= ow or cy < 0 or cy >= oh:
         _fail("center_px is out of orig_image_size range")
+    if cx_crop < 0 or cx_crop >= cw or cy_crop < 0 or cy_crop >= ch:
+        _fail("center_px_crop is out of crop_size range")
+    if not _is_finite_number(crop_ox) or not _is_finite_number(crop_oy):
+        _fail("crop_origin_xy must contain finite numbers")
 
     bbox = record.get("bbox_xywh")
     if not isinstance(bbox, list) or len(bbox) != 4:
@@ -88,6 +98,28 @@ def validate_record(record: dict) -> None:
         _fail("bbox_xywh must be finite numbers")
     if float(bw) <= 0 or float(bh) <= 0:
         _fail("bbox_xywh width/height must be positive")
+
+    bbox_crop = record.get("bbox_xywh_crop")
+    if not isinstance(bbox_crop, list) or len(bbox_crop) != 4:
+        _fail("Invalid 4-element field: bbox_xywh_crop")
+    cbx, cby, cbw, cbh = bbox_crop
+    if not all(_is_finite_number(v) for v in (cbx, cby, cbw, cbh)):
+        _fail("bbox_xywh_crop must be finite numbers")
+    if float(cbw) <= 0 or float(cbh) <= 0:
+        _fail("bbox_xywh_crop width/height must be positive")
+
+    crop_box = record.get("crop_box_xyxy")
+    if not isinstance(crop_box, list) or len(crop_box) != 4:
+        _fail("Invalid 4-element field: crop_box_xyxy")
+    x1, y1, x2, y2 = crop_box
+    if not all(_is_finite_number(v) for v in (x1, y1, x2, y2)):
+        _fail("crop_box_xyxy must be finite numbers")
+    if float(x2) <= float(x1) or float(y2) <= float(y1):
+        _fail("crop_box_xyxy must satisfy x2>x1 and y2>y1")
+    if abs(float(crop_ox) - float(x1)) > 1e-3 or abs(float(crop_oy) - float(y1)) > 1e-3:
+        _fail("crop_origin_xy must match crop_box_xyxy top-left")
+    if abs((float(x2) - float(x1)) - float(cw)) > 1e-3 or abs((float(y2) - float(y1)) - float(ch)) > 1e-3:
+        _fail("crop_box_xyxy size must match crop_size")
 
     for flag_key in ("visible", "occluded", "truncated"):
         flag_val = record.get(flag_key)

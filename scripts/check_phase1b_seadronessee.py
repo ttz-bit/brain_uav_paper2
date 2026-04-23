@@ -96,6 +96,7 @@ def main() -> None:
 
         leakage_ids: set[str] = set()
         schema_errors = 0
+        crop_center_errors = 0
         for row in rows:
             try:
                 validate_record(row)
@@ -103,6 +104,28 @@ def main() -> None:
                 schema_errors += 1
                 errors.append(f"Schema error in {manifest_path}: {e}")
                 continue
+            crop_size = row.get("crop_size")
+            center_crop = row.get("center_px_crop")
+            if (
+                not isinstance(crop_size, list)
+                or len(crop_size) != 2
+                or not isinstance(center_crop, list)
+                or len(center_crop) != 2
+            ):
+                crop_center_errors += 1
+                errors.append(f"Invalid crop center fields in {manifest_path}: frame_id={row.get('frame_id')}")
+            else:
+                cw = float(crop_size[0])
+                ch = float(crop_size[1])
+                cx = float(center_crop[0])
+                cy = float(center_crop[1])
+                if cx < 0 or cx >= cw or cy < 0 or cy >= ch:
+                    crop_center_errors += 1
+                    errors.append(
+                        "center_px_crop out of crop_size range in "
+                        f"{manifest_path}: frame_id={row.get('frame_id')}, "
+                        f"center=({cx:.2f},{cy:.2f}), crop_size=({cw:.2f},{ch:.2f})"
+                    )
             try:
                 leakage_ids.add(_leakage_id(row))
             except KeyError as e:
@@ -110,6 +133,8 @@ def main() -> None:
                 errors.append(f"Leakage id error in {manifest_path}: {e}")
         if schema_errors > 0:
             errors.append(f"{manifest_path} schema_errors={schema_errors}")
+        if crop_center_errors > 0:
+            errors.append(f"{manifest_path} crop_center_errors={crop_center_errors}")
         split_leakage_ids[split] = leakage_ids
 
         if summary_path.exists():
@@ -123,10 +148,16 @@ def main() -> None:
 
         if qc_split_dir.exists():
             qc_overlay_count = len(list(qc_split_dir.glob("*_overlay.jpg")))
+            qc_crop_center_count = len(list(qc_split_dir.glob("*_crop_center.jpg")))
             if qc_overlay_count < int(args.min_qc_per_split):
                 errors.append(
                     f"QC samples too few in {qc_split_dir}: "
                     f"{qc_overlay_count} < {int(args.min_qc_per_split)}"
+                )
+            if qc_crop_center_count < int(args.min_qc_per_split):
+                errors.append(
+                    f"QC crop-center samples too few in {qc_split_dir}: "
+                    f"{qc_crop_center_count} < {int(args.min_qc_per_split)}"
                 )
 
     leakage_path = stats_dir / "split_leakage_report.json"

@@ -80,13 +80,19 @@ def resolve_raw_image_path(raw_root: Path, raw_rel: str) -> Path:
     raise FileNotFoundError(f"Cannot resolve local image for: {raw_rel}")
 
 
-def make_center_crop(img: np.ndarray, center_x: float, center_y: float, crop_size: int) -> np.ndarray:
+def make_center_crop(
+    img: np.ndarray,
+    center_x: float,
+    center_y: float,
+    crop_size: int,
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
     half = crop_size // 2
     h, w = img.shape[:2]
     x1 = int(round(center_x)) - half
     y1 = int(round(center_y)) - half
     x2 = x1 + crop_size
     y2 = y1 + crop_size
+    crop_box_xyxy = (x1, y1, x2, y2)
 
     pad_left = max(0, -x1)
     pad_top = max(0, -y1)
@@ -110,7 +116,7 @@ def make_center_crop(img: np.ndarray, center_x: float, center_y: float, crop_siz
     crop = img[y1:y2, x1:x2]
     if crop.shape[0] != crop_size or crop.shape[1] != crop_size:
         crop = cv2.resize(crop, (crop_size, crop_size), interpolation=cv2.INTER_LINEAR)
-    return crop
+    return crop, crop_box_xyxy
 
 
 def draw_bbox_overlay(img: np.ndarray, bbox_xywh: tuple[int, int, int, int]) -> np.ndarray:
@@ -120,6 +126,23 @@ def draw_bbox_overlay(img: np.ndarray, bbox_xywh: tuple[int, int, int, int]) -> 
     cx = x + w / 2.0
     cy = y + h / 2.0
     cv2.circle(vis, (int(round(cx)), int(round(cy))), 5, (0, 0, 255), -1)
+    return vis
+
+
+def draw_crop_overlay(
+    crop_img: np.ndarray,
+    center_px_crop: tuple[float, float],
+    bbox_xywh_crop: tuple[float, float, float, float],
+) -> np.ndarray:
+    vis = crop_img.copy()
+    cx, cy = center_px_crop
+    bx, by, bw, bh = bbox_xywh_crop
+    x1 = int(round(bx))
+    y1 = int(round(by))
+    x2 = int(round(bx + bw))
+    y2 = int(round(by + bh))
+    cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    cv2.circle(vis, (int(round(cx)), int(round(cy))), 4, (0, 0, 255), -1)
     return vis
 
 
@@ -133,11 +156,19 @@ def _build_unified_record(
     crop_size: int,
     bbox_xywh: tuple[int, int, int, int],
     center_px: tuple[float, float],
+    center_px_crop: tuple[float, float],
+    bbox_xywh_crop: tuple[float, float, float, float],
+    crop_origin_xy: tuple[int, int],
+    crop_box_xyxy: tuple[int, int, int, int],
     img_w: int,
     img_h: int,
 ) -> dict[str, Any]:
     x, y, w, h = bbox_xywh
     cx, cy = center_px
+    cx_crop, cy_crop = center_px_crop
+    bx_crop, by_crop, bw_crop, bh_crop = bbox_xywh_crop
+    crop_x1, crop_y1 = crop_origin_xy
+    crop_box_x1, crop_box_y1, crop_box_x2, crop_box_y2 = crop_box_xyxy
     record = {
         "image_path": crop_rel,
         "dataset_name": "SeaDronesSee",
@@ -150,6 +181,10 @@ def _build_unified_record(
         "crop_size": [int(crop_size), int(crop_size)],
         "center_px": [float(cx), float(cy)],
         "bbox_xywh": [int(x), int(y), int(w), int(h)],
+        "center_px_crop": [float(cx_crop), float(cy_crop)],
+        "bbox_xywh_crop": [float(bx_crop), float(by_crop), float(bw_crop), float(bh_crop)],
+        "crop_origin_xy": [int(crop_x1), int(crop_y1)],
+        "crop_box_xyxy": [int(crop_box_x1), int(crop_box_y1), int(crop_box_x2), int(crop_box_y2)],
         "visible": 1,
         "occluded": 0,
         "truncated": 0,
@@ -322,7 +357,10 @@ def process_split(
             ):
                 summary["boundary_crop_count"] += 1
 
-            crop = make_center_crop(img, center_x, center_y, crop_size)
+            crop, crop_box_xyxy = make_center_crop(img, center_x, center_y, crop_size)
+            crop_x1, crop_y1, _, _ = crop_box_xyxy
+            center_crop = (center_x - float(crop_x1), center_y - float(crop_y1))
+            bbox_crop = (x - float(crop_x1), y - float(crop_y1), float(w), float(h))
             frame_id = Path(local_frame_name).stem
             crop_name = f"seq_{int(seq_id):04d}_frame_{frame_id}.png"
             crop_path = crops_dir / crop_name
@@ -340,6 +378,10 @@ def process_split(
                 crop_size=crop_size,
                 bbox_xywh=bbox_xywh,
                 center_px=(center_x, center_y),
+                center_px_crop=center_crop,
+                bbox_xywh_crop=bbox_crop,
+                crop_origin_xy=(crop_x1, crop_y1),
+                crop_box_xyxy=crop_box_xyxy,
                 img_w=img_w,
                 img_h=img_h,
             )
@@ -355,10 +397,13 @@ def process_split(
 
             if qc_saved < qc_per_split:
                 vis = draw_bbox_overlay(img, bbox_xywh)
+                crop_vis = draw_crop_overlay(crop, center_crop, bbox_crop)
                 qc_overlay_path = qc_dir / f"seq_{int(seq_id):04d}_frame_{frame_id}_overlay.jpg"
                 qc_crop_path = qc_dir / f"seq_{int(seq_id):04d}_frame_{frame_id}_crop.jpg"
+                qc_crop_center_path = qc_dir / f"seq_{int(seq_id):04d}_frame_{frame_id}_crop_center.jpg"
                 cv2.imwrite(str(qc_overlay_path), vis)
                 cv2.imwrite(str(qc_crop_path), crop)
+                cv2.imwrite(str(qc_crop_center_path), crop_vis)
                 qc_saved += 1
 
     manifest_path = manifests_dir / f"records_{split}.jsonl"

@@ -20,6 +20,10 @@ def _make_record(crop_rel: str, frame_id: str) -> dict:
         "crop_size": [128, 128],
         "center_px": [320.0, 240.0],
         "bbox_xywh": [10, 20, 30, 40],
+        "center_px_crop": [64.0, 64.0],
+        "bbox_xywh_crop": [49.0, 44.0, 30.0, 40.0],
+        "crop_origin_xy": [256, 176],
+        "crop_box_xyxy": [256, 176, 384, 304],
         "visible": 1,
         "occluded": 0,
         "truncated": 0,
@@ -83,4 +87,3 @@ def test_smoke_train_public_vision_runs_end_to_end(tmp_path: Path):
     assert report["steps"] == 5
     assert (out_dir / "linear_weights.npy").exists()
     assert (out_dir / "visuals").exists()
-

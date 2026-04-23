@@ -59,8 +59,13 @@ class SeaDronesSeeDataset:
         crop_path = resolve_image_path(str(row["crop_path"]), self.project_root)
         image = load_bgr_image(crop_path)
 
-        center = np.asarray(row["center_px"], dtype=np.float32).reshape(2)
-        bbox = np.asarray(row["bbox_xywh"], dtype=np.float32).reshape(4)
+        if "center_px_crop" not in row:
+            raise KeyError("Missing center_px_crop in SeaDronesSee manifest row")
+        if "bbox_xywh_crop" not in row:
+            raise KeyError("Missing bbox_xywh_crop in SeaDronesSee manifest row")
+
+        center = np.asarray(row["center_px_crop"], dtype=np.float32).reshape(2)
+        bbox = np.asarray(row["bbox_xywh_crop"], dtype=np.float32).reshape(4)
         visible = bool(int(row.get("visible", 1)))
         occluded = bool(int(row.get("occluded", 0)))
         truncated = bool(int(row.get("truncated", 0)))
@@ -89,4 +94,3 @@ def build_seadronessee_dataset(
         project_root=project_root,
         max_samples=max_samples,
     )
-
