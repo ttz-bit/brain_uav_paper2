@@ -1,70 +1,93 @@
 # brain_uav_paper2
 
-Independent experiment scaffold for Paper 2 of the brain-inspired UAV project.
+Independent experiment codebase for Paper 2 of the brain-inspired UAV project.
 
-## 1. Project Overview
+## Overview
 
-This repository is an independent experimental codebase for Paper 2.  
-Its goal is to support a brain-inspired visual perception pipeline for target-related online trajectory planning under the same aircraft and no-fly-zone modeling framework used in Paper 1.
+This repository focuses on Paper 2 visual perception and data pipeline work while keeping a frozen bridge interface to the corrected Paper 1 environment.
 
-At the current stage, this repository focuses on:
+Current focus:
 
-- freezing interfaces and experiment protocol;
-- preparing a synthetic visual data generation pipeline;
-- supporting public dataset based external visual validation;
-- reserving a bridge for future closed-loop integration after Paper 1 physical calibration is finalized.
+- keep Paper 1 interface/protocol stable;
+- build public-vision external validation pipeline;
+- prepare SeaDronesSee into unified manifest format for training;
+- keep closed-loop bridge as placeholder until Paper 1 physical calibration is finalized.
 
-## 2. Current Status
+## Current Milestone Status
 
-Current progress:
+- Phase 1A: interface/protocol freeze in place.
+- Phase 1B: SeaDronesSee external data pipeline implemented and accepted.
+  - preprocessing done for `train/val`;
+  - unified schema validation enabled;
+  - split leakage / QC / mismatch checks implemented;
+  - training entry script for public vision available.
 
-- independent Python project scaffold has been created;
-- package structure has been initialized;
-- interface layer has been frozen;
-- experiment protocol layer has been frozen;
-- unified schema has been defined;
-- evaluation metric names have been defined;
-- Git version control and GitHub remote sync are ready.
+Not finalized yet:
 
-What is **not finalized yet**:
+- final Paper 1 physical world-unit and dynamics calibration;
+- final closed-loop bridge implementation;
+- final high-performance vision model (current train script is baseline).
 
-- final physical world unit;
-- final time step `dt`;
-- final aircraft speed;
-- final no-fly-zone radius scale;
-- final render GSD;
-- final closed-loop metric formulas;
-- final bridge implementation to the corrected Paper 1 environment.
+## Key Paths
 
-## 3. Repository Structure
+- `scripts/prepare_seadronessee.py`: convert raw SeaDronesSee to processed crops + manifests.
+- `scripts/check_phase1b_seadronessee.py`: phase 1B acceptance checks.
+- `scripts/train_public_vision.py`: baseline public vision training entry.
+- `src/paper2/datasets/unified_schema.py`: manifest schema and hard validation.
+- `src/paper2/datasets/seadronessee_dataset.py`: dataset reader using crop-space labels.
+- `src/paper2/env_adapter/interfaces.py`: frozen environment protocol.
+- `src/paper2/env_adapter/paper1_bridge.py`: placeholder bridge (kept intentionally unimplemented).
 
-```text
-brain_uav_paper2/
-├─ configs/                  # configuration files
-│  ├─ env.yaml               # environment config schema placeholder
-│  ├─ render.yaml            # rendering config schema placeholder
-│  ├─ vision.yaml            # visual task config schema placeholder
-│  └─ experiment.yaml        # experiment protocol freeze
-├─ docs/
-│  └─ phase0_freeze.md       # phase 0 freeze note
-├─ scripts/
-│  ├─ check_interface.py     # phase 0A interface check
-│  └─ check_phase0b.py       # phase 0B protocol check
-├─ src/paper2/
-│  ├─ common/
-│  │  ├─ config.py           # yaml loader
-│  │  └─ types.py            # core state definitions
-│  ├─ datasets/
-│  │  └─ unified_schema.py   # unified record schema
-│  ├─ env_adapter/
-│  │  ├─ interfaces.py       # environment protocol
-│  │  └─ paper1_bridge.py    # placeholder bridge to paper1 environment
-│  ├─ eval/
-│  │  └─ metrics_spec.py     # metric name definitions
-│  ├─ render/                # rendering module (to be implemented)
-│  ├─ tracking/              # tracking module (to be implemented)
-│  └─ vision/                # vision module (to be implemented)
-├─ outputs/                  # generated outputs
-├─ tests/                    # tests
-├─ .gitignore
-└─ pyproject.toml
+## Phase 1B Data Format Notes
+
+Each manifest record includes both original-image and crop-space target fields.
+
+Core fields:
+
+- original-image space: `center_px`, `bbox_xywh`
+- crop space: `center_px_crop`, `bbox_xywh_crop`
+- crop geometry: `crop_origin_xy`, `crop_box_xyxy`, `crop_size`
+
+The training reader consumes crop-space labels by default.
+
+## Quick Start (Server)
+
+```bash
+cd ~/projects/brain_uav_paper2
+conda activate paper2
+export PYTHONPATH=src
+```
+
+Preprocess:
+
+```bash
+python scripts/prepare_seadronessee.py \
+  --raw-root /data_8T/clt/SeaDronesSee \
+  --out-root data/processed/seadronessee \
+  --splits train val \
+  --overwrite
+```
+
+Check:
+
+```bash
+python scripts/check_phase1b_seadronessee.py \
+  --root data/processed/seadronessee \
+  --splits train val \
+  --allow-length-mismatch
+```
+
+Train baseline:
+
+```bash
+python scripts/train_public_vision.py \
+  --root data/processed/seadronessee \
+  --split train \
+  --project-root ~/projects/brain_uav_paper2 \
+  --max-samples 4096 \
+  --batch-size 64 \
+  --steps 400 \
+  --learning-rate 0.001 \
+  --grad-clip 0.5 \
+  --out-dir outputs/train/public_vision/run_example
+```
