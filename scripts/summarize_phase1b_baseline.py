@@ -66,11 +66,11 @@ def _artifact_paths(report_path: Path, report: dict[str, Any], project_root: Pat
     }
 
 
-def _check_artifacts(paths: dict[str, Path]) -> tuple[bool, list[str]]:
+def _check_artifacts(paths: dict[str, Path], purpose: str) -> tuple[bool, list[str]]:
     missing: list[str] = []
     if not paths["report_path"].exists():
         missing.append("report.json")
-    if not paths["weights_path"].exists():
+    if purpose != "evaluation" and (not paths["weights_path"].exists()):
         missing.append("linear_weights.npy")
     vis_ok = paths["visual_dir"].exists() and any(paths["visual_dir"].glob("*.jpg"))
     if not vis_ok:
@@ -167,7 +167,7 @@ def main() -> None:
         split = str(report.get("split", "")).strip() or expected_split
         metrics_ok, metric_errors = _check_metrics(report, purpose)
         artifact_paths = _artifact_paths(report_path, report, project_root)
-        artifacts_ok, missing_artifacts = _check_artifacts(artifact_paths)
+        artifacts_ok, missing_artifacts = _check_artifacts(artifact_paths, purpose)
 
         issues = []
         if expected_split and split != expected_split:
