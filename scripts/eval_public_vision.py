@@ -18,18 +18,29 @@ def parse_args() -> argparse.Namespace:
         default=r"D:\Projects\brain_uav_paper2\data\processed\seadronessee",
         help="Processed public dataset root (SeaDronesSee for now)",
     )
-    parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"])
+    parser.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
     parser.add_argument("--project-root", type=str, default=str(Path(__file__).resolve().parents[1]))
     parser.add_argument("--max-samples", type=int, default=2048)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--steps", type=int, default=400)
-    parser.add_argument("--learning-rate", type=float, default=1e-2)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument(
+        "--weights-path",
+        type=str,
+        required=True,
+        help="Path to saved linear_weights.npy from train_public_vision.py",
+    )
+    parser.add_argument(
+        "--norm-stats-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to feature_norm_stats.npz. "
+            "If omitted, try sibling file near weights, then fallback to current split stats."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--out-dir",
         type=str,
-        default=str(Path(__file__).resolve().parents[1] / "outputs" / "train" / "public_vision"),
+        default=str(Path(__file__).resolve().parents[1] / "outputs" / "eval" / "public_vision"),
     )
     return parser.parse_args()
 
@@ -48,19 +59,54 @@ def _target_from_sample(sample) -> np.ndarray:
     return np.array([cx, cy, conf], dtype=np.float32)
 
 
+def _load_norm_stats(
+    x: np.ndarray, weights_path: Path, norm_stats_path: Path | None
+) -> tuple[np.ndarray, np.ndarray, str]:
+    chosen = norm_stats_path
+    if chosen is None:
+        sibling = weights_path.with_name("feature_norm_stats.npz")
+        if sibling.exists():
+            chosen = sibling
+
+    if chosen is not None and chosen.exists():
+        data = np.load(chosen)
+        mean = np.asarray(data["mean"], dtype=np.float32)
+        std = np.asarray(data["std"], dtype=np.float32)
+        std = np.maximum(std, 1e-6)
+        return mean, std, f"loaded:{chosen}"
+
+    # Fallback: compute from the current evaluation split.
+    # This keeps script robust for old runs that did not save norm stats.
+    x_core = x[:, :-1]
+    mean = np.mean(x_core, axis=0, keepdims=True)
+    std = np.std(x_core, axis=0, keepdims=True)
+    std = np.maximum(std, 1e-6)
+    return mean.astype(np.float32), std.astype(np.float32), "computed_from_eval_split"
+
+
 def main() -> None:
     args = parse_args()
     rng = np.random.default_rng(args.seed)
 
+    project_root = Path(args.project_root).resolve()
     out_dir = Path(args.out_dir)
     vis_dir = out_dir / "visuals"
     out_dir.mkdir(parents=True, exist_ok=True)
     vis_dir.mkdir(parents=True, exist_ok=True)
 
+    weights_path = Path(args.weights_path).resolve()
+    if not weights_path.exists():
+        raise FileNotFoundError(f"Missing weights file: {weights_path}")
+    w = np.load(weights_path)
+    if w.ndim != 2:
+        raise ValueError(f"weights must be 2D matrix, got shape={w.shape}")
+
+    norm_path = Path(args.norm_stats_path).resolve() if args.norm_stats_path else None
+
     ds = build_seadronessee_dataset(
         root=args.root,
         split=args.split,
-        project_root=args.project_root,
+        project_root=project_root,
         max_samples=args.max_samples,
     )
 
@@ -73,61 +119,35 @@ def main() -> None:
     x_raw = np.stack(features, axis=0)
     y = np.stack(targets, axis=0)
 
-    # Keep final bias column unchanged, normalize other feature dims for stable optimization.
     x = x_raw.copy()
+    mean, std, norm_source = _load_norm_stats(x, weights_path, norm_path)
     if x.shape[1] > 1:
-        x_core = x[:, :-1]
-        mean = np.mean(x_core, axis=0, keepdims=True)
-        std = np.std(x_core, axis=0, keepdims=True)
-        std = np.maximum(std, 1e-6)
-        x[:, :-1] = (x_core - mean) / std
+        x[:, :-1] = (x[:, :-1] - mean.reshape(1, -1)) / std.reshape(1, -1)
 
-    n, d = x.shape
-    out_dim = y.shape[1]
-    w = rng.normal(0.0, 0.01, size=(d, out_dim)).astype(np.float32)
+    if w.shape[0] != x.shape[1]:
+        raise ValueError(f"Weight dim mismatch: weights={w.shape}, features={x.shape}")
 
-    def mse(pred: np.ndarray, gt: np.ndarray) -> float:
-        return float(np.mean((pred - gt) ** 2))
-
-    initial_loss = mse(x @ w, y)
-    loss_trace: list[float] = []
-
-    steps = max(1, int(args.steps))
-    batch_size = max(1, int(args.batch_size))
-    lr = float(args.learning_rate)
-
-    for step in range(steps):
-        idx = rng.integers(0, n, size=min(batch_size, n))
-        xb = x[idx]
-        yb = y[idx]
-        pred = xb @ w
-        err = pred - yb
-        grad = (2.0 / float(len(xb))) * (xb.T @ err)
-        grad = np.clip(grad, -float(args.grad_clip), float(args.grad_clip))
-        w = w - lr * grad.astype(np.float32)
-        loss_trace.append(mse(x @ w, y))
-        if (step + 1) % 10 == 0 or step == 0:
-            print(f"[SMOKE] step={step + 1:03d}/{steps}, loss={loss_trace[-1]:.6f}")
-
-    final_loss = mse(x @ w, y)
-    improve_ratio = (initial_loss - final_loss) / max(initial_loss, 1e-12)
+    pred = x @ w
+    mse = float(np.mean((pred - y) ** 2))
+    mae = float(np.mean(np.abs(pred - y)))
 
     vis_count = min(8, len(ds))
     vis_indices = rng.choice(len(ds), size=vis_count, replace=False) if vis_count > 0 else []
     for rank, i in enumerate(vis_indices):
         s = ds[int(i)]
         feat = _extract_feature(s.image)
-        if x.shape[1] > 1:
-            feat[:-1] = (feat[:-1] - mean.reshape(-1)) / std.reshape(-1)
-        pred = feat @ w
-        if not np.isfinite(pred).all():
-            pred = np.nan_to_num(pred, nan=0.0, posinf=1.0, neginf=0.0)
+        if feat.shape[0] != x.shape[1]:
+            raise ValueError("Feature dimension mismatch in visualization pass")
+        feat[:-1] = (feat[:-1] - mean.reshape(-1)) / std.reshape(-1)
+        one_pred = feat @ w
+        if not np.isfinite(one_pred).all():
+            one_pred = np.nan_to_num(one_pred, nan=0.0, posinf=1.0, neginf=0.0)
 
         h_img, w_img = s.image.shape[:2]
         gt_center_conf = _target_from_sample(s)
-        pred_x = int(np.clip(pred[0], 0.0, 1.0) * w_img)
-        pred_y = int(np.clip(pred[1], 0.0, 1.0) * h_img)
-        pred_conf = float(np.clip(pred[2], 0.0, 1.0))
+        pred_x = int(np.clip(one_pred[0], 0.0, 1.0) * w_img)
+        pred_y = int(np.clip(one_pred[1], 0.0, 1.0) * h_img)
+        pred_conf = float(np.clip(one_pred[2], 0.0, 1.0))
         gt_x = int(np.clip(gt_center_conf[0], 0.0, 1.0) * w_img)
         gt_y = int(np.clip(gt_center_conf[1], 0.0, 1.0) * h_img)
         gt_conf = float(np.clip(gt_center_conf[2], 0.0, 1.0))
@@ -152,27 +172,22 @@ def main() -> None:
         cv2.imwrite(str(vis_dir / f"sample_{rank:02d}.jpg"), vis)
 
     report = {
-        "task": "train_public_vision",
+        "task": "eval_public_vision",
         "dataset": "SeaDronesSee",
         "split": args.split,
-        "num_samples": int(n),
-        "feature_dim": int(d),
-        "output_dim": int(out_dim),
-        "batch_size": int(batch_size),
-        "steps": int(steps),
-        "learning_rate": float(lr),
-        "initial_loss": float(initial_loss),
-        "final_loss": float(final_loss),
-        "improve_ratio": float(improve_ratio),
+        "purpose": "evaluation",
+        "num_samples": int(len(ds)),
+        "feature_dim": int(x.shape[1]),
+        "output_dim": int(w.shape[1]),
+        "mse": mse,
+        "mae": mae,
+        "weights_path": str(weights_path),
+        "normalization_source": norm_source,
         "artifacts": {
             "visual_dir": str(vis_dir),
-            "weights_path": str(out_dir / "linear_weights.npy"),
-            "norm_stats_path": str(out_dir / "feature_norm_stats.npz"),
             "report_path": str(out_dir / "report.json"),
         },
     }
-    np.save(out_dir / "linear_weights.npy", w)
-    np.savez(out_dir / "feature_norm_stats.npz", mean=mean, std=std)
     (out_dir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

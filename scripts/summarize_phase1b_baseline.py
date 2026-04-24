@@ -7,6 +7,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -76,15 +78,23 @@ def _check_artifacts(paths: dict[str, Path]) -> tuple[bool, list[str]]:
     return len(missing) == 0, missing
 
 
-def _check_metrics(report: dict[str, Any]) -> tuple[bool, list[str]]:
+def _check_metrics(report: dict[str, Any], purpose: str) -> tuple[bool, list[str]]:
     errors: list[str] = []
-    initial_loss = float(report.get("initial_loss", "nan"))
-    final_loss = float(report.get("final_loss", "nan"))
-    improve_ratio = float(report.get("improve_ratio", "nan"))
-    if not (final_loss < initial_loss):
-        errors.append("final_loss_not_lower_than_initial")
-    if not (improve_ratio > 0.0):
-        errors.append("improve_ratio_not_positive")
+    if purpose == "evaluation":
+        mse = report.get("mse")
+        mae = report.get("mae")
+        if not isinstance(mse, (int, float)) or not np.isfinite(float(mse)) or float(mse) < 0.0:
+            errors.append("invalid_mse")
+        if not isinstance(mae, (int, float)) or not np.isfinite(float(mae)) or float(mae) < 0.0:
+            errors.append("invalid_mae")
+    else:
+        initial_loss = float(report.get("initial_loss", "nan"))
+        final_loss = float(report.get("final_loss", "nan"))
+        improve_ratio = float(report.get("improve_ratio", "nan"))
+        if not (final_loss < initial_loss):
+            errors.append("final_loss_not_lower_than_initial")
+        if not (improve_ratio > 0.0):
+            errors.append("improve_ratio_not_positive")
     return len(errors) == 0, errors
 
 
@@ -155,7 +165,7 @@ def main() -> None:
 
         report = _read_json(report_path)
         split = str(report.get("split", "")).strip() or expected_split
-        metrics_ok, metric_errors = _check_metrics(report)
+        metrics_ok, metric_errors = _check_metrics(report, purpose)
         artifact_paths = _artifact_paths(report_path, report, project_root)
         artifacts_ok, missing_artifacts = _check_artifacts(artifact_paths)
 
@@ -171,9 +181,17 @@ def main() -> None:
             "purpose": purpose,
             "seed": _infer_seed(run_name),
             "num_samples": int(report.get("num_samples", 0)),
-            "initial_loss": float(report.get("initial_loss", "nan")),
-            "final_loss": float(report.get("final_loss", "nan")),
-            "improve_ratio": float(report.get("improve_ratio", "nan")),
+            "initial_loss": (
+                float(report.get("initial_loss", "nan")) if "initial_loss" in report else None
+            ),
+            "final_loss": (
+                float(report.get("final_loss", "nan")) if "final_loss" in report else None
+            ),
+            "improve_ratio": (
+                float(report.get("improve_ratio", "nan")) if "improve_ratio" in report else None
+            ),
+            "mse": float(report.get("mse", "nan")) if "mse" in report else None,
+            "mae": float(report.get("mae", "nan")) if "mae" in report else None,
             "metrics_ok": metrics_ok,
             "artifacts_ok": artifacts_ok,
             "overall_ok": metrics_ok and artifacts_ok and (len(issues) == 0),
@@ -217,6 +235,8 @@ def main() -> None:
         "initial_loss",
         "final_loss",
         "improve_ratio",
+        "mse",
+        "mae",
         "metrics_ok",
         "artifacts_ok",
         "overall_ok",

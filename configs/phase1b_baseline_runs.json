@@ -23,6 +23,12 @@
       "report_path": "outputs/train/public_vision/run3_val_seed7/report.json",
       "expected_split": "val",
       "purpose": "fit_check"
+    },
+    {
+      "run_name": "run3_val_seed7_eval",
+      "report_path": "outputs/eval/public_vision/run3_val_seed7_eval/report.json",
+      "expected_split": "val",
+      "purpose": "evaluation"
     }
   ]
 }
