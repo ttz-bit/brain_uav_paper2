@@ -1,0 +1,32 @@
+{
+  "experiments": [
+    {
+      "experiment_id": "snn_1024_seed42",
+      "seed": 42,
+      "samples": 1024,
+      "train_report_path": "outputs/train/public_vision_snn/run1_train_small/report.json",
+      "eval_report_path": "outputs/eval/public_vision_snn/run1_val_eval_small/report.json"
+    },
+    {
+      "experiment_id": "snn_1024_seed7",
+      "seed": 7,
+      "samples": 1024,
+      "train_report_path": "outputs/train/public_vision_snn/run2_train_small_seed7/report.json",
+      "eval_report_path": "outputs/eval/public_vision_snn/run2_val_eval_small_seed7/report.json"
+    },
+    {
+      "experiment_id": "snn_2048_seed42",
+      "seed": 42,
+      "samples": 2048,
+      "train_report_path": "outputs/train/public_vision_snn/run3_train_2048_seed42/report.json",
+      "eval_report_path": "outputs/eval/public_vision_snn/run3_val_eval_2048_seed42/report.json"
+    },
+    {
+      "experiment_id": "snn_2048_seed7",
+      "seed": 7,
+      "samples": 2048,
+      "train_report_path": "outputs/train/public_vision_snn/run4_train_2048_seed7/report.json",
+      "eval_report_path": "outputs/eval/public_vision_snn/run4_val_eval_2048_seed7/report.json"
+    }
+  ]
+}
