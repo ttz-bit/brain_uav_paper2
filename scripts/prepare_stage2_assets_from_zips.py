@@ -127,6 +127,7 @@ def main() -> None:
         suffix = p.suffix.lower()
         name = p.name.lower()
         low = str(p).lower().replace("\\", "/")
+        norm_name = low.rsplit("/", 1)[-1]
 
         if "/manifests/" in low and suffix in {".csv", ".jsonl", ".txt"}:
             safe_copy(p, out_root / "manifests" / p.name)
@@ -141,16 +142,26 @@ def main() -> None:
             num_manifest += 1
             continue
 
-        if name.startswith("target_") and suffix == ".png":
+        if suffix == ".png" and (
+            name.startswith("target_")
+            or norm_name.startswith("target_")
+            or "/target_" in low
+        ):
             split = infer_split(p, f"target::{p.stem}", args.train_ratio, args.val_ratio)
-            safe_copy(p, out_root / "target_templates" / "alpha_png" / split / p.name)
+            out_name = norm_name if norm_name.endswith(".png") else p.name
+            safe_copy(p, out_root / "target_templates" / "alpha_png" / split / out_name)
             num_target += 1
             continue
 
-        if name.startswith("distractor_") and suffix == ".png":
+        if suffix == ".png" and (
+            name.startswith("distractor_")
+            or norm_name.startswith("distractor_")
+            or "/distractor_" in low
+        ):
             split = infer_split(p, f"distractor::{p.stem}", args.train_ratio, args.val_ratio)
-            safe_copy(p, out_root / "distractor_templates" / "splits" / split / p.name)
-            safe_copy(p, out_root / "distractor_templates" / "alpha_png" / p.name)
+            out_name = norm_name if norm_name.endswith(".png") else p.name
+            safe_copy(p, out_root / "distractor_templates" / "splits" / split / out_name)
+            safe_copy(p, out_root / "distractor_templates" / "alpha_png" / out_name)
             num_dst_split += 1
             num_dst_alpha += 1
             continue
@@ -175,4 +186,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
