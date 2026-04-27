@@ -68,6 +68,75 @@ def _snap_to_water(mask_u8: np.ndarray, x: float, y: float, max_radius: int = 64
     return float(xs[idx]), float(ys[idx])
 
 
+def _alpha_water_ratio(mask_u8: np.ndarray, overlay_bgra: np.ndarray, center_x: float, center_y: float) -> float:
+    h, w = mask_u8.shape[:2]
+    oh, ow = overlay_bgra.shape[:2]
+    x1 = int(round(center_x - ow / 2))
+    y1 = int(round(center_y - oh / 2))
+    x2 = x1 + ow
+    y2 = y1 + oh
+
+    ix1 = max(0, x1)
+    iy1 = max(0, y1)
+    ix2 = min(w, x2)
+    iy2 = min(h, y2)
+    if ix1 >= ix2 or iy1 >= iy2:
+        return 0.0
+
+    ox1 = ix1 - x1
+    oy1 = iy1 - y1
+    ox2 = ox1 + (ix2 - ix1)
+    oy2 = oy1 + (iy2 - iy1)
+
+    alpha = overlay_bgra[oy1:oy2, ox1:ox2, 3]
+    fg = alpha > 10
+    denom = int(fg.sum())
+    if denom <= 0:
+        return 0.0
+    water = mask_u8[iy1:iy2, ix1:ix2] > 0
+    num = int((fg & water).sum())
+    return float(num / float(denom))
+
+
+def _sample_water_center(
+    mask_u8: np.ndarray,
+    overlay_bgra: np.ndarray,
+    x0: float,
+    y0: float,
+    rng: np.random.Generator,
+    min_ratio: float = 0.85,
+    tries: int = 24,
+) -> tuple[float, float]:
+    h, w = mask_u8.shape[:2]
+    ys, xs = np.where(mask_u8 > 0)
+    if len(xs) == 0:
+        return float(np.clip(x0, 0, w - 1)), float(np.clip(y0, 0, h - 1))
+
+    best_x = float(np.clip(x0, 0, w - 1))
+    best_y = float(np.clip(y0, 0, h - 1))
+    best_score = -1.0
+
+    # Candidate 1: nearest water center.
+    nx, ny = _snap_to_water(mask_u8, x0, y0, max_radius=max(h, w))
+    candidates = [(nx, ny)]
+    # Candidate 2+: random water pixels.
+    n = min(tries, len(xs))
+    idx = rng.choice(len(xs), size=n, replace=False)
+    for i in idx:
+        candidates.append((float(xs[int(i)]), float(ys[int(i)])))
+
+    for cx, cy in candidates:
+        ratio = _alpha_water_ratio(mask_u8, overlay_bgra, cx, cy)
+        dist = float(np.hypot(cx - x0, cy - y0))
+        score = ratio - 0.0015 * dist
+        if score > best_score:
+            best_score = score
+            best_x, best_y = cx, cy
+        if ratio >= min_ratio:
+            return cx, cy
+    return best_x, best_y
+
+
 @dataclass
 class RenderSplitResult:
     split: str
@@ -134,16 +203,22 @@ class Stage2Renderer:
         with label_path.open("w", encoding="utf-8") as f:
             for seq_idx in range(num_sequences):
                 bg = self.registry.sample_one("background", split, self.rng)
-                target = self.registry.sample_one("target", split, self.rng)
                 d_num = int(self.rng.integers(int(distractor_cfg["min_count"]), int(distractor_cfg["max_count"]) + 1))
                 distractors = self.registry.sample_many("distractor", split, d_num, self.rng)
 
                 used_background_ids.add(bg.asset_id)
-                used_target_ids.add(target.asset_id)
                 for d in distractors:
                     used_distractor_ids.add(d.asset_id)
 
                 bg_img = self._read_background(bg)
+                # Prefer top-view templates for aerial realism; fallback to any target if none available.
+                split_targets = self.registry.get("target", split)
+                top_targets = [a for a in split_targets if a.category == "boat_top"]
+                if top_targets:
+                    target = top_targets[int(self.rng.integers(0, len(top_targets)))]
+                else:
+                    target = self.registry.sample_one("target", split, self.rng)
+                used_target_ids.add(target.asset_id)
                 target_bgra = read_bgra(target.path)
                 distractor_bgras = [read_bgra(d.path) for d in distractors]
 
@@ -167,13 +242,14 @@ class Stage2Renderer:
                     water = _water_mask(patch)
 
                     tx, ty = world_to_image(state.x, state.y, crop_center_x, crop_center_y, gsd, image_size)
-                    tx, ty = _snap_to_water(water, tx, ty)
                     scale_min, scale_max = stage_cfg["target_scale_range"]
                     target_scale = float(self.rng.uniform(float(scale_min), float(scale_max)))
                     target_patch = resize_bgra_with_scale(target_bgra, target_scale, image_size=image_size)
-                    heading_deg = float(np.degrees(np.arctan2(state.vy, state.vx)))
-                    # Templates are mostly "bow-to-right"; rotate to align with motion direction.
-                    target_patch = rotate_bgra(target_patch, heading_deg)
+                    # Only top-view templates are rotated by heading to avoid "capsized" side-view artifacts.
+                    if target.category == "boat_top":
+                        heading_deg = float(np.degrees(np.arctan2(state.vy, state.vx)))
+                        target_patch = rotate_bgra(target_patch, heading_deg)
+                    tx, ty = _sample_water_center(water, target_patch, tx, ty, self.rng, min_ratio=0.90, tries=32)
                     bbox, vis = alpha_blend_center(patch, target_patch, tx, ty)
 
                     d_ids: list[str] = []
