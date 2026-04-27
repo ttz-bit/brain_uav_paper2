@@ -60,8 +60,8 @@ target:
   scale_mode: stage_progressive
   fixed_scale_range: [0.08, 0.12]
   max_step_px: 8.0
-  allowed_categories: ["boat_top", "boat_oblique"]
-  heading_noise_deg: 10.0
+  allowed_categories: ["boat_top"]
+  heading_noise_deg: 4.0
 
 continuity:
   max_position_shift_ratio: 0.15
