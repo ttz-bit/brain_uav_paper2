@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import hashlib
 import shutil
 import zipfile
@@ -100,6 +101,78 @@ def ensure_layout(root: Path) -> None:
         p.mkdir(parents=True, exist_ok=True)
 
 
+def _desired_counts(n: int, train_ratio: float, val_ratio: float) -> tuple[int, int, int]:
+    test_ratio = max(0.0, 1.0 - train_ratio - val_ratio)
+    raw = [n * train_ratio, n * val_ratio, n * test_ratio]
+    base = [int(math.floor(x)) for x in raw]
+    rem = n - sum(base)
+    frac_idx = sorted([(raw[i] - base[i], i) for i in range(3)], reverse=True)
+    for k in range(rem):
+        base[frac_idx[k % 3][1]] += 1
+    n_train, n_val, n_test = base
+    if n >= 3:
+        if n_train == 0:
+            n_train, n_test = 1, max(0, n_test - 1)
+        if n_val == 0:
+            n_val, n_train = 1, max(1, n_train - 1)
+        if n_test == 0:
+            n_test, n_train = 1, max(1, n_train - 1)
+        while n_train + n_val + n_test < n:
+            n_train += 1
+        while n_train + n_val + n_test > n and n_train > 1:
+            n_train -= 1
+    else:
+        n_train = min(1, n)
+        n_val = 1 if n >= 2 else 0
+        n_test = n - n_train - n_val
+    return n_train, n_val, n_test
+
+
+def _rebalance_split_pngs(root: Path, train_ratio: float, val_ratio: float) -> tuple[int, int, int, int]:
+    split_dirs = [root / "train", root / "val", root / "test"]
+    for d in split_dirs:
+        d.mkdir(parents=True, exist_ok=True)
+    files = []
+    for d in split_dirs:
+        files.extend([p for p in d.glob("*.png") if p.is_file()])
+    files = sorted(files, key=lambda p: p.name.lower())
+    n = len(files)
+    n_train, n_val, n_test = _desired_counts(n, train_ratio, val_ratio)
+
+    tmp = root / ".rebalance_tmp"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir(parents=True, exist_ok=True)
+    staged: list[Path] = []
+    for i, p in enumerate(files):
+        t = tmp / f"{i:06d}__{p.name}"
+        shutil.move(str(p), str(t))
+        staged.append(t)
+
+    cursor = 0
+    for split, count in (("train", n_train), ("val", n_val), ("test", n_test)):
+        out_dir = root / split
+        for _ in range(count):
+            src = staged[cursor]
+            cursor += 1
+            out = out_dir / src.name.split("__", 1)[1]
+            shutil.move(str(src), str(out))
+
+    shutil.rmtree(tmp)
+    return n, n_train, n_val, n_test
+
+
+def _sync_distractor_alpha_from_splits(splits_root: Path, alpha_root: Path) -> None:
+    for sp in SPLITS:
+        d = alpha_root / sp
+        if d.exists():
+            for p in d.glob("*.png"):
+                p.unlink()
+        d.mkdir(parents=True, exist_ok=True)
+        for src in sorted((splits_root / sp).glob("*.png"), key=lambda p: p.name.lower()):
+            safe_copy(src, d / src.name)
+
+
 def main() -> None:
     args = parse_args()
     zip_dir = Path(args.zip_dir).resolve()
@@ -192,6 +265,26 @@ def main() -> None:
         f"background={num_bg} target={num_target} "
         f"distractor_split={num_dst_split} distractor_alpha={num_dst_alpha} "
         f"manifest={num_manifest} qc={num_qc}"
+    )
+
+    # Enforce deterministic 70/15/15 split for template assets.
+    t_total, t_train, t_val, t_test = _rebalance_split_pngs(
+        out_root / "target_templates" / "alpha_png", args.train_ratio, args.val_ratio
+    )
+    d_total, d_train, d_val, d_test = _rebalance_split_pngs(
+        out_root / "distractor_templates" / "splits", args.train_ratio, args.val_ratio
+    )
+    _sync_distractor_alpha_from_splits(
+        out_root / "distractor_templates" / "splits",
+        out_root / "distractor_templates" / "alpha_png",
+    )
+    print(
+        "[INFO] rebalanced target "
+        f"total={t_total} train={t_train} val={t_val} test={t_test}"
+    )
+    print(
+        "[INFO] rebalanced distractor "
+        f"total={d_total} train={d_train} val={d_val} test={d_test}"
     )
 
 
