@@ -91,7 +91,9 @@ def ensure_layout(root: Path) -> None:
         root / "distractor_templates" / "splits" / "train",
         root / "distractor_templates" / "splits" / "val",
         root / "distractor_templates" / "splits" / "test",
-        root / "distractor_templates" / "alpha_png",
+        root / "distractor_templates" / "alpha_png" / "train",
+        root / "distractor_templates" / "alpha_png" / "val",
+        root / "distractor_templates" / "alpha_png" / "test",
         root / "manifests",
         root / "qc",
     ]:
@@ -169,7 +171,7 @@ def main() -> None:
             split = infer_split(p, f"distractor::{p.stem}", args.train_ratio, args.val_ratio)
             out_name = norm_name if norm_name.endswith(".png") else p.name
             safe_copy(p, out_root / "distractor_templates" / "splits" / split / out_name)
-            safe_copy(p, out_root / "distractor_templates" / "alpha_png" / out_name)
+            safe_copy(p, out_root / "distractor_templates" / "alpha_png" / split / out_name)
             num_dst_split += 1
             num_dst_alpha += 1
             continue
