@@ -372,6 +372,13 @@ class Stage2Renderer:
                                 local_radius=20,
                                 global_fallback=False,
                             )
+                    # Final hard continuity guard: never allow large frame-to-frame pixel jump.
+                    if prev_target_xy is not None:
+                        px, py = prev_target_xy
+                        final_step = float(np.hypot(tx - px, ty - py))
+                        max_step = float(target_cfg.get("max_step_px", 8.0))
+                        if final_step > max_step:
+                            tx, ty = px, py
                     bbox, vis = alpha_blend_center(patch, target_patch, tx, ty)
                     prev_target_xy = (tx, ty)
 
