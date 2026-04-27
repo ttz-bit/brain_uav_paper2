@@ -14,6 +14,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--inventory-csv", type=str, default="data/assets/stage2/asset_inventory.csv")
     p.add_argument("--out-json", type=str, default="data/assets/stage2/reports/asset_qc_report.json")
+    p.add_argument("--required-types", type=str, default="background,target,distractor")
+    p.add_argument("--required-splits", type=str, default="train,val,test")
     return p.parse_args()
 
 
@@ -33,6 +35,8 @@ def main() -> None:
     inventory = load_asset_inventory(args.inventory_csv)
     out_json = Path(args.out_json).resolve()
     out_json.parent.mkdir(parents=True, exist_ok=True)
+    required_types = [x.strip() for x in str(args.required_types).split(",") if x.strip()]
+    required_splits = [x.strip() for x in str(args.required_splits).split(",") if x.strip()]
 
     missing_files: list[str] = []
     invalid_shapes: list[str] = []
@@ -78,6 +82,15 @@ def main() -> None:
         overlap[asset_type] = overlap_count
         overlap_examples[asset_type] = ex
 
+    missing_required: dict[str, list[str]] = {}
+    for t in required_types:
+        missing = []
+        for s in required_splits:
+            if counts.get(t, {}).get(s, 0) <= 0:
+                missing.append(s)
+        if missing:
+            missing_required[t] = missing
+
     report = {
         "inventory_csv": str(Path(args.inventory_csv).resolve()),
         "num_assets": len(inventory),
@@ -91,12 +104,14 @@ def main() -> None:
             "missing_files": missing_files[:50],
             "invalid_shapes": invalid_shapes[:50],
             "invalid_alpha": invalid_alpha[:50],
+            "missing_required_type_split": missing_required,
         },
         "pass": (
             len(missing_files) == 0
             and len(invalid_shapes) == 0
             and len(invalid_alpha) == 0
             and all(v == 0 for v in overlap.values())
+            and len(missing_required) == 0
         ),
     }
     out_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
