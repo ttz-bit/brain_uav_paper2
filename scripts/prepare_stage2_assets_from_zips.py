@@ -73,10 +73,18 @@ def infer_background_category(path: Path) -> str | None:
 
 def ensure_layout(root: Path) -> None:
     for p in [
-        root / "backgrounds" / "open_sea_processed",
-        root / "backgrounds" / "coastal",
-        root / "backgrounds" / "island_complex",
-        root / "backgrounds" / "port",
+        root / "backgrounds" / "open_sea_processed" / "train",
+        root / "backgrounds" / "open_sea_processed" / "val",
+        root / "backgrounds" / "open_sea_processed" / "test",
+        root / "backgrounds" / "coastal" / "train",
+        root / "backgrounds" / "coastal" / "val",
+        root / "backgrounds" / "coastal" / "test",
+        root / "backgrounds" / "island_complex" / "train",
+        root / "backgrounds" / "island_complex" / "val",
+        root / "backgrounds" / "island_complex" / "test",
+        root / "backgrounds" / "port" / "train",
+        root / "backgrounds" / "port" / "val",
+        root / "backgrounds" / "port" / "test",
         root / "target_templates" / "alpha_png" / "train",
         root / "target_templates" / "alpha_png" / "val",
         root / "target_templates" / "alpha_png" / "test",
@@ -169,7 +177,8 @@ def main() -> None:
         if suffix in IMAGE_EXTS:
             cat = infer_background_category(p)
             if cat is not None:
-                safe_copy(p, out_root / "backgrounds" / cat / p.name)
+                split = infer_split(p, f"background::{cat}::{norm_name}", args.train_ratio, args.val_ratio)
+                safe_copy(p, out_root / "backgrounds" / cat / split / norm_name)
                 num_bg += 1
 
     print("[DONE] Stage2 assets prepared")
