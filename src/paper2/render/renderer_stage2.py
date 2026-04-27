@@ -114,6 +114,8 @@ def _sample_water_center(
     rng: np.random.Generator,
     min_ratio: float = 0.85,
     tries: int = 24,
+    local_radius: int = 24,
+    global_fallback: bool = False,
 ) -> tuple[float, float]:
     h, w = mask_u8.shape[:2]
     ys, xs = np.where(mask_u8 > 0)
@@ -127,11 +129,23 @@ def _sample_water_center(
     # Candidate 1: nearest water center.
     nx, ny = _snap_to_water(mask_u8, x0, y0, max_radius=max(h, w))
     candidates = [(nx, ny)]
-    # Candidate 2+: random water pixels.
-    n = min(tries, len(xs))
-    idx = rng.choice(len(xs), size=n, replace=False)
-    for i in idx:
-        candidates.append((float(xs[int(i)]), float(ys[int(i)])))
+    # Candidate 2+: prefer local water pixels around current center.
+    lx1 = max(0, int(round(x0)) - int(local_radius))
+    ly1 = max(0, int(round(y0)) - int(local_radius))
+    lx2 = min(w, int(round(x0)) + int(local_radius) + 1)
+    ly2 = min(h, int(round(y0)) + int(local_radius) + 1)
+    local = mask_u8[ly1:ly2, lx1:lx2] > 0
+    lys, lxs = np.where(local)
+    if len(lxs) > 0:
+        n_local = min(tries, len(lxs))
+        idx = rng.choice(len(lxs), size=n_local, replace=False)
+        for i in idx:
+            candidates.append((float(lxs[int(i)] + lx1), float(lys[int(i)] + ly1)))
+    elif global_fallback:
+        n = min(tries, len(xs))
+        idx = rng.choice(len(xs), size=n, replace=False)
+        for i in idx:
+            candidates.append((float(xs[int(i)]), float(ys[int(i)])))
 
     for cx, cy in candidates:
         ratio = _alpha_water_ratio(mask_u8, overlay_bgra, cx, cy)
@@ -300,7 +314,17 @@ class Stage2Renderer:
                     if target.category == "boat_top":
                         heading_deg = float(np.degrees(np.arctan2(state.vy, state.vx)))
                         target_patch = rotate_bgra(target_patch, heading_deg)
-                    tx, ty = _sample_water_center(water, target_patch, tx, ty, self.rng, min_ratio=0.985, tries=64)
+                    tx, ty = _sample_water_center(
+                        water,
+                        target_patch,
+                        tx,
+                        ty,
+                        self.rng,
+                        min_ratio=0.985,
+                        tries=64,
+                        local_radius=24,
+                        global_fallback=False,
+                    )
                     # Keep temporal continuity: strict per-frame jump cap.
                     if prev_target_xy is not None:
                         px, py = prev_target_xy
@@ -311,7 +335,17 @@ class Stage2Renderer:
                             s = max_step / dist
                             tx = px + dx * s
                             ty = py + dy * s
-                            tx, ty = _sample_water_center(water, target_patch, tx, ty, self.rng, min_ratio=0.98, tries=32)
+                            tx, ty = _sample_water_center(
+                                water,
+                                target_patch,
+                                tx,
+                                ty,
+                                self.rng,
+                                min_ratio=0.98,
+                                tries=32,
+                                local_radius=20,
+                                global_fallback=False,
+                            )
                     # Hard constraint: target must remain on water.
                     if _alpha_water_ratio(water, target_patch, tx, ty) < 0.98:
                         if prev_target_xy is not None:
@@ -323,9 +357,21 @@ class Stage2Renderer:
                                 self.rng,
                                 min_ratio=0.99,
                                 tries=64,
+                                local_radius=20,
+                                global_fallback=False,
                             )
                         else:
-                            tx, ty = _sample_water_center(water, target_patch, tx, ty, self.rng, min_ratio=0.99, tries=64)
+                            tx, ty = _sample_water_center(
+                                water,
+                                target_patch,
+                                tx,
+                                ty,
+                                self.rng,
+                                min_ratio=0.99,
+                                tries=64,
+                                local_radius=20,
+                                global_fallback=False,
+                            )
                     bbox, vis = alpha_blend_center(patch, target_patch, tx, ty)
                     prev_target_xy = (tx, ty)
 
@@ -348,6 +394,8 @@ class Stage2Renderer:
                                 self.rng,
                                 min_ratio=0.96,
                                 tries=24,
+                                local_radius=28,
+                                global_fallback=True,
                             )
                             if _alpha_water_ratio(water, d_patch, d_center_x, d_center_y) < 0.96:
                                 continue
