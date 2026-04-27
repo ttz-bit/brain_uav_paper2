@@ -83,3 +83,12 @@ seed:
 assets:
   root: D:/Projects/brain_uav_paper2/data/assets/source_stage2
   inventory_csv: data/assets/stage2/asset_inventory.csv
+
+background:
+  allowed_categories: ["open_sea", "coastal", "island_complex", "port"]
+  excluded_categories: []
+
+trajectory:
+  force_target_on_water: true
+  water_snap_radius_px: 96
+  max_world_step_m: 80.0

@@ -338,6 +338,13 @@ def _random_water_point(mask_u8: np.ndarray, rng: np.random.Generator) -> tuple[
     return float(xs[i]), float(ys[i])
 
 
+def _is_water_pixel(mask_u8: np.ndarray, x: float, y: float) -> bool:
+    h, w = mask_u8.shape[:2]
+    xi = int(np.clip(round(x), 0, w - 1))
+    yi = int(np.clip(round(y), 0, h - 1))
+    return int(mask_u8[yi, xi]) > 0
+
+
 def _bbox_from_center(overlay_bgra: np.ndarray, center_x: float, center_y: float, w: int, h: int) -> tuple[int, int, int, int]:
     oh, ow = overlay_bgra.shape[:2]
     x1 = int(round(center_x - ow / 2))
@@ -420,14 +427,89 @@ class Stage2Renderer:
         return float((mask_u8 > 0).mean())
 
     def _sample_background(self, split: str) -> AssetRecord:
-        # Conservative stage2 smoke rule: avoid "port" backgrounds until dedicated harbor-water masking is ready.
-        pool = [a for a in self.registry.get("background", split) if str(a.category).lower() != "port"]
-        if not pool:
-            pool = self.registry.get("background", split)
+        bg_cfg = dict(self.cfg.get("background", {}))
+        pool = self.registry.get("background", split)
+        allowed = {str(x).strip().lower() for x in bg_cfg.get("allowed_categories", []) if str(x).strip()}
+        excluded = {str(x).strip().lower() for x in bg_cfg.get("excluded_categories", []) if str(x).strip()}
+        if allowed:
+            pool = [a for a in pool if str(a.category).strip().lower() in allowed]
+        if excluded:
+            pool = [a for a in pool if str(a.category).strip().lower() not in excluded]
         if not pool:
             raise ValueError(f"No background assets for split={split}")
         idx = int(self.rng.integers(0, len(pool)))
         return pool[idx]
+
+    def _constrain_motion_to_water(
+        self,
+        motion: list,
+        water_mask_global: np.ndarray,
+        world_size_m: float,
+        bg_w: int,
+        bg_h: int,
+        max_world_step_m: float,
+        snap_radius_px: int,
+    ) -> list:
+        if not motion:
+            return motion
+
+        out: list = []
+        prev_x: float | None = None
+        prev_y: float | None = None
+        prev_heading: float = float(motion[0].heading)
+
+        for s in motion:
+            px, py = world_to_background_px(float(s.x), float(s.y), world_size_m, bg_w, bg_h)
+            spx, spy = _snap_to_water(water_mask_global, px, py, max_radius=max(1, int(snap_radius_px)))
+            if not _is_water_pixel(water_mask_global, spx, spy):
+                rp = _random_water_point(water_mask_global, self.rng)
+                if rp is not None:
+                    spx, spy = rp
+                elif prev_x is not None and prev_y is not None:
+                    spx, spy = world_to_background_px(prev_x, prev_y, world_size_m, bg_w, bg_h)
+                else:
+                    spx, spy = px, py
+
+            xw, yw = background_px_to_world(spx, spy, world_size_m, bg_w, bg_h)
+
+            if prev_x is not None and prev_y is not None:
+                dx = float(xw - prev_x)
+                dy = float(yw - prev_y)
+                d = float(np.hypot(dx, dy))
+                if d > float(max_world_step_m) and d > 1e-6:
+                    t = float(max_world_step_m) / d
+                    xw = float(prev_x + dx * t)
+                    yw = float(prev_y + dy * t)
+                    cpx, cpy = world_to_background_px(xw, yw, world_size_m, bg_w, bg_h)
+                    spx2, spy2 = _snap_to_water(
+                        water_mask_global,
+                        cpx,
+                        cpy,
+                        max_radius=max(2, int(max(6, snap_radius_px // 4))),
+                    )
+                    if _is_water_pixel(water_mask_global, spx2, spy2):
+                        xw, yw = background_px_to_world(spx2, spy2, world_size_m, bg_w, bg_h)
+                    else:
+                        xw, yw = float(prev_x), float(prev_y)
+
+            if prev_x is None or prev_y is None:
+                vx = float(s.vx)
+                vy = float(s.vy)
+                heading = float(s.heading)
+            else:
+                vx = float(xw - prev_x)
+                vy = float(yw - prev_y)
+                speed = float(np.hypot(vx, vy))
+                if speed > 1e-6:
+                    heading = float(np.arctan2(vy, vx))
+                    prev_heading = heading
+                else:
+                    heading = float(prev_heading)
+
+            out.append(type(s)(x=float(xw), y=float(yw), vx=vx, vy=vy, heading=heading))
+            prev_x, prev_y = float(xw), float(yw)
+
+        return out
 
     def render_split(self, split: str, num_sequences: int) -> RenderSplitResult:
         ds_name = str(self.output_root.name)
@@ -451,6 +533,10 @@ class Stage2Renderer:
         max_land_overlap = float(placement_cfg.get("max_land_overlap", 0.0))
         max_shore_overlap = float(placement_cfg.get("max_shore_buffer_overlap", 0.05))
         min_shore_clearance_px = int(placement_cfg.get("min_shore_clearance_px", 5))
+        trajectory_cfg = dict(self.cfg.get("trajectory", {}))
+        traj_force_water = bool(trajectory_cfg.get("force_target_on_water", True))
+        traj_snap_radius_px = int(trajectory_cfg.get("water_snap_radius_px", 96))
+        traj_max_step_m = float(trajectory_cfg.get("max_world_step_m", 80.0))
         allowed_target_categories = {str(x) for x in target_cfg.get("allowed_categories", ["boat_top", "boat_oblique"])}
         heading_noise_deg = float(target_cfg.get("heading_noise_deg", 10.0))
 
@@ -510,6 +596,16 @@ class Stage2Renderer:
                 mode = sample_mode(motion_probs, self.rng)
                 # Start with far-stage dt; the per-frame gsd/dt is still saved in labels.
                 motion = generate_motion_sequence(mode, frames_per_sequence, dt=1.0, world_size_m=world_size_m, rng=self.rng)
+                if traj_force_water:
+                    motion = self._constrain_motion_to_water(
+                        motion=motion,
+                        water_mask_global=bg_target_water_global,
+                        world_size_m=world_size_m,
+                        bg_w=bg_img.shape[1],
+                        bg_h=bg_img.shape[0],
+                        max_world_step_m=traj_max_step_m,
+                        snap_radius_px=traj_snap_radius_px,
+                    )
                 prev_target_xy: tuple[float, float] | None = None
                 prev_crop_center: tuple[float, float] | None = None
                 prev_scale: float | None = None
