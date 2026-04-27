@@ -1,0 +1,64 @@
+dataset:
+  name: stage2_smoke_v0
+  image_size: 256
+  heatmap_size: 64
+  frames_per_sequence: 20
+  world_size_m: 4000.0
+
+splits:
+  train:
+    sequences: 8
+  val:
+    sequences: 8
+  test:
+    sequences: 8
+
+stages:
+  far:
+    gsd_m_per_px: 25.0
+    perception_dt: 1.0
+    observation_source: external_cue
+    center_jitter_px: 10.0
+    target_scale_range: [0.12, 0.22]
+  mid:
+    gsd_m_per_px: 25.0
+    perception_dt: 1.0
+    observation_source: onboard_midrange
+    center_jitter_px: 7.0
+    target_scale_range: [0.18, 0.30]
+  terminal:
+    gsd_m_per_px: 10.0
+    perception_dt: 0.5
+    observation_source: onboard_terminal
+    center_jitter_px: 3.0
+    target_scale_range: [0.30, 0.50]
+
+motion_modes:
+  cv: 0.35
+  turn: 0.25
+  piecewise: 0.25
+  evasive: 0.15
+
+distractors:
+  min_count: 0
+  max_count: 3
+  scale_range: [0.10, 0.28]
+
+visibility:
+  min_positive_visibility: 0.35
+  max_low_visibility_ratio: 0.10
+
+perturbations:
+  brightness_jitter: 0.2
+  contrast_jitter: 0.2
+  blur_prob: 0.25
+  haze_prob: 0.20
+  light_cloud_prob: 0.15
+  compression_prob: 0.15
+
+seed:
+  global_seed: 20260427
+
+assets:
+  root: D:/paper2_assets
+  inventory_csv: data/assets/stage2/asset_inventory.csv
