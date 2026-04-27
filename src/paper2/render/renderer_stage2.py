@@ -108,6 +108,72 @@ def _select_primary_water_component(mask_u8: np.ndarray, patch_bgr: np.ndarray) 
     return out
 
 
+def _water_with_clearance(mask_u8: np.ndarray, min_clearance_px: int) -> np.ndarray:
+    if min_clearance_px <= 0:
+        return mask_u8
+    binary = (mask_u8 > 0).astype(np.uint8)
+    if int(binary.sum()) <= 0:
+        return mask_u8
+    dist = cv2.distanceTransform(binary, distanceType=cv2.DIST_L2, maskSize=3)
+    out = np.zeros_like(mask_u8, dtype=np.uint8)
+    out[dist >= float(min_clearance_px)] = 255
+    return out
+
+
+def _harmonize_overlay_to_background(
+    bg_bgr: np.ndarray,
+    overlay_bgra: np.ndarray,
+    center_x: float,
+    center_y: float,
+    strength: float = 0.35,
+) -> np.ndarray:
+    """Match overlay tone to local background so pasted targets look less synthetic."""
+    out = overlay_bgra.copy()
+    h, w = bg_bgr.shape[:2]
+    oh, ow = out.shape[:2]
+    x1 = int(round(center_x - ow / 2))
+    y1 = int(round(center_y - oh / 2))
+    x2 = x1 + ow
+    y2 = y1 + oh
+
+    ix1 = max(0, x1)
+    iy1 = max(0, y1)
+    ix2 = min(w, x2)
+    iy2 = min(h, y2)
+    if ix1 >= ix2 or iy1 >= iy2:
+        return out
+
+    ox1 = ix1 - x1
+    oy1 = iy1 - y1
+    ox2 = ox1 + (ix2 - ix1)
+    oy2 = oy1 + (iy2 - iy1)
+
+    fg_bgr = out[oy1:oy2, ox1:ox2, :3].astype(np.float32)
+    fg_alpha = out[oy1:oy2, ox1:ox2, 3]
+    mask = fg_alpha > 10
+    if int(mask.sum()) < 12:
+        return out
+
+    bg_local = bg_bgr[iy1:iy2, ix1:ix2, :3].astype(np.float32)
+    fg_pix = fg_bgr[mask]
+    bg_pix = bg_local[mask]
+    fg_mean = fg_pix.mean(axis=0)
+    bg_mean = bg_pix.mean(axis=0)
+    fg_std = fg_pix.std(axis=0) + 1e-3
+    bg_std = bg_pix.std(axis=0) + 1e-3
+
+    matched = (fg_bgr - fg_mean) / fg_std * bg_std + bg_mean
+    fg_bgr = fg_bgr * (1.0 - float(strength)) + matched * float(strength)
+    fg_bgr = np.clip(fg_bgr, 0.0, 255.0).astype(np.uint8)
+    out[oy1:oy2, ox1:ox2, :3] = fg_bgr
+
+    # Slightly soften alpha edge to reduce hard cut-out boundary.
+    alpha_f = out[:, :, 3].astype(np.float32)
+    alpha_blur = cv2.GaussianBlur(alpha_f, (0, 0), sigmaX=0.5, sigmaY=0.5)
+    out[:, :, 3] = np.clip(alpha_blur, 0.0, 255.0).astype(np.uint8)
+    return out
+
+
 def _snap_to_water(mask_u8: np.ndarray, x: float, y: float, max_radius: int = 64) -> tuple[float, float]:
     h, w = mask_u8.shape[:2]
     xi = int(np.clip(round(x), 0, w - 1))
@@ -412,8 +478,14 @@ class Stage2Renderer:
                     if target.category == "boat_top":
                         heading_deg = float(np.degrees(np.arctan2(state.vy, state.vx)))
                         target_patch = rotate_bgra(target_patch, heading_deg)
+                    # Keep target away from shoreline to avoid unrealistic "beaching" samples.
+                    th, tw = target_patch.shape[:2]
+                    shoreline_margin = int(np.clip(round(0.15 * max(th, tw)), 3, 16))
+                    target_water = _water_with_clearance(water, shoreline_margin)
+                    if self._mask_ratio(target_water) < 0.01:
+                        target_water = water
                     tx, ty = _sample_water_center(
-                        water,
+                        target_water,
                         target_patch,
                         tx,
                         ty,
@@ -434,7 +506,7 @@ class Stage2Renderer:
                             tx = px + dx * s
                             ty = py + dy * s
                             tx, ty = _sample_water_center(
-                                water,
+                                target_water,
                                 target_patch,
                                 tx,
                                 ty,
@@ -445,10 +517,10 @@ class Stage2Renderer:
                                 global_fallback=False,
                             )
                     # Hard constraint: target must remain on water.
-                    if _alpha_water_ratio(water, target_patch, tx, ty) < 0.98:
+                    if _alpha_water_ratio(target_water, target_patch, tx, ty) < 0.98:
                         if prev_target_xy is not None:
                             tx, ty = _sample_water_center(
-                                water,
+                                target_water,
                                 target_patch,
                                 prev_target_xy[0],
                                 prev_target_xy[1],
@@ -460,7 +532,7 @@ class Stage2Renderer:
                             )
                         else:
                             tx, ty = _sample_water_center(
-                                water,
+                                target_water,
                                 target_patch,
                                 tx,
                                 ty,
@@ -481,22 +553,23 @@ class Stage2Renderer:
                     # Final hard placement guard: target center must be on water.
                     iy = int(np.clip(round(ty), 0, image_size - 1))
                     ix = int(np.clip(round(tx), 0, image_size - 1))
-                    if int(water[iy, ix]) <= 0:
+                    if int(target_water[iy, ix]) <= 0:
                         max_step = float(target_cfg.get("max_step_px", 8.0))
                         local_snap_radius = int(max(6, round(max_step * 2.0)))
-                        tx2, ty2 = _snap_to_water(water, tx, ty, max_radius=local_snap_radius)
+                        tx2, ty2 = _snap_to_water(target_water, tx, ty, max_radius=local_snap_radius)
                         iy2 = int(np.clip(round(ty2), 0, image_size - 1))
                         ix2 = int(np.clip(round(tx2), 0, image_size - 1))
-                        if int(water[iy2, ix2]) > 0:
+                        if int(target_water[iy2, ix2]) > 0:
                             tx, ty = tx2, ty2
                         elif prev_target_xy is not None:
                             px, py = prev_target_xy
                             py_i = int(np.clip(round(py), 0, image_size - 1))
                             px_i = int(np.clip(round(px), 0, image_size - 1))
-                            if int(water[py_i, px_i]) > 0:
+                            if int(target_water[py_i, px_i]) > 0:
                                 tx, ty = px, py
                             # else: keep tx,ty as-is to avoid sudden teleports.
 
+                    target_patch = _harmonize_overlay_to_background(patch, target_patch, tx, ty, strength=0.35)
                     bbox, vis = alpha_blend_center(patch, target_patch, tx, ty)
                     prev_target_xy = (tx, ty)
 
@@ -511,8 +584,11 @@ class Stage2Renderer:
                             p = _random_water_point(water, self.rng)
                             if p is None:
                                 break
+                            d_water = _water_with_clearance(water, min_clearance_px=2)
+                            if self._mask_ratio(d_water) < 0.01:
+                                d_water = water
                             d_center_x, d_center_y = _sample_water_center(
-                                water,
+                                d_water,
                                 d_patch,
                                 p[0],
                                 p[1],
@@ -528,6 +604,7 @@ class Stage2Renderer:
                             # No collision/overlap with target and already placed distractors.
                             if any(_iou_xywh(d_bbox, b2) > 0.02 for b2 in placed_bboxes):
                                 continue
+                            d_patch = _harmonize_overlay_to_background(patch, d_patch, d_center_x, d_center_y, strength=0.30)
                             alpha_blend_center(patch, d_patch, d_center_x, d_center_y)
                             d_ids.append(d_asset.asset_id)
                             placed_bboxes.append(d_bbox)
