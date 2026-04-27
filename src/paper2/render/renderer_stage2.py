@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from paper2.render.asset_registry import AssetRecord, AssetRegistry
-from paper2.render.compositor import alpha_blend_center, read_bgra, resize_bgra_with_scale
+from paper2.render.compositor import alpha_blend_center, read_bgra, resize_bgra_with_scale, rotate_bgra
 from paper2.render.coordinate_mapper import world_to_background_px, world_to_image
 from paper2.render.motion_sampler import generate_motion_sequence, sample_mode
 from paper2.render.perturbations import apply_perturbations
@@ -35,6 +35,37 @@ def _extract_patch(background_bgr: np.ndarray, cx: float, cy: float, size: int) 
         y2 += pad_t
         return padded[y1:y2, x1:x2].copy()
     return background_bgr[y1:y2, x1:x2].copy()
+
+
+def _water_mask(patch_bgr: np.ndarray) -> np.ndarray:
+    # Lightweight heuristic: water tends to be blue/green with medium saturation.
+    hsv = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2HSV)
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
+    m1 = (h >= 70) & (h <= 135) & (s >= 25) & (v >= 20)
+    m2 = (h >= 50) & (h <= 160) & (s >= 35) & (v >= 15)
+    m = (m1 | m2).astype(np.uint8) * 255
+    kernel = np.ones((3, 3), np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
+    return m
+
+
+def _snap_to_water(mask_u8: np.ndarray, x: float, y: float, max_radius: int = 64) -> tuple[float, float]:
+    h, w = mask_u8.shape[:2]
+    xi = int(np.clip(round(x), 0, w - 1))
+    yi = int(np.clip(round(y), 0, h - 1))
+    if mask_u8[yi, xi] > 0:
+        return float(xi), float(yi)
+    ys, xs = np.where(mask_u8 > 0)
+    if len(xs) == 0:
+        return float(xi), float(yi)
+    d2 = (xs - xi) * (xs - xi) + (ys - yi) * (ys - yi)
+    idx = int(np.argmin(d2))
+    if d2[idx] > max_radius * max_radius:
+        return float(xi), float(yi)
+    return float(xs[idx]), float(ys[idx])
 
 
 @dataclass
@@ -133,11 +164,16 @@ class Stage2Renderer:
 
                     bg_cx, bg_cy = world_to_background_px(crop_center_x, crop_center_y, world_size_m, bg_img.shape[1], bg_img.shape[0])
                     patch = _extract_patch(bg_img, bg_cx, bg_cy, image_size)
+                    water = _water_mask(patch)
 
                     tx, ty = world_to_image(state.x, state.y, crop_center_x, crop_center_y, gsd, image_size)
+                    tx, ty = _snap_to_water(water, tx, ty)
                     scale_min, scale_max = stage_cfg["target_scale_range"]
                     target_scale = float(self.rng.uniform(float(scale_min), float(scale_max)))
                     target_patch = resize_bgra_with_scale(target_bgra, target_scale, image_size=image_size)
+                    heading_deg = float(np.degrees(np.arctan2(state.vy, state.vx)))
+                    # Templates are mostly "bow-to-right"; rotate to align with motion direction.
+                    target_patch = rotate_bgra(target_patch, heading_deg)
                     bbox, vis = alpha_blend_center(patch, target_patch, tx, ty)
 
                     d_ids: list[str] = []

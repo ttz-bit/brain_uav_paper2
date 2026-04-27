@@ -26,6 +26,28 @@ def resize_bgra_with_scale(img_bgra: np.ndarray, scale: float, image_size: int) 
     return cv2.resize(img_bgra, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
 
+def rotate_bgra(img_bgra: np.ndarray, angle_deg: float) -> np.ndarray:
+    h, w = img_bgra.shape[:2]
+    if h <= 0 or w <= 0:
+        return img_bgra
+    center = (w / 2.0, h / 2.0)
+    m = cv2.getRotationMatrix2D(center, float(angle_deg), 1.0)
+    cos = abs(m[0, 0])
+    sin = abs(m[0, 1])
+    new_w = int((h * sin) + (w * cos))
+    new_h = int((h * cos) + (w * sin))
+    m[0, 2] += (new_w / 2.0) - center[0]
+    m[1, 2] += (new_h / 2.0) - center[1]
+    return cv2.warpAffine(
+        img_bgra,
+        m,
+        (new_w, new_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0, 0),
+    )
+
+
 def alpha_blend_center(
     canvas_bgr: np.ndarray,
     overlay_bgra: np.ndarray,
