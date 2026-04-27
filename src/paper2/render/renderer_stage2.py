@@ -52,6 +52,14 @@ def _water_mask(patch_bgr: np.ndarray) -> np.ndarray:
     return m
 
 
+def _safe_water_mask(mask_u8: np.ndarray, margin_px: int = 3) -> np.ndarray:
+    if margin_px <= 0:
+        return mask_u8
+    k = max(3, int(margin_px) * 2 + 1)
+    kernel = np.ones((k, k), np.uint8)
+    return cv2.erode(mask_u8, kernel, iterations=1)
+
+
 def _snap_to_water(mask_u8: np.ndarray, x: float, y: float, max_radius: int = 64) -> tuple[float, float]:
     h, w = mask_u8.shape[:2]
     xi = int(np.clip(round(x), 0, w - 1))
@@ -145,6 +153,32 @@ def _random_water_point(mask_u8: np.ndarray, rng: np.random.Generator) -> tuple[
     return float(xs[i]), float(ys[i])
 
 
+def _bbox_from_center(overlay_bgra: np.ndarray, center_x: float, center_y: float, w: int, h: int) -> tuple[int, int, int, int]:
+    oh, ow = overlay_bgra.shape[:2]
+    x1 = int(round(center_x - ow / 2))
+    y1 = int(round(center_y - oh / 2))
+    x2 = x1 + ow
+    y2 = y1 + oh
+    ix1 = max(0, x1)
+    iy1 = max(0, y1)
+    ix2 = min(w, x2)
+    iy2 = min(h, y2)
+    return (ix1, iy1, max(0, ix2 - ix1), max(0, iy2 - iy1))
+
+
+def _iou_xywh(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax1, ay1, aw, ah = a
+    bx1, by1, bw, bh = b
+    ax2, ay2 = ax1 + aw, ay1 + ah
+    bx2, by2 = bx1 + bw, by1 + bh
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = float(iw * ih)
+    ua = float(max(1, aw * ah) + max(1, bw * bh) - inter)
+    return inter / ua
+
+
 @dataclass
 class RenderSplitResult:
     split: str
@@ -233,6 +267,7 @@ class Stage2Renderer:
                 mode = sample_mode(motion_probs, self.rng)
                 # Start with far-stage dt; the per-frame gsd/dt is still saved in labels.
                 motion = generate_motion_sequence(mode, frames_per_sequence, dt=1.0, world_size_m=world_size_m, rng=self.rng)
+                prev_target_xy: tuple[float, float] | None = None
 
                 for frame_idx, state in enumerate(motion):
                     stage_name = self._stage_for_frame(frame_idx, frames_per_sequence)
@@ -247,7 +282,7 @@ class Stage2Renderer:
 
                     bg_cx, bg_cy = world_to_background_px(crop_center_x, crop_center_y, world_size_m, bg_img.shape[1], bg_img.shape[0])
                     patch = _extract_patch(bg_img, bg_cx, bg_cy, image_size)
-                    water = _water_mask(patch)
+                    water = _safe_water_mask(_water_mask(patch), margin_px=4)
 
                     tx, ty = world_to_image(state.x, state.y, crop_center_x, crop_center_y, gsd, image_size)
                     scale_min, scale_max = stage_cfg["target_scale_range"]
@@ -257,43 +292,59 @@ class Stage2Renderer:
                     if target.category == "boat_top":
                         heading_deg = float(np.degrees(np.arctan2(state.vy, state.vx)))
                         target_patch = rotate_bgra(target_patch, heading_deg)
-                    tx, ty = _sample_water_center(water, target_patch, tx, ty, self.rng, min_ratio=0.96, tries=48)
-                    # Hard constraint: target must stay on water; fallback to random water tries.
-                    t_ratio = _alpha_water_ratio(water, target_patch, tx, ty)
-                    if t_ratio < 0.96:
-                        for _ in range(24):
-                            p = _random_water_point(water, self.rng)
-                            if p is None:
-                                break
-                            cx, cy = p
-                            if _alpha_water_ratio(water, target_patch, cx, cy) >= 0.96:
-                                tx, ty = cx, cy
-                                t_ratio = 1.0
-                                break
+                    tx, ty = _sample_water_center(water, target_patch, tx, ty, self.rng, min_ratio=0.985, tries=64)
+                    # Keep temporal continuity: limit per-frame jump.
+                    if prev_target_xy is not None:
+                        px, py = prev_target_xy
+                        dx, dy = tx - px, ty - py
+                        dist = float(np.hypot(dx, dy))
+                        max_step = float(image_size) * 0.28
+                        if dist > max_step and dist > 1e-6:
+                            s = max_step / dist
+                            tx = px + dx * s
+                            ty = py + dy * s
+                            tx, ty = _sample_water_center(water, target_patch, tx, ty, self.rng, min_ratio=0.98, tries=32)
+                    # Hard constraint: target must remain on water.
+                    if _alpha_water_ratio(water, target_patch, tx, ty) < 0.98:
+                        p = _random_water_point(water, self.rng)
+                        if p is not None:
+                            tx, ty = _sample_water_center(water, target_patch, p[0], p[1], self.rng, min_ratio=0.99, tries=64)
                     bbox, vis = alpha_blend_center(patch, target_patch, tx, ty)
+                    prev_target_xy = (tx, ty)
 
                     d_ids: list[str] = []
+                    placed_bboxes: list[tuple[int, int, int, int]] = [bbox]
                     d_min, d_max = distractor_cfg["scale_range"]
                     for d_asset, d_img in zip(distractors, distractor_bgras):
                         d_scale = float(self.rng.uniform(float(d_min), float(d_max)))
                         d_patch = resize_bgra_with_scale(d_img, d_scale, image_size=image_size)
-                        p = _random_water_point(water, self.rng)
-                        if p is None:
+                        placed = False
+                        for _ in range(24):
+                            p = _random_water_point(water, self.rng)
+                            if p is None:
+                                break
+                            d_center_x, d_center_y = _sample_water_center(
+                                water,
+                                d_patch,
+                                p[0],
+                                p[1],
+                                self.rng,
+                                min_ratio=0.96,
+                                tries=24,
+                            )
+                            if _alpha_water_ratio(water, d_patch, d_center_x, d_center_y) < 0.96:
+                                continue
+                            d_bbox = _bbox_from_center(d_patch, d_center_x, d_center_y, image_size, image_size)
+                            # No collision/overlap with target and already placed distractors.
+                            if any(_iou_xywh(d_bbox, b2) > 0.02 for b2 in placed_bboxes):
+                                continue
+                            alpha_blend_center(patch, d_patch, d_center_x, d_center_y)
+                            d_ids.append(d_asset.asset_id)
+                            placed_bboxes.append(d_bbox)
+                            placed = True
+                            break
+                        if not placed:
                             continue
-                        d_center_x, d_center_y = p
-                        d_center_x, d_center_y = _sample_water_center(
-                            water,
-                            d_patch,
-                            d_center_x,
-                            d_center_y,
-                            self.rng,
-                            min_ratio=0.93,
-                            tries=24,
-                        )
-                        if _alpha_water_ratio(water, d_patch, d_center_x, d_center_y) < 0.93:
-                            continue
-                        alpha_blend_center(patch, d_patch, d_center_x, d_center_y)
-                        d_ids.append(d_asset.asset_id)
 
                     patch = apply_perturbations(patch, perturb_cfg, self.rng)
 
