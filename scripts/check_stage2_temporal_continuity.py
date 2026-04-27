@@ -13,6 +13,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-root", type=str, default="data/rendered/stage2_smoke_v0")
     p.add_argument("--max-center-step-px", type=float, default=20.0)
     p.add_argument("--max-world-step-m", type=float, default=80.0)
+    p.add_argument("--max-scale-change-ratio", type=float, default=0.05)
+    p.add_argument("--max-angle-change-deg", type=float, default=12.0)
+    p.add_argument("--max-crop-step-px", type=float, default=38.4)
     p.add_argument(
         "--out-json",
         type=str,
@@ -63,6 +66,10 @@ def main() -> None:
     seq_reports: dict[str, dict] = {}
     all_center_steps: list[float] = []
     all_world_steps: list[float] = []
+    all_crop_steps: list[float] = []
+    scale_change_violations = 0
+    angle_change_violations = 0
+    crop_step_violations = 0
     center_violations = 0
     world_violations = 0
 
@@ -70,7 +77,13 @@ def main() -> None:
         rows = sorted(rows, key=lambda x: int(x["frame_id"]))
         center_steps: list[float] = []
         world_steps: list[float] = []
+        crop_steps: list[float] = []
         seq_bad: list[dict] = []
+        seq_scale_change_violations = 0
+        seq_angle_change_violations = 0
+        seq_crop_step_violations = 0
+        bg_ids = {str(r.get("background_asset_id", "")) for r in rows}
+        tgt_ids = {str(r.get("target_asset_id", "")) for r in rows}
         for i in range(1, len(rows)):
             a = rows[i - 1]
             b = rows[i]
@@ -78,28 +91,68 @@ def main() -> None:
             aw = a["meta"]["target_state_world"]
             bw = b["meta"]["target_state_world"]
             w_step = _step([aw["x"], aw["y"]], [bw["x"], bw["y"]])
+            ac = a["meta"].get("crop_center_world", [0.0, 0.0])
+            bc = b["meta"].get("crop_center_world", [0.0, 0.0])
+            agsd = float(a.get("gsd_m_per_px", a["meta"].get("gsd", 1.0)))
+            bgsd = float(b.get("gsd_m_per_px", b["meta"].get("gsd", 1.0)))
+            gsd = max(1e-6, 0.5 * (agsd + bgsd))
+            crop_step_m = _step([float(ac[0]), float(ac[1])], [float(bc[0]), float(bc[1])])
+            crop_step_px = crop_step_m / gsd
+            a_scale = float(a.get("meta", {}).get("scale_factor", a.get("scale_px", a["meta"].get("scale_px", 0.0))))
+            b_scale = float(b.get("meta", {}).get("scale_factor", b.get("scale_px", b["meta"].get("scale_px", 0.0))))
+            scale_ratio = float(b_scale / max(1e-6, a_scale))
+            a_ang = float(a.get("angle_deg", a["meta"].get("angle_deg", 0.0)))
+            b_ang = float(b.get("angle_deg", b["meta"].get("angle_deg", 0.0)))
+            d_ang = b_ang - a_ang
+            while d_ang > 180.0:
+                d_ang -= 360.0
+            while d_ang < -180.0:
+                d_ang += 360.0
+
             center_steps.append(c_step)
             world_steps.append(w_step)
-            if c_step > float(args.max_center_step_px) or w_step > float(args.max_world_step_m):
+            crop_steps.append(crop_step_px)
+            if (
+                c_step > float(args.max_center_step_px)
+                or w_step > float(args.max_world_step_m)
+                or abs(scale_ratio - 1.0) > float(args.max_scale_change_ratio) + 1e-6
+                or abs(d_ang) > float(args.max_angle_change_deg) + 1e-6
+                or crop_step_px > float(args.max_crop_step_px) + 1e-6
+            ):
                 seq_bad.append(
                     {
                         "from_frame": str(a["frame_id"]),
                         "to_frame": str(b["frame_id"]),
                         "center_step_px": c_step,
                         "world_step_m": w_step,
+                        "scale_ratio": scale_ratio,
+                        "angle_delta_deg": float(d_ang),
+                        "crop_step_px": crop_step_px,
                     }
                 )
             if c_step > float(args.max_center_step_px):
                 center_violations += 1
             if w_step > float(args.max_world_step_m):
                 world_violations += 1
+            if abs(scale_ratio - 1.0) > float(args.max_scale_change_ratio) + 1e-6:
+                scale_change_violations += 1
+                seq_scale_change_violations += 1
+            if abs(d_ang) > float(args.max_angle_change_deg) + 1e-6:
+                angle_change_violations += 1
+                seq_angle_change_violations += 1
+            if crop_step_px > float(args.max_crop_step_px) + 1e-6:
+                crop_step_violations += 1
+                seq_crop_step_violations += 1
 
         all_center_steps.extend(center_steps)
         all_world_steps.extend(world_steps)
+        all_crop_steps.extend(crop_steps)
 
         seq_reports[seq_id] = {
             "num_frames": len(rows),
             "num_steps": max(0, len(rows) - 1),
+            "background_fixed": bool(len(bg_ids) == 1),
+            "target_fixed": bool(len(tgt_ids) == 1),
             "center_step_px": {
                 "mean": float(np.mean(center_steps)) if center_steps else 0.0,
                 "p95": float(np.percentile(center_steps, 95)) if center_steps else 0.0,
@@ -110,10 +163,20 @@ def main() -> None:
                 "p95": float(np.percentile(world_steps, 95)) if world_steps else 0.0,
                 "max": float(np.max(world_steps)) if world_steps else 0.0,
             },
+            "crop_step_px": {
+                "mean": float(np.mean(crop_steps)) if crop_steps else 0.0,
+                "p95": float(np.percentile(crop_steps, 95)) if crop_steps else 0.0,
+                "max": float(np.max(crop_steps)) if crop_steps else 0.0,
+            },
+            "scale_change_violations": int(seq_scale_change_violations),
+            "angle_change_violations": int(seq_angle_change_violations),
+            "crop_step_violations": int(seq_crop_step_violations),
             "jump_events": seq_bad[:20],
             "num_jump_events": len(seq_bad),
         }
 
+    fixed_bg_ok = all(v.get("background_fixed", False) for v in seq_reports.values()) if seq_reports else True
+    fixed_target_ok = all(v.get("target_fixed", False) for v in seq_reports.values()) if seq_reports else True
     report = {
         "dataset_root": str(root),
         "num_rows": int(total_rows),
@@ -121,6 +184,9 @@ def main() -> None:
         "thresholds": {
             "max_center_step_px": float(args.max_center_step_px),
             "max_world_step_m": float(args.max_world_step_m),
+            "max_scale_change_ratio": float(args.max_scale_change_ratio),
+            "max_angle_change_deg": float(args.max_angle_change_deg),
+            "max_crop_step_px": float(args.max_crop_step_px),
         },
         "global": {
             "center_step_px": {
@@ -133,10 +199,28 @@ def main() -> None:
                 "p95": float(np.percentile(all_world_steps, 95)) if all_world_steps else 0.0,
                 "max": float(np.max(all_world_steps)) if all_world_steps else 0.0,
             },
+            "crop_step_px": {
+                "mean": float(np.mean(all_crop_steps)) if all_crop_steps else 0.0,
+                "p95": float(np.percentile(all_crop_steps, 95)) if all_crop_steps else 0.0,
+                "max": float(np.max(all_crop_steps)) if all_crop_steps else 0.0,
+            },
             "center_step_violations": int(center_violations),
             "world_step_violations": int(world_violations),
+            "scale_change_violations": int(scale_change_violations),
+            "angle_change_violations": int(angle_change_violations),
+            "crop_step_violations": int(crop_step_violations),
+            "background_fixed_violations": int(sum(1 for v in seq_reports.values() if not v.get("background_fixed", False))),
+            "target_fixed_violations": int(sum(1 for v in seq_reports.values() if not v.get("target_fixed", False))),
         },
-        "pass": bool(center_violations == 0 and world_violations == 0),
+        "pass": bool(
+            center_violations == 0
+            and world_violations == 0
+            and scale_change_violations == 0
+            and angle_change_violations == 0
+            and crop_step_violations == 0
+            and fixed_bg_ok
+            and fixed_target_ok
+        ),
         "sequences": seq_reports,
     }
 
@@ -148,4 +232,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

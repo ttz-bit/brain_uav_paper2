@@ -19,6 +19,11 @@ class RenderedFrameRecord:
     target_asset_id: str
     distractor_asset_ids: list[str]
     motion_mode: str
+    land_overlap_ratio: float
+    shore_buffer_overlap_ratio: float
+    scale_px: float
+    angle_deg: float
+    obs_valid: bool
     meta: dict
 
     def to_dict(self) -> dict:

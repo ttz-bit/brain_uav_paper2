@@ -60,6 +60,22 @@ target:
   scale_mode: stage_progressive
   fixed_scale_range: [0.08, 0.12]
   max_step_px: 8.0
+  allowed_categories: ["boat_top", "boat_oblique"]
+  heading_noise_deg: 10.0
+
+continuity:
+  max_position_shift_ratio: 0.15
+  max_scale_change_ratio: 0.05
+  max_angle_change_deg: 12.0
+  max_crop_shift_ratio: 0.15
+
+placement:
+  require_water_mask: true
+  max_land_overlap: 0.0
+  max_shore_buffer_overlap: 0.05
+  min_visibility: 0.35
+  max_truncation_ratio: 0.20
+  min_shore_clearance_px: 5
 
 seed:
   global_seed: 20260427

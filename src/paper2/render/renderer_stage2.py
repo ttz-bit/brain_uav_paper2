@@ -220,6 +220,63 @@ def _alpha_water_ratio(mask_u8: np.ndarray, overlay_bgra: np.ndarray, center_x: 
     return float(num / float(denom))
 
 
+def _alpha_overlap_ratio(mask_u8: np.ndarray, overlay_bgra: np.ndarray, center_x: float, center_y: float) -> float:
+    h, w = mask_u8.shape[:2]
+    oh, ow = overlay_bgra.shape[:2]
+    x1 = int(round(center_x - ow / 2))
+    y1 = int(round(center_y - oh / 2))
+    x2 = x1 + ow
+    y2 = y1 + oh
+
+    ix1 = max(0, x1)
+    iy1 = max(0, y1)
+    ix2 = min(w, x2)
+    iy2 = min(h, y2)
+    if ix1 >= ix2 or iy1 >= iy2:
+        return 0.0
+
+    ox1 = ix1 - x1
+    oy1 = iy1 - y1
+    ox2 = ox1 + (ix2 - ix1)
+    oy2 = oy1 + (iy2 - iy1)
+
+    alpha = overlay_bgra[oy1:oy2, ox1:ox2, 3]
+    fg = alpha > 10
+    denom = int(fg.sum())
+    if denom <= 0:
+        return 0.0
+    m = mask_u8[iy1:iy2, ix1:ix2] > 0
+    num = int((fg & m).sum())
+    return float(num / float(denom))
+
+
+def _overlay_visibility(overlay_bgra: np.ndarray, center_x: float, center_y: float, w: int, h: int) -> float:
+    oh, ow = overlay_bgra.shape[:2]
+    x1 = int(round(center_x - ow / 2))
+    y1 = int(round(center_y - oh / 2))
+    x2 = x1 + ow
+    y2 = y1 + oh
+
+    alpha = overlay_bgra[:, :, 3] > 10
+    total = int(alpha.sum())
+    if total <= 0:
+        return 0.0
+
+    ix1 = max(0, x1)
+    iy1 = max(0, y1)
+    ix2 = min(w, x2)
+    iy2 = min(h, y2)
+    if ix1 >= ix2 or iy1 >= iy2:
+        return 0.0
+
+    ox1 = ix1 - x1
+    oy1 = iy1 - y1
+    ox2 = ox1 + (ix2 - ix1)
+    oy2 = oy1 + (iy2 - iy1)
+    visible = int((overlay_bgra[oy1:oy2, ox1:ox2, 3] > 10).sum())
+    return float(visible / float(total))
+
+
 def _sample_water_center(
     mask_u8: np.ndarray,
     overlay_bgra: np.ndarray,
@@ -382,6 +439,20 @@ class Stage2Renderer:
         distractor_cfg = dict(self.cfg["distractors"])
         stages_cfg = dict(self.cfg["stages"])
         target_cfg = dict(self.cfg.get("target", {}))
+        continuity_cfg = dict(self.cfg.get("continuity", {}))
+        placement_cfg = dict(self.cfg.get("placement", {}))
+        max_pos_step_px = float(continuity_cfg.get("max_position_shift_ratio", 0.15)) * float(image_size)
+        max_crop_shift_ratio = float(continuity_cfg.get("max_crop_shift_ratio", 0.15))
+        max_scale_change_ratio = float(continuity_cfg.get("max_scale_change_ratio", 0.05))
+        max_angle_change_deg = float(continuity_cfg.get("max_angle_change_deg", 12.0))
+        min_visibility = float(placement_cfg.get("min_visibility", 0.35))
+        max_truncation_ratio = float(placement_cfg.get("max_truncation_ratio", 0.20))
+        require_water_mask = bool(placement_cfg.get("require_water_mask", True))
+        max_land_overlap = float(placement_cfg.get("max_land_overlap", 0.0))
+        max_shore_overlap = float(placement_cfg.get("max_shore_buffer_overlap", 0.05))
+        min_shore_clearance_px = int(placement_cfg.get("min_shore_clearance_px", 5))
+        allowed_target_categories = {str(x) for x in target_cfg.get("allowed_categories", ["boat_top", "boat_oblique"])}
+        heading_noise_deg = float(target_cfg.get("heading_noise_deg", 10.0))
 
         images_dir = self.output_root / "images" / split
         labels_dir = self.output_root / "labels"
@@ -417,13 +488,14 @@ class Stage2Renderer:
                 for d in distractors:
                     used_distractor_ids.add(d.asset_id)
 
-                # Prefer top-view templates for aerial realism; fallback to any target if none available.
+                # Enforce allowed target viewpoints for aerial realism.
                 split_targets = self.registry.get("target", split)
-                top_targets = [a for a in split_targets if a.category == "boat_top"]
-                if top_targets:
-                    target = top_targets[int(self.rng.integers(0, len(top_targets)))]
-                else:
-                    target = self.registry.sample_one("target", split, self.rng)
+                allowed_targets = [a for a in split_targets if str(a.category) in allowed_target_categories]
+                if not allowed_targets:
+                    raise RuntimeError(
+                        f"No allowed target templates in split={split}; expected categories={sorted(allowed_target_categories)}"
+                    )
+                target = allowed_targets[int(self.rng.integers(0, len(allowed_targets)))]
                 used_target_ids.add(target.asset_id)
                 target_bgra = read_bgra(target.path)
                 distractor_bgras = [read_bgra(d.path) for d in distractors]
@@ -432,6 +504,9 @@ class Stage2Renderer:
                 # Start with far-stage dt; the per-frame gsd/dt is still saved in labels.
                 motion = generate_motion_sequence(mode, frames_per_sequence, dt=1.0, world_size_m=world_size_m, rng=self.rng)
                 prev_target_xy: tuple[float, float] | None = None
+                prev_crop_center: tuple[float, float] | None = None
+                prev_scale: float | None = None
+                prev_angle_deg: float | None = None
                 # Keep target scale stable per sequence by default (more realistic temporal continuity).
                 fixed_scale_range = target_cfg.get("fixed_scale_range", [0.14, 0.20])
                 seq_target_scale = float(self.rng.uniform(float(fixed_scale_range[0]), float(fixed_scale_range[1])))
@@ -447,6 +522,16 @@ class Stage2Renderer:
                     crop_center_y = state.y + float(self.rng.normal(0.0, center_jitter_px * gsd))
                     crop_center_x = float(np.clip(crop_center_x, 0.0, world_size_m))
                     crop_center_y = float(np.clip(crop_center_y, 0.0, world_size_m))
+                    if prev_crop_center is not None:
+                        pcx, pcy = prev_crop_center
+                        dx = crop_center_x - pcx
+                        dy = crop_center_y - pcy
+                        d = float(np.hypot(dx, dy))
+                        max_crop_step_m = max_crop_shift_ratio * float(image_size) * gsd
+                        if d > max_crop_step_m and d > 1e-6:
+                            s = max_crop_step_m / d
+                            crop_center_x = pcx + dx * s
+                            crop_center_y = pcy + dy * s
 
                     bg_cx, bg_cy = world_to_background_px(crop_center_x, crop_center_y, world_size_m, bg_img.shape[1], bg_img.shape[0])
                     patch = _extract_patch(bg_img, bg_cx, bg_cy, image_size)
@@ -460,6 +545,19 @@ class Stage2Renderer:
                         tgt_bg_x, tgt_bg_y = world_to_background_px(state.x, state.y, world_size_m, bg_img.shape[1], bg_img.shape[0])
                         nwx, nwy = _snap_to_water(bg_water_global, tgt_bg_x, tgt_bg_y, max_radius=max(bg_img.shape[0], bg_img.shape[1]))
                         crop_center_x, crop_center_y = background_px_to_world(nwx, nwy, world_size_m, bg_img.shape[1], bg_img.shape[0])
+                        if prev_crop_center is not None:
+                            pcx, pcy = prev_crop_center
+                            dx = crop_center_x - pcx
+                            dy = crop_center_y - pcy
+                            d = float(np.hypot(dx, dy))
+                            max_crop_step_m = max_crop_shift_ratio * float(image_size) * gsd
+                            if d > max_crop_step_m and d > 1e-6:
+                                s = max_crop_step_m / d
+                                crop_center_x = pcx + dx * s
+                                crop_center_y = pcy + dy * s
+                                nwx, nwy = world_to_background_px(
+                                    crop_center_x, crop_center_y, world_size_m, bg_img.shape[1], bg_img.shape[0]
+                                )
                         bg_cx, bg_cy = nwx, nwy
                         patch = _extract_patch(bg_img, bg_cx, bg_cy, image_size)
                         water = _extract_patch(bg_water_global, bg_cx, bg_cy, image_size)
@@ -473,14 +571,27 @@ class Stage2Renderer:
                         target_scale = float(self.rng.uniform(float(scale_min), float(scale_max)))
                     else:
                         target_scale = seq_target_scale
+                    if prev_scale is not None:
+                        s_lo = prev_scale * (1.0 - max_scale_change_ratio)
+                        s_hi = prev_scale * (1.0 + max_scale_change_ratio)
+                        target_scale = float(np.clip(target_scale, s_lo, s_hi))
+                    target_scale = float(max(0.01, target_scale))
                     target_patch = resize_bgra_with_scale(target_bgra, target_scale, image_size=image_size)
-                    # Only top-view templates are rotated by heading to avoid "capsized" side-view artifacts.
-                    if target.category == "boat_top":
-                        heading_deg = float(np.degrees(np.arctan2(state.vy, state.vx)))
-                        target_patch = rotate_bgra(target_patch, heading_deg)
+                    heading_deg = float(np.degrees(np.arctan2(state.vy, state.vx)))
+                    angle_deg = heading_deg + float(self.rng.uniform(-heading_noise_deg, heading_noise_deg))
+                    if prev_angle_deg is not None:
+                        d_ang = angle_deg - prev_angle_deg
+                        while d_ang > 180.0:
+                            d_ang -= 360.0
+                        while d_ang < -180.0:
+                            d_ang += 360.0
+                        d_ang = float(np.clip(d_ang, -max_angle_change_deg, max_angle_change_deg))
+                        angle_deg = prev_angle_deg + d_ang
+                    target_patch = rotate_bgra(target_patch, angle_deg)
+
                     # Keep target away from shoreline to avoid unrealistic "beaching" samples.
                     th, tw = target_patch.shape[:2]
-                    shoreline_margin = int(np.clip(round(0.15 * max(th, tw)), 3, 16))
+                    shoreline_margin = int(max(min_shore_clearance_px, np.clip(round(0.55 * max(th, tw)), 4, 48)))
                     target_water = _water_with_clearance(water, shoreline_margin)
                     if self._mask_ratio(target_water) < 0.01:
                         target_water = water
@@ -500,7 +611,7 @@ class Stage2Renderer:
                         px, py = prev_target_xy
                         dx, dy = tx - px, ty - py
                         dist = float(np.hypot(dx, dy))
-                        max_step = float(target_cfg.get("max_step_px", 16.0))
+                        max_step = min(float(target_cfg.get("max_step_px", 16.0)), max_pos_step_px)
                         if dist > max_step and dist > 1e-6:
                             s = max_step / dist
                             tx = px + dx * s
@@ -546,7 +657,7 @@ class Stage2Renderer:
                     if prev_target_xy is not None:
                         px, py = prev_target_xy
                         final_step = float(np.hypot(tx - px, ty - py))
-                        max_step = float(target_cfg.get("max_step_px", 8.0))
+                        max_step = min(float(target_cfg.get("max_step_px", 8.0)), max_pos_step_px)
                         if final_step > max_step:
                             tx, ty = px, py
 
@@ -569,9 +680,118 @@ class Stage2Renderer:
                                 tx, ty = px, py
                             # else: keep tx,ty as-is to avoid sudden teleports.
 
+                    water_binary = (water > 0).astype(np.uint8)
+                    land_mask = ((water_binary == 0).astype(np.uint8)) * 255
+                    shore_mask = (((water_binary > 0) & (cv2.distanceTransform(water_binary, cv2.DIST_L2, 3) < float(shoreline_margin))).astype(np.uint8)) * 255
+
+                    # Placement retry under hard semantic constraints.
+                    for _ in range(12):
+                        land_overlap_ratio = _alpha_overlap_ratio(land_mask, target_patch, tx, ty)
+                        shore_overlap_ratio = _alpha_overlap_ratio(shore_mask, target_patch, tx, ty)
+                        if land_overlap_ratio <= max_land_overlap and shore_overlap_ratio <= max_shore_overlap:
+                            break
+                        anchor_x, anchor_y = (prev_target_xy[0], prev_target_xy[1]) if prev_target_xy is not None else (tx, ty)
+                        max_step = min(float(target_cfg.get("max_step_px", 8.0)), max_pos_step_px)
+                        tx, ty = _sample_water_center(
+                            target_water,
+                            target_patch,
+                            anchor_x,
+                            anchor_y,
+                            self.rng,
+                            min_ratio=0.99,
+                            tries=48,
+                            local_radius=int(max(6, round(max_step))),
+                            global_fallback=False,
+                        )
+
+                    land_overlap_ratio = _alpha_overlap_ratio(land_mask, target_patch, tx, ty)
+                    shore_overlap_ratio = _alpha_overlap_ratio(shore_mask, target_patch, tx, ty)
+                    pre_vis = _overlay_visibility(target_patch, tx, ty, image_size, image_size)
+                    truncation_ratio = max(0.0, 1.0 - pre_vis)
+                    max_step = min(float(target_cfg.get("max_step_px", 8.0)), max_pos_step_px)
+                    is_semantic_ok = (
+                        float(land_overlap_ratio) <= float(max_land_overlap)
+                        and float(shore_overlap_ratio) <= float(max_shore_overlap)
+                        and float(pre_vis) >= float(min_visibility)
+                        and float(truncation_ratio) <= float(max_truncation_ratio)
+                        and (not require_water_mask or _alpha_water_ratio(water, target_patch, tx, ty) >= 0.96)
+                    )
+                    if not is_semantic_ok:
+                        for _ in range(96):
+                            p = _random_water_point(target_water, self.rng)
+                            if p is None:
+                                break
+                            cx, cy = _sample_water_center(
+                                target_water,
+                                target_patch,
+                                p[0],
+                                p[1],
+                                self.rng,
+                                min_ratio=0.99,
+                                tries=24,
+                                local_radius=int(max(6, round(max_step))),
+                                global_fallback=False,
+                            )
+                            if prev_target_xy is not None:
+                                d = float(np.hypot(cx - prev_target_xy[0], cy - prev_target_xy[1]))
+                                if d > max_step + 1e-6:
+                                    continue
+                            l = _alpha_overlap_ratio(land_mask, target_patch, cx, cy)
+                            s = _alpha_overlap_ratio(shore_mask, target_patch, cx, cy)
+                            v = _overlay_visibility(target_patch, cx, cy, image_size, image_size)
+                            t = max(0.0, 1.0 - v)
+                            if (
+                                float(l) <= float(max_land_overlap)
+                                and float(s) <= float(max_shore_overlap)
+                                and float(v) >= float(min_visibility)
+                                and float(t) <= float(max_truncation_ratio)
+                                and (not require_water_mask or _alpha_water_ratio(water, target_patch, cx, cy) >= 0.96)
+                            ):
+                                tx, ty = cx, cy
+                                land_overlap_ratio = l
+                                shore_overlap_ratio = s
+                                pre_vis = v
+                                truncation_ratio = t
+                                break
+                    is_semantic_ok = (
+                        float(land_overlap_ratio) <= float(max_land_overlap)
+                        and float(shore_overlap_ratio) <= float(max_shore_overlap)
+                        and float(pre_vis) >= float(min_visibility)
+                        and float(truncation_ratio) <= float(max_truncation_ratio)
+                        and (not require_water_mask or _alpha_water_ratio(water, target_patch, tx, ty) >= 0.96)
+                    )
+                    if (not is_semantic_ok) and (prev_target_xy is not None):
+                        px, py = prev_target_xy
+                        l = _alpha_overlap_ratio(land_mask, target_patch, px, py)
+                        s = _alpha_overlap_ratio(shore_mask, target_patch, px, py)
+                        v = _overlay_visibility(target_patch, px, py, image_size, image_size)
+                        t = max(0.0, 1.0 - v)
+                        if (
+                            float(l) <= float(max_land_overlap)
+                            and float(s) <= float(max_shore_overlap)
+                            and float(v) >= float(min_visibility)
+                            and float(t) <= float(max_truncation_ratio)
+                            and (not require_water_mask or _alpha_water_ratio(water, target_patch, px, py) >= 0.96)
+                        ):
+                            tx, ty = px, py
+                            land_overlap_ratio = l
+                            shore_overlap_ratio = s
+                            pre_vis = v
+                            truncation_ratio = t
+
                     target_patch = _harmonize_overlay_to_background(patch, target_patch, tx, ty, strength=0.35)
                     bbox, vis = alpha_blend_center(patch, target_patch, tx, ty)
+                    obs_valid = (
+                        (not require_water_mask or _alpha_water_ratio(water, target_patch, tx, ty) >= 0.96)
+                        and float(land_overlap_ratio) <= float(max_land_overlap)
+                        and float(shore_overlap_ratio) <= float(max_shore_overlap)
+                        and float(vis) >= float(min_visibility)
+                        and float(truncation_ratio) <= float(max_truncation_ratio)
+                    )
                     prev_target_xy = (tx, ty)
+                    prev_crop_center = (crop_center_x, crop_center_y)
+                    prev_scale = target_scale
+                    prev_angle_deg = angle_deg
 
                     d_ids: list[str] = []
                     placed_bboxes: list[tuple[int, int, int, int]] = [bbox]
@@ -635,15 +855,40 @@ class Stage2Renderer:
                         target_asset_id=target.asset_id,
                         distractor_asset_ids=d_ids,
                         motion_mode=mode,
+                        land_overlap_ratio=float(land_overlap_ratio),
+                        shore_buffer_overlap_ratio=float(shore_overlap_ratio),
+                        scale_px=float(max(target_patch.shape[0], target_patch.shape[1])),
+                        angle_deg=float(angle_deg),
+                        obs_valid=bool(obs_valid),
                         meta={
                             "dataset_name": ds_name,
                             "crop_center_world": [crop_center_x, crop_center_y],
+                            "crop_center_world_x": float(crop_center_x),
+                            "crop_center_world_y": float(crop_center_y),
                             "target_state_world": {
                                 "x": float(state.x),
                                 "y": float(state.y),
                                 "vx": float(state.vx),
                                 "vy": float(state.vy),
+                                "heading_deg": float(heading_deg),
                             },
+                            "target_world_x": float(state.x),
+                            "target_world_y": float(state.y),
+                            "target_world_vx": float(state.vx),
+                            "target_world_vy": float(state.vy),
+                            "target_heading_deg": float(heading_deg),
+                            "center_x": float(tx),
+                            "center_y": float(ty),
+                            "bbox_xywh": [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
+                            "visibility": float(vis),
+                            "gsd": float(gsd),
+                            "perception_stage": str(stage_name),
+                            "land_overlap_ratio": float(land_overlap_ratio),
+                            "shore_buffer_overlap_ratio": float(shore_overlap_ratio),
+                            "scale_px": float(max(target_patch.shape[0], target_patch.shape[1])),
+                            "scale_factor": float(target_scale),
+                            "angle_deg": float(angle_deg),
+                            "obs_valid": bool(obs_valid),
                         },
                     )
                     f.write(json.dumps(row.to_dict(), ensure_ascii=False) + "\n")

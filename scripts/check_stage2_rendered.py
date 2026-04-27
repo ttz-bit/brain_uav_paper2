@@ -12,6 +12,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-root", type=str, default="data/rendered/stage2_smoke_v0")
     p.add_argument("--max-low-visibility-ratio", type=float, default=0.10)
     p.add_argument("--min-positive-visibility", type=float, default=0.35)
+    p.add_argument("--max-land-overlap", type=float, default=0.0)
+    p.add_argument("--max-shore-overlap", type=float, default=0.05)
+    p.add_argument("--max-truncation-ratio", type=float, default=0.20)
+    p.add_argument("--max-center-bias-ratio", type=float, default=0.90)
+    p.add_argument("--center-bias-radius-ratio", type=float, default=0.12)
     return p.parse_args()
 
 
@@ -38,6 +43,11 @@ def main() -> None:
     center_in_bounds = 0
     bbox_valid = 0
     low_vis = 0
+    land_overlap_violations = 0
+    shore_overlap_violations = 0
+    truncation_violations = 0
+    obs_invalid = 0
+    center_biased = 0
 
     for split in ("train", "val", "test"):
         path = labels_dir / f"{split}.jsonl"
@@ -61,6 +71,11 @@ def main() -> None:
             cx, cy = float(r["target_center_px"][0]), float(r["target_center_px"][1])
             if 0.0 <= cx < float(w) and 0.0 <= cy < float(h):
                 center_in_bounds += 1
+                c0x = 0.5 * float(w)
+                c0y = 0.5 * float(h)
+                c_r = float(args.center_bias_radius_ratio) * float(min(w, h))
+                if ((cx - c0x) ** 2 + (cy - c0y) ** 2) <= (c_r * c_r):
+                    center_biased += 1
             bx, by, bw, bh = [float(x) for x in r["bbox_xywh"]]
             if bw > 0 and bh > 0 and bx + bw > 0 and by + bh > 0 and bx < w and by < h:
                 bbox_valid += 1
@@ -68,6 +83,19 @@ def main() -> None:
             vis = float(r.get("visibility", 0.0))
             if vis < float(args.min_positive_visibility):
                 low_vis += 1
+            trunc = max(0.0, 1.0 - vis)
+            if trunc > float(args.max_truncation_ratio):
+                truncation_violations += 1
+
+            land_overlap = float(r.get("land_overlap_ratio", r.get("meta", {}).get("land_overlap_ratio", 1.0)))
+            shore_overlap = float(r.get("shore_buffer_overlap_ratio", r.get("meta", {}).get("shore_buffer_overlap_ratio", 1.0)))
+            if land_overlap > float(args.max_land_overlap):
+                land_overlap_violations += 1
+            if shore_overlap > float(args.max_shore_overlap):
+                shore_overlap_violations += 1
+
+            if not bool(r.get("obs_valid", r.get("meta", {}).get("obs_valid", False))):
+                obs_invalid += 1
 
             split_asset_sets[split]["background"].add(str(r["background_asset_id"]))
             split_asset_sets[split]["target"].add(str(r["target_asset_id"]))
@@ -84,6 +112,7 @@ def main() -> None:
     center_rate = float(center_in_bounds / max(1, total))
     bbox_rate = float(bbox_valid / max(1, total))
     low_vis_ratio = float(low_vis / max(1, total))
+    center_bias_ratio = float(center_biased / max(1, total))
 
     report = {
         "dataset_root": str(root),
@@ -91,12 +120,22 @@ def main() -> None:
         "center_in_bounds_rate": center_rate,
         "bbox_valid_rate": bbox_rate,
         "low_visibility_ratio": low_vis_ratio,
+        "center_bias_ratio": center_bias_ratio,
+        "land_overlap_violations": int(land_overlap_violations),
+        "shore_overlap_violations": int(shore_overlap_violations),
+        "truncation_violations": int(truncation_violations),
+        "obs_invalid_count": int(obs_invalid),
         "split_asset_leakage": leakage,
         "pass": (
             len(errors) == 0
             and center_rate >= 1.0
             and bbox_rate >= 1.0
             and low_vis_ratio <= float(args.max_low_visibility_ratio)
+            and center_bias_ratio <= float(args.max_center_bias_ratio)
+            and land_overlap_violations == 0
+            and shore_overlap_violations == 0
+            and truncation_violations == 0
+            and obs_invalid == 0
             and all(v == 0 for v in leakage.values())
         ),
         "errors": errors[:100],
