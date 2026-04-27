@@ -56,6 +56,11 @@ perturbations:
   light_cloud_prob: 0.15
   compression_prob: 0.15
 
+target:
+  scale_mode: fixed_sequence
+  fixed_scale_range: [0.14, 0.20]
+  max_step_px: 16.0
+
 seed:
   global_seed: 20260427
 

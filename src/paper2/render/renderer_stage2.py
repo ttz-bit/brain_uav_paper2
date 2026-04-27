@@ -231,6 +231,7 @@ class Stage2Renderer:
         perturb_cfg = dict(self.cfg["perturbations"])
         distractor_cfg = dict(self.cfg["distractors"])
         stages_cfg = dict(self.cfg["stages"])
+        target_cfg = dict(self.cfg.get("target", {}))
 
         images_dir = self.output_root / "images" / split
         labels_dir = self.output_root / "labels"
@@ -268,6 +269,10 @@ class Stage2Renderer:
                 # Start with far-stage dt; the per-frame gsd/dt is still saved in labels.
                 motion = generate_motion_sequence(mode, frames_per_sequence, dt=1.0, world_size_m=world_size_m, rng=self.rng)
                 prev_target_xy: tuple[float, float] | None = None
+                # Keep target scale stable per sequence by default (more realistic temporal continuity).
+                fixed_scale_range = target_cfg.get("fixed_scale_range", [0.14, 0.20])
+                seq_target_scale = float(self.rng.uniform(float(fixed_scale_range[0]), float(fixed_scale_range[1])))
+                scale_mode = str(target_cfg.get("scale_mode", "fixed_sequence"))
 
                 for frame_idx, state in enumerate(motion):
                     stage_name = self._stage_for_frame(frame_idx, frames_per_sequence)
@@ -285,20 +290,23 @@ class Stage2Renderer:
                     water = _safe_water_mask(_water_mask(patch), margin_px=4)
 
                     tx, ty = world_to_image(state.x, state.y, crop_center_x, crop_center_y, gsd, image_size)
-                    scale_min, scale_max = stage_cfg["target_scale_range"]
-                    target_scale = float(self.rng.uniform(float(scale_min), float(scale_max)))
+                    if scale_mode == "stage_progressive":
+                        scale_min, scale_max = stage_cfg["target_scale_range"]
+                        target_scale = float(self.rng.uniform(float(scale_min), float(scale_max)))
+                    else:
+                        target_scale = seq_target_scale
                     target_patch = resize_bgra_with_scale(target_bgra, target_scale, image_size=image_size)
                     # Only top-view templates are rotated by heading to avoid "capsized" side-view artifacts.
                     if target.category == "boat_top":
                         heading_deg = float(np.degrees(np.arctan2(state.vy, state.vx)))
                         target_patch = rotate_bgra(target_patch, heading_deg)
                     tx, ty = _sample_water_center(water, target_patch, tx, ty, self.rng, min_ratio=0.985, tries=64)
-                    # Keep temporal continuity: limit per-frame jump.
+                    # Keep temporal continuity: strict per-frame jump cap.
                     if prev_target_xy is not None:
                         px, py = prev_target_xy
                         dx, dy = tx - px, ty - py
                         dist = float(np.hypot(dx, dy))
-                        max_step = float(image_size) * 0.28
+                        max_step = float(target_cfg.get("max_step_px", 16.0))
                         if dist > max_step and dist > 1e-6:
                             s = max_step / dist
                             tx = px + dx * s
@@ -306,9 +314,18 @@ class Stage2Renderer:
                             tx, ty = _sample_water_center(water, target_patch, tx, ty, self.rng, min_ratio=0.98, tries=32)
                     # Hard constraint: target must remain on water.
                     if _alpha_water_ratio(water, target_patch, tx, ty) < 0.98:
-                        p = _random_water_point(water, self.rng)
-                        if p is not None:
-                            tx, ty = _sample_water_center(water, target_patch, p[0], p[1], self.rng, min_ratio=0.99, tries=64)
+                        if prev_target_xy is not None:
+                            tx, ty = _sample_water_center(
+                                water,
+                                target_patch,
+                                prev_target_xy[0],
+                                prev_target_xy[1],
+                                self.rng,
+                                min_ratio=0.99,
+                                tries=64,
+                            )
+                        else:
+                            tx, ty = _sample_water_center(water, target_patch, tx, ty, self.rng, min_ratio=0.99, tries=64)
                     bbox, vis = alpha_blend_center(patch, target_patch, tx, ty)
                     prev_target_xy = (tx, ty)
 
