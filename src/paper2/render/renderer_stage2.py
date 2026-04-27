@@ -137,6 +137,14 @@ def _sample_water_center(
     return best_x, best_y
 
 
+def _random_water_point(mask_u8: np.ndarray, rng: np.random.Generator) -> tuple[float, float] | None:
+    ys, xs = np.where(mask_u8 > 0)
+    if len(xs) == 0:
+        return None
+    i = int(rng.integers(0, len(xs)))
+    return float(xs[i]), float(ys[i])
+
+
 @dataclass
 class RenderSplitResult:
     split: str
@@ -249,16 +257,41 @@ class Stage2Renderer:
                     if target.category == "boat_top":
                         heading_deg = float(np.degrees(np.arctan2(state.vy, state.vx)))
                         target_patch = rotate_bgra(target_patch, heading_deg)
-                    tx, ty = _sample_water_center(water, target_patch, tx, ty, self.rng, min_ratio=0.90, tries=32)
+                    tx, ty = _sample_water_center(water, target_patch, tx, ty, self.rng, min_ratio=0.96, tries=48)
+                    # Hard constraint: target must stay on water; fallback to random water tries.
+                    t_ratio = _alpha_water_ratio(water, target_patch, tx, ty)
+                    if t_ratio < 0.96:
+                        for _ in range(24):
+                            p = _random_water_point(water, self.rng)
+                            if p is None:
+                                break
+                            cx, cy = p
+                            if _alpha_water_ratio(water, target_patch, cx, cy) >= 0.96:
+                                tx, ty = cx, cy
+                                t_ratio = 1.0
+                                break
                     bbox, vis = alpha_blend_center(patch, target_patch, tx, ty)
 
                     d_ids: list[str] = []
                     d_min, d_max = distractor_cfg["scale_range"]
                     for d_asset, d_img in zip(distractors, distractor_bgras):
-                        d_center_x = float(self.rng.uniform(0.1, 0.9) * image_size)
-                        d_center_y = float(self.rng.uniform(0.1, 0.9) * image_size)
                         d_scale = float(self.rng.uniform(float(d_min), float(d_max)))
                         d_patch = resize_bgra_with_scale(d_img, d_scale, image_size=image_size)
+                        p = _random_water_point(water, self.rng)
+                        if p is None:
+                            continue
+                        d_center_x, d_center_y = p
+                        d_center_x, d_center_y = _sample_water_center(
+                            water,
+                            d_patch,
+                            d_center_x,
+                            d_center_y,
+                            self.rng,
+                            min_ratio=0.93,
+                            tries=24,
+                        )
+                        if _alpha_water_ratio(water, d_patch, d_center_x, d_center_y) < 0.93:
+                            continue
                         alpha_blend_center(patch, d_patch, d_center_x, d_center_y)
                         d_ids.append(d_asset.asset_id)
 
