@@ -9,7 +9,7 @@ import numpy as np
 
 from paper2.render.asset_registry import AssetRecord, AssetRegistry
 from paper2.render.compositor import alpha_blend_center, read_bgra, resize_bgra_with_scale, rotate_bgra
-from paper2.render.coordinate_mapper import world_to_background_px, world_to_image
+from paper2.render.coordinate_mapper import background_px_to_world, world_to_background_px, world_to_image
 from paper2.render.motion_sampler import generate_motion_sequence, sample_mode
 from paper2.render.perturbations import apply_perturbations
 from paper2.render.schema import RenderedFrameRecord
@@ -38,17 +38,25 @@ def _extract_patch(background_bgr: np.ndarray, cx: float, cy: float, size: int) 
 
 
 def _water_mask(patch_bgr: np.ndarray) -> np.ndarray:
-    # Lightweight heuristic: water tends to be blue/green with medium saturation.
+    # Conservative heuristic for sea/harbor water:
+    # require plausible HSV range + blue/cyan dominance, and suppress bright gray land/concrete.
+    b = patch_bgr[:, :, 0].astype(np.int16)
+    g = patch_bgr[:, :, 1].astype(np.int16)
+    r = patch_bgr[:, :, 2].astype(np.int16)
     hsv = cv2.cvtColor(patch_bgr, cv2.COLOR_BGR2HSV)
-    h = hsv[:, :, 0]
-    s = hsv[:, :, 1]
-    v = hsv[:, :, 2]
-    m1 = (h >= 70) & (h <= 135) & (s >= 25) & (v >= 20)
-    m2 = (h >= 50) & (h <= 160) & (s >= 35) & (v >= 15)
-    m = (m1 | m2).astype(np.uint8) * 255
+    h = hsv[:, :, 0].astype(np.int16)
+    s = hsv[:, :, 1].astype(np.int16)
+    v = hsv[:, :, 2].astype(np.int16)
+
+    hsv_water = ((h >= 70) & (h <= 135) & (s >= 30) & (v >= 20)) | ((h >= 55) & (h <= 150) & (s >= 45) & (v >= 15))
+    blue_dom = b >= (np.maximum(r, g) + 6)
+    cyan_dom = (b >= (g - 4)) & (g >= (r + 3))
+    not_bright_gray = ~((s <= 28) & (v >= 90))
+    m = (hsv_water & (blue_dom | cyan_dom) & not_bright_gray).astype(np.uint8) * 255
     kernel = np.ones((3, 3), np.uint8)
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel)
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
+    m = _select_primary_water_component(m, patch_bgr)
     return m
 
 
@@ -58,6 +66,46 @@ def _safe_water_mask(mask_u8: np.ndarray, margin_px: int = 3) -> np.ndarray:
     k = max(3, int(margin_px) * 2 + 1)
     kernel = np.ones((k, k), np.uint8)
     return cv2.erode(mask_u8, kernel, iterations=1)
+
+
+def _select_primary_water_component(mask_u8: np.ndarray, patch_bgr: np.ndarray) -> np.ndarray:
+    # Keep the most plausible "open water" connected component to avoid piers/roads false positives.
+    num, labels, stats, _ = cv2.connectedComponentsWithStats((mask_u8 > 0).astype(np.uint8), connectivity=8)
+    if num <= 1:
+        return mask_u8
+
+    h, w = mask_u8.shape[:2]
+    b = patch_bgr[:, :, 0].astype(np.int16)
+    g = patch_bgr[:, :, 1].astype(np.int16)
+    r = patch_bgr[:, :, 2].astype(np.int16)
+    blue_dom = b - np.maximum(g, r)
+
+    best_id = -1
+    best_score = -1.0
+    for cid in range(1, num):
+        area = int(stats[cid, cv2.CC_STAT_AREA])
+        if area < max(80, (h * w) // 300):
+            continue
+        x = int(stats[cid, cv2.CC_STAT_LEFT])
+        y = int(stats[cid, cv2.CC_STAT_TOP])
+        cw = int(stats[cid, cv2.CC_STAT_WIDTH])
+        ch = int(stats[cid, cv2.CC_STAT_HEIGHT])
+        touches_border = x <= 0 or y <= 0 or (x + cw) >= (w - 1) or (y + ch) >= (h - 1)
+        comp = labels == cid
+        if int(comp.sum()) <= 0:
+            continue
+        mean_blue = float(np.mean(blue_dom[comp]))
+        # Prefer large border-connected components with stronger blue dominance.
+        score = float(area) + (5000.0 if touches_border else 0.0) + mean_blue * 40.0
+        if score > best_score:
+            best_score = score
+            best_id = cid
+
+    if best_id <= 0:
+        return mask_u8
+    out = np.zeros_like(mask_u8, dtype=np.uint8)
+    out[labels == best_id] = 255
+    return out
 
 
 def _snap_to_water(mask_u8: np.ndarray, x: float, y: float, max_radius: int = 64) -> tuple[float, float]:
@@ -228,7 +276,13 @@ class Stage2Renderer:
         return "terminal"
 
     def _image_rel_path(self, split: str, seq_id: int, frame_id: int) -> str:
-        return f"data/rendered/{self.cfg['dataset']['name']}/images/{split}/seq_{seq_id:04d}_frame_{frame_id:04d}.png"
+        image_abs = self.output_root / "images" / split / f"seq_{seq_id:04d}_frame_{frame_id:04d}.png"
+        try:
+            rel = image_abs.resolve().relative_to(self.project_root.resolve())
+            return str(rel).replace("\\", "/")
+        except Exception:
+            # Fallback to absolute path when output_root is outside project_root.
+            return str(image_abs.resolve()).replace("\\", "/")
 
     def _read_background(self, asset: AssetRecord) -> np.ndarray:
         img = cv2.imread(str(asset.path), cv2.IMREAD_COLOR)
@@ -236,8 +290,24 @@ class Stage2Renderer:
             raise FileNotFoundError(f"Cannot read background: {asset.path}")
         return img
 
+    @staticmethod
+    def _mask_ratio(mask_u8: np.ndarray) -> float:
+        if mask_u8.size <= 0:
+            return 0.0
+        return float((mask_u8 > 0).mean())
+
+    def _sample_background(self, split: str) -> AssetRecord:
+        # Conservative stage2 smoke rule: avoid "port" backgrounds until dedicated harbor-water masking is ready.
+        pool = [a for a in self.registry.get("background", split) if str(a.category).lower() != "port"]
+        if not pool:
+            pool = self.registry.get("background", split)
+        if not pool:
+            raise ValueError(f"No background assets for split={split}")
+        idx = int(self.rng.integers(0, len(pool)))
+        return pool[idx]
+
     def render_split(self, split: str, num_sequences: int) -> RenderSplitResult:
-        ds_name = str(self.cfg["dataset"]["name"])
+        ds_name = str(self.output_root.name)
         frames_per_sequence = int(self.cfg["dataset"]["frames_per_sequence"])
         image_size = int(self.cfg["dataset"]["image_size"])
         world_size_m = float(self.cfg["dataset"]["world_size_m"])
@@ -259,7 +329,21 @@ class Stage2Renderer:
 
         with label_path.open("w", encoding="utf-8") as f:
             for seq_idx in range(num_sequences):
-                bg = self.registry.sample_one("background", split, self.rng)
+                # Ensure chosen background contains enough water area for maritime rendering.
+                bg = None
+                bg_img = None
+                bg_water_global = None
+                for _ in range(24):
+                    cand = self._sample_background(split)
+                    cand_img = self._read_background(cand)
+                    cand_water = _safe_water_mask(_water_mask(cand_img), margin_px=6)
+                    if self._mask_ratio(cand_water) >= 0.03:
+                        bg = cand
+                        bg_img = cand_img
+                        bg_water_global = cand_water
+                        break
+                if bg is None or bg_img is None or bg_water_global is None:
+                    raise RuntimeError(f"No usable water background found for split={split}")
                 d_num = int(self.rng.integers(int(distractor_cfg["min_count"]), int(distractor_cfg["max_count"]) + 1))
                 distractors = self.registry.sample_many("distractor", split, d_num, self.rng)
 
@@ -267,7 +351,6 @@ class Stage2Renderer:
                 for d in distractors:
                     used_distractor_ids.add(d.asset_id)
 
-                bg_img = self._read_background(bg)
                 # Prefer top-view templates for aerial realism; fallback to any target if none available.
                 split_targets = self.registry.get("target", split)
                 top_targets = [a for a in split_targets if a.category == "boat_top"]
@@ -301,7 +384,22 @@ class Stage2Renderer:
 
                     bg_cx, bg_cy = world_to_background_px(crop_center_x, crop_center_y, world_size_m, bg_img.shape[1], bg_img.shape[0])
                     patch = _extract_patch(bg_img, bg_cx, bg_cy, image_size)
-                    water = _safe_water_mask(_water_mask(patch), margin_px=4)
+                    water = _extract_patch(bg_water_global, bg_cx, bg_cy, image_size)
+                    if water.ndim == 3:
+                        water = water[:, :, 0]
+                    water = water.astype(np.uint8)
+
+                    # If local patch has too little water, move crop center to nearest global water.
+                    if self._mask_ratio(water) < 0.20:
+                        tgt_bg_x, tgt_bg_y = world_to_background_px(state.x, state.y, world_size_m, bg_img.shape[1], bg_img.shape[0])
+                        nwx, nwy = _snap_to_water(bg_water_global, tgt_bg_x, tgt_bg_y, max_radius=max(bg_img.shape[0], bg_img.shape[1]))
+                        crop_center_x, crop_center_y = background_px_to_world(nwx, nwy, world_size_m, bg_img.shape[1], bg_img.shape[0])
+                        bg_cx, bg_cy = nwx, nwy
+                        patch = _extract_patch(bg_img, bg_cx, bg_cy, image_size)
+                        water = _extract_patch(bg_water_global, bg_cx, bg_cy, image_size)
+                        if water.ndim == 3:
+                            water = water[:, :, 0]
+                        water = water.astype(np.uint8)
 
                     tx, ty = world_to_image(state.x, state.y, crop_center_x, crop_center_y, gsd, image_size)
                     if scale_mode == "stage_progressive":
@@ -379,6 +477,26 @@ class Stage2Renderer:
                         max_step = float(target_cfg.get("max_step_px", 8.0))
                         if final_step > max_step:
                             tx, ty = px, py
+
+                    # Final hard placement guard: target center must be on water.
+                    iy = int(np.clip(round(ty), 0, image_size - 1))
+                    ix = int(np.clip(round(tx), 0, image_size - 1))
+                    if int(water[iy, ix]) <= 0:
+                        max_step = float(target_cfg.get("max_step_px", 8.0))
+                        local_snap_radius = int(max(6, round(max_step * 2.0)))
+                        tx2, ty2 = _snap_to_water(water, tx, ty, max_radius=local_snap_radius)
+                        iy2 = int(np.clip(round(ty2), 0, image_size - 1))
+                        ix2 = int(np.clip(round(tx2), 0, image_size - 1))
+                        if int(water[iy2, ix2]) > 0:
+                            tx, ty = tx2, ty2
+                        elif prev_target_xy is not None:
+                            px, py = prev_target_xy
+                            py_i = int(np.clip(round(py), 0, image_size - 1))
+                            px_i = int(np.clip(round(px), 0, image_size - 1))
+                            if int(water[py_i, px_i]) > 0:
+                                tx, ty = px, py
+                            # else: keep tx,ty as-is to avoid sudden teleports.
+
                     bbox, vis = alpha_blend_center(patch, target_patch, tx, ty)
                     prev_target_xy = (tx, ty)
 
