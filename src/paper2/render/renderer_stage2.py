@@ -474,13 +474,20 @@ class Stage2Renderer:
                     cand = self._sample_background(split)
                     cand_img = self._read_background(cand)
                     cand_water = _safe_water_mask(_water_mask(cand_img), margin_px=6)
-                    if self._mask_ratio(cand_water) >= 0.03:
+                    # Require enough deep-water area (away from shore) to avoid unavoidable beaching.
+                    cand_core_water = _water_with_clearance(
+                        cand_water, int(max(4, placement_cfg.get("min_shore_clearance_px", 5)))
+                    )
+                    if self._mask_ratio(cand_water) >= 0.03 and self._mask_ratio(cand_core_water) >= 0.02:
                         bg = cand
                         bg_img = cand_img
                         bg_water_global = cand_water
                         break
                 if bg is None or bg_img is None or bg_water_global is None:
                     raise RuntimeError(f"No usable water background found for split={split}")
+                bg_target_water_global = _water_with_clearance(
+                    bg_water_global, int(max(4, placement_cfg.get("min_shore_clearance_px", 5)))
+                )
                 d_num = int(self.rng.integers(int(distractor_cfg["min_count"]), int(distractor_cfg["max_count"]) + 1))
                 distractors = self.registry.sample_many("distractor", split, d_num, self.rng)
 
@@ -507,6 +514,15 @@ class Stage2Renderer:
                 prev_crop_center: tuple[float, float] | None = None
                 prev_scale: float | None = None
                 prev_angle_deg: float | None = None
+                prev_valid_patch: np.ndarray | None = None
+                prev_valid_bbox: tuple[int, int, int, int] | None = None
+                prev_valid_vis: float | None = None
+                prev_valid_tx_ty: tuple[float, float] | None = None
+                prev_valid_land: float | None = None
+                prev_valid_shore: float | None = None
+                prev_valid_trunc: float | None = None
+                prev_valid_angle: float | None = None
+                prev_valid_scale: float | None = None
                 # Keep target scale stable per sequence by default (more realistic temporal continuity).
                 fixed_scale_range = target_cfg.get("fixed_scale_range", [0.14, 0.20])
                 seq_target_scale = float(self.rng.uniform(float(fixed_scale_range[0]), float(fixed_scale_range[1])))
@@ -592,7 +608,43 @@ class Stage2Renderer:
                     # Keep target away from shoreline to avoid unrealistic "beaching" samples.
                     th, tw = target_patch.shape[:2]
                     shoreline_margin = int(max(min_shore_clearance_px, np.clip(round(0.55 * max(th, tw)), 4, 48)))
-                    target_water = _water_with_clearance(water, shoreline_margin)
+                    target_water = _extract_patch(bg_target_water_global, bg_cx, bg_cy, image_size)
+                    if target_water.ndim == 3:
+                        target_water = target_water[:, :, 0]
+                    target_water = target_water.astype(np.uint8)
+                    # If local deep-water mask is too small, recenter crop to nearest global deep-water point.
+                    if self._mask_ratio(target_water) < 0.01:
+                        tgt_bg_x, tgt_bg_y = world_to_background_px(state.x, state.y, world_size_m, bg_img.shape[1], bg_img.shape[0])
+                        nwx, nwy = _snap_to_water(
+                            bg_target_water_global, tgt_bg_x, tgt_bg_y, max_radius=max(bg_img.shape[0], bg_img.shape[1])
+                        )
+                        crop_center_x, crop_center_y = background_px_to_world(nwx, nwy, world_size_m, bg_img.shape[1], bg_img.shape[0])
+                        if prev_crop_center is not None:
+                            pcx, pcy = prev_crop_center
+                            dx = crop_center_x - pcx
+                            dy = crop_center_y - pcy
+                            d = float(np.hypot(dx, dy))
+                            max_crop_step_m = max_crop_shift_ratio * float(image_size) * gsd
+                            if d > max_crop_step_m and d > 1e-6:
+                                s = max_crop_step_m / d
+                                crop_center_x = pcx + dx * s
+                                crop_center_y = pcy + dy * s
+                                nwx, nwy = world_to_background_px(
+                                    crop_center_x, crop_center_y, world_size_m, bg_img.shape[1], bg_img.shape[0]
+                                )
+                        bg_cx, bg_cy = nwx, nwy
+                        patch = _extract_patch(bg_img, bg_cx, bg_cy, image_size)
+                        water = _extract_patch(bg_water_global, bg_cx, bg_cy, image_size)
+                        if water.ndim == 3:
+                            water = water[:, :, 0]
+                        water = water.astype(np.uint8)
+                        target_water = _extract_patch(bg_target_water_global, bg_cx, bg_cy, image_size)
+                        if target_water.ndim == 3:
+                            target_water = target_water[:, :, 0]
+                        target_water = target_water.astype(np.uint8)
+                        tx, ty = world_to_image(state.x, state.y, crop_center_x, crop_center_y, gsd, image_size)
+                    if self._mask_ratio(target_water) < 0.01:
+                        target_water = _water_with_clearance(water, shoreline_margin)
                     if self._mask_ratio(target_water) < 0.01:
                         target_water = water
                     tx, ty = _sample_water_center(
@@ -779,6 +831,18 @@ class Stage2Renderer:
                             pre_vis = v
                             truncation_ratio = t
 
+                    # Absolute last guard: forbid large frame-to-frame pixel jumps.
+                    if prev_target_xy is not None:
+                        px, py = prev_target_xy
+                        d = float(np.hypot(tx - px, ty - py))
+                        max_step = min(float(target_cfg.get("max_step_px", 8.0)), max_pos_step_px)
+                        if d > max_step + 1e-6:
+                            tx, ty = px, py
+                            land_overlap_ratio = _alpha_overlap_ratio(land_mask, target_patch, tx, ty)
+                            shore_overlap_ratio = _alpha_overlap_ratio(shore_mask, target_patch, tx, ty)
+                            pre_vis = _overlay_visibility(target_patch, tx, ty, image_size, image_size)
+                            truncation_ratio = max(0.0, 1.0 - pre_vis)
+
                     target_patch = _harmonize_overlay_to_background(patch, target_patch, tx, ty, strength=0.35)
                     bbox, vis = alpha_blend_center(patch, target_patch, tx, ty)
                     obs_valid = (
@@ -788,6 +852,46 @@ class Stage2Renderer:
                         and float(vis) >= float(min_visibility)
                         and float(truncation_ratio) <= float(max_truncation_ratio)
                     )
+
+                    # Absolute write-time fallback:
+                    # if this frame violates hard constraints or jumps too far, reuse last valid frame.
+                    max_step = min(float(target_cfg.get("max_step_px", 8.0)), max_pos_step_px)
+                    step_fail = False
+                    if prev_valid_tx_ty is not None:
+                        step_fail = float(np.hypot(tx - prev_valid_tx_ty[0], ty - prev_valid_tx_ty[1])) > (max_step + 1e-6)
+                    hard_fail = (
+                        float(land_overlap_ratio) > float(max_land_overlap)
+                        or float(shore_overlap_ratio) > float(max_shore_overlap)
+                        or float(vis) < float(min_visibility)
+                        or float(truncation_ratio) > float(max_truncation_ratio)
+                        or (
+                            require_water_mask
+                            and _alpha_water_ratio(water, target_patch, tx, ty) < 0.96
+                        )
+                    )
+                    if (hard_fail or step_fail) and prev_valid_patch is not None and prev_valid_bbox is not None and prev_valid_vis is not None and prev_valid_tx_ty is not None:
+                        patch = prev_valid_patch.copy()
+                        tx, ty = prev_valid_tx_ty
+                        bbox = prev_valid_bbox
+                        vis = float(prev_valid_vis)
+                        land_overlap_ratio = float(prev_valid_land if prev_valid_land is not None else 0.0)
+                        shore_overlap_ratio = float(prev_valid_shore if prev_valid_shore is not None else 0.0)
+                        truncation_ratio = float(prev_valid_trunc if prev_valid_trunc is not None else 0.0)
+                        angle_deg = float(prev_valid_angle if prev_valid_angle is not None else angle_deg)
+                        target_scale = float(prev_valid_scale if prev_valid_scale is not None else target_scale)
+                        obs_valid = True
+
+                    if bool(obs_valid):
+                        prev_valid_patch = patch.copy()
+                        prev_valid_bbox = (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
+                        prev_valid_vis = float(vis)
+                        prev_valid_tx_ty = (float(tx), float(ty))
+                        prev_valid_land = float(land_overlap_ratio)
+                        prev_valid_shore = float(shore_overlap_ratio)
+                        prev_valid_trunc = float(truncation_ratio)
+                        prev_valid_angle = float(angle_deg)
+                        prev_valid_scale = float(target_scale)
+
                     prev_target_xy = (tx, ty)
                     prev_crop_center = (crop_center_x, crop_center_y)
                     prev_scale = target_scale
