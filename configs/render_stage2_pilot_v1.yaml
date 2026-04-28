@@ -76,6 +76,7 @@ placement:
   min_visibility: 0.35
   max_truncation_ratio: 0.20
   min_shore_clearance_px: 8
+  port_min_shore_clearance_px: 10
 
 seed:
   global_seed: 20260428
@@ -87,8 +88,13 @@ assets:
 background:
   allowed_categories: ["open_sea", "coastal", "island_complex", "port"]
   excluded_categories: []
+  require_all_categories_per_split: true
+  required_categories: ["open_sea", "coastal", "island_complex", "port"]
+  strict_required_categories: true
 
 trajectory:
   force_target_on_water: true
   water_snap_radius_px: 48
   max_world_step_m: 60.0
+  port_water_snap_radius_px: 36
+  port_max_world_step_m: 50.0

@@ -441,7 +441,7 @@ class Stage2Renderer:
             return 0.0
         return float((mask_u8 > 0).mean())
 
-    def _sample_background(self, split: str) -> AssetRecord:
+    def _background_pool(self, split: str) -> list[AssetRecord]:
         bg_cfg = dict(self.cfg.get("background", {}))
         pool = self.registry.get("background", split)
         allowed = {str(x).strip().lower() for x in bg_cfg.get("allowed_categories", []) if str(x).strip()}
@@ -450,10 +450,52 @@ class Stage2Renderer:
             pool = [a for a in pool if str(a.category).strip().lower() in allowed]
         if excluded:
             pool = [a for a in pool if str(a.category).strip().lower() not in excluded]
+        return pool
+
+    def _sample_background(self, split: str, preferred_category: str | None = None) -> AssetRecord:
+        pool = self._background_pool(split)
+        if preferred_category:
+            pref = str(preferred_category).strip().lower()
+            subset = [a for a in pool if str(a.category).strip().lower() == pref]
+            if subset:
+                pool = subset
         if not pool:
             raise ValueError(f"No background assets for split={split}")
         idx = int(self.rng.integers(0, len(pool)))
         return pool[idx]
+
+    def _build_background_category_schedule(self, split: str, num_sequences: int) -> list[str]:
+        bg_cfg = dict(self.cfg.get("background", {}))
+        if not bool(bg_cfg.get("require_all_categories_per_split", False)):
+            return []
+
+        pool = self._background_pool(split)
+        if not pool:
+            raise ValueError(f"No background assets for split={split}")
+
+        by_cat: dict[str, list[AssetRecord]] = {}
+        for a in pool:
+            c = str(a.category).strip().lower()
+            by_cat.setdefault(c, []).append(a)
+
+        required_cfg = [str(x).strip().lower() for x in bg_cfg.get("required_categories", []) if str(x).strip()]
+        required = required_cfg if required_cfg else sorted(by_cat.keys())
+        strict = bool(bg_cfg.get("strict_required_categories", True))
+
+        missing = [c for c in required if c not in by_cat]
+        if missing and strict:
+            raise RuntimeError(
+                f"Missing required background categories in split={split}: {missing}; "
+                "rebalance inventory or relax background.strict_required_categories."
+            )
+
+        usable = [c for c in required if c in by_cat]
+        if not usable:
+            return []
+
+        schedule = [usable[i % len(usable)] for i in range(max(0, int(num_sequences)))]
+        self.rng.shuffle(schedule)
+        return schedule
 
     def _constrain_motion_to_water(
         self,
@@ -569,10 +611,13 @@ class Stage2Renderer:
         max_land_overlap = float(placement_cfg.get("max_land_overlap", 0.0))
         max_shore_overlap = float(placement_cfg.get("max_shore_buffer_overlap", 0.05))
         min_shore_clearance_px = int(placement_cfg.get("min_shore_clearance_px", 5))
+        port_min_shore_clearance_px = int(placement_cfg.get("port_min_shore_clearance_px", min_shore_clearance_px))
         trajectory_cfg = dict(self.cfg.get("trajectory", {}))
         traj_force_water = bool(trajectory_cfg.get("force_target_on_water", True))
         traj_snap_radius_px = int(trajectory_cfg.get("water_snap_radius_px", 96))
         traj_max_step_m = float(trajectory_cfg.get("max_world_step_m", 80.0))
+        port_traj_snap_radius_px = int(trajectory_cfg.get("port_water_snap_radius_px", traj_snap_radius_px))
+        port_traj_max_step_m = float(trajectory_cfg.get("port_max_world_step_m", traj_max_step_m))
         allowed_target_categories = {str(x) for x in target_cfg.get("allowed_categories", ["boat_top", "boat_oblique"])}
         heading_noise_deg = float(target_cfg.get("heading_noise_deg", 10.0))
 
@@ -585,20 +630,24 @@ class Stage2Renderer:
         used_background_ids: set[str] = set()
         used_target_ids: set[str] = set()
         used_distractor_ids: set[str] = set()
+        bg_category_schedule = self._build_background_category_schedule(split, num_sequences)
 
         with label_path.open("w", encoding="utf-8") as f:
             for seq_idx in range(num_sequences):
+                desired_bg_category = bg_category_schedule[seq_idx] if seq_idx < len(bg_category_schedule) else None
                 # Ensure chosen background contains enough water area for maritime rendering.
                 bg = None
                 bg_img = None
                 bg_water_global = None
                 for _ in range(24):
-                    cand = self._sample_background(split)
+                    cand = self._sample_background(split, preferred_category=desired_bg_category)
                     cand_img = self._read_background(cand)
                     cand_water = _safe_water_mask(_water_mask(cand_img), margin_px=6)
+                    cand_is_port = str(cand.category).strip().lower() == "port"
+                    cand_min_shore_clearance_px = port_min_shore_clearance_px if cand_is_port else min_shore_clearance_px
                     # Require enough deep-water area (away from shore) to avoid unavoidable beaching.
                     cand_core_water = _water_with_clearance(
-                        cand_water, int(max(4, placement_cfg.get("min_shore_clearance_px", 5)))
+                        cand_water, int(max(4, cand_min_shore_clearance_px))
                     )
                     if self._mask_ratio(cand_water) >= 0.03 and self._mask_ratio(cand_core_water) >= 0.02:
                         bg = cand
@@ -607,8 +656,12 @@ class Stage2Renderer:
                         break
                 if bg is None or bg_img is None or bg_water_global is None:
                     raise RuntimeError(f"No usable water background found for split={split}")
+                is_port_bg = str(bg.category).strip().lower() == "port"
+                seq_min_shore_clearance_px = port_min_shore_clearance_px if is_port_bg else min_shore_clearance_px
+                seq_traj_snap_radius_px = port_traj_snap_radius_px if is_port_bg else traj_snap_radius_px
+                seq_traj_max_step_m = port_traj_max_step_m if is_port_bg else traj_max_step_m
                 bg_target_water_global = _water_with_clearance(
-                    bg_water_global, int(max(4, placement_cfg.get("min_shore_clearance_px", 5)))
+                    bg_water_global, int(max(4, seq_min_shore_clearance_px))
                 )
                 d_num = int(self.rng.integers(int(distractor_cfg["min_count"]), int(distractor_cfg["max_count"]) + 1))
                 distractors = self.registry.sample_many("distractor", split, d_num, self.rng)
@@ -640,8 +693,8 @@ class Stage2Renderer:
                         world_size_m=world_size_m,
                         bg_w=bg_img.shape[1],
                         bg_h=bg_img.shape[0],
-                        max_world_step_m=traj_max_step_m,
-                        snap_radius_px=traj_snap_radius_px,
+                        max_world_step_m=seq_traj_max_step_m,
+                        snap_radius_px=seq_traj_snap_radius_px,
                     )
                 prev_target_xy: tuple[float, float] | None = None
                 prev_crop_center: tuple[float, float] | None = None
@@ -740,7 +793,7 @@ class Stage2Renderer:
 
                     # Keep target away from shoreline to avoid unrealistic "beaching" samples.
                     th, tw = target_patch.shape[:2]
-                    shoreline_margin = int(max(min_shore_clearance_px, np.clip(round(0.55 * max(th, tw)), 4, 48)))
+                    shoreline_margin = int(max(seq_min_shore_clearance_px, np.clip(round(0.55 * max(th, tw)), 4, 48)))
                     target_water = _extract_patch(bg_target_water_global, bg_cx, bg_cy, image_size)
                     if target_water.ndim == 3:
                         target_water = target_water[:, :, 0]
@@ -1099,6 +1152,7 @@ class Stage2Renderer:
                         obs_valid=bool(obs_valid),
                         meta={
                             "dataset_name": ds_name,
+                            "background_category": str(bg.category),
                             "crop_center_world": [crop_center_x, crop_center_y],
                             "crop_center_world_x": float(crop_center_x),
                             "crop_center_world_y": float(crop_center_y),
