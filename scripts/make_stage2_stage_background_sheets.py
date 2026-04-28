@@ -104,16 +104,22 @@ def main() -> None:
             if not seq_map:
                 print(f"[SKIP] no samples for split={split}, stage={st}, bg={bg}")
                 continue
-            # pick a stable sequence with most frames in this stage
-            seq_id = sorted(seq_map.keys(), key=lambda k: len(seq_map[k]), reverse=True)[0]
-            rows = sorted(seq_map[seq_id], key=lambda x: int(x.get("frame_id", 0)))
+            # Aggregate frames across multiple sequences to avoid black padding for short stage slices.
+            rows: list[dict] = []
+            seq_order = sorted(seq_map.keys(), key=lambda k: len(seq_map[k]), reverse=True)
+            for seq_id in seq_order:
+                seq_rows = sorted(seq_map[seq_id], key=lambda x: int(x.get("frame_id", 0)))
+                rows.extend(seq_rows)
+                if len(rows) >= frames:
+                    break
             rows = rows[:frames]
             imgs: list[np.ndarray] = []
             for r in rows:
                 p = Path(str(r.get("image_path", "")))
                 img_path = p if p.is_absolute() else (Path.cwd() / p)
                 if not img_path.exists():
-                    img_path = root / "images" / split / f"seq_{seq_id.split('_')[-1]}_frame_{int(r.get('frame_id',0)):04d}.png"
+                    seq_suffix = str(r.get("sequence_id", "")).split("_")[-1]
+                    img_path = root / "images" / split / f"seq_{seq_suffix}_frame_{int(r.get('frame_id',0)):04d}.png"
                 img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
                 if img is None:
                     continue
@@ -121,7 +127,7 @@ def main() -> None:
                     img = _draw_overlay(img, r)
                 cv2.putText(
                     img,
-                    f"{split} {st} {bg} {seq_id}",
+                    f"{split} {st} {bg} {str(r.get('sequence_id',''))}",
                     (6, 16),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.45,
