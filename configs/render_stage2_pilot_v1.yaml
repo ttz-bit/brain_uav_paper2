@@ -59,7 +59,7 @@ perturbations:
 target:
   scale_mode: stage_progressive
   fixed_scale_range: [0.10, 0.14]
-  max_step_px: 6.0
+  max_step_px: 5.0
   allowed_categories: ["boat_top"]
   heading_noise_deg: 4.0
 
@@ -72,11 +72,11 @@ continuity:
 placement:
   require_water_mask: true
   max_land_overlap: 0.0
-  max_shore_buffer_overlap: 0.02
+  max_shore_buffer_overlap: 0.01
   min_visibility: 0.35
-  max_truncation_ratio: 0.20
-  min_shore_clearance_px: 8
-  port_min_shore_clearance_px: 10
+  max_truncation_ratio: 0.15
+  min_shore_clearance_px: 10
+  port_min_shore_clearance_px: 14
 
 seed:
   global_seed: 20260428
@@ -94,7 +94,7 @@ background:
 
 trajectory:
   force_target_on_water: true
-  water_snap_radius_px: 48
-  max_world_step_m: 60.0
-  port_water_snap_radius_px: 36
-  port_max_world_step_m: 50.0
+  water_snap_radius_px: 40
+  max_world_step_m: 55.0
+  port_water_snap_radius_px: 28
+  port_max_world_step_m: 40.0
