@@ -5,6 +5,11 @@ dataset:
   frames_per_sequence: 40
   world_size_m: 4000.0
 
+stage_ratios:
+  far: 0.15
+  mid: 0.40
+  terminal: 0.45
+
 splits:
   train:
     sequences: 100

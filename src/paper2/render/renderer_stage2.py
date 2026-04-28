@@ -412,13 +412,40 @@ class Stage2Renderer:
         out["compression_quality"] = int(self.rng.integers(55, 86)) if float(self.rng.random()) < float(base_cfg.get("compression_prob", 0.0)) else 0
         return out
 
-    def _stage_for_frame(self, frame_idx: int, frames_per_sequence: int) -> str:
-        ratio = float(frame_idx) / max(1.0, float(frames_per_sequence - 1))
-        if ratio < 0.4:
-            return "far"
-        if ratio < 0.75:
-            return "mid"
-        return "terminal"
+    def _stage_schedule(self, frames_per_sequence: int) -> list[str]:
+        stage_ratios_cfg = dict(self.cfg.get("stage_ratios", {"far": 0.15, "mid": 0.40, "terminal": 0.45}))
+        order = ["far", "mid", "terminal"]
+        ratios = [max(0.0, float(stage_ratios_cfg.get(k, 0.0))) for k in order]
+        s = float(sum(ratios))
+        if s <= 0.0:
+            ratios = [0.15, 0.40, 0.45]
+            s = float(sum(ratios))
+        ratios = [r / s for r in ratios]
+
+        n = max(1, int(frames_per_sequence))
+        raw = [r * n for r in ratios]
+        cnt = [int(np.floor(x)) for x in raw]
+        rem = n - int(sum(cnt))
+        if rem > 0:
+            frac_order = sorted(range(len(order)), key=lambda i: (raw[i] - cnt[i]), reverse=True)
+            for i in frac_order[:rem]:
+                cnt[i] += 1
+        if sum(cnt) != n:
+            cnt[-1] += n - sum(cnt)
+
+        # Ensure each stage exists when frames allow, consistent with three-stage requirement.
+        if n >= 3:
+            for i in range(3):
+                if cnt[i] <= 0:
+                    j = int(np.argmax(cnt))
+                    if cnt[j] > 1:
+                        cnt[j] -= 1
+                        cnt[i] += 1
+
+        out: list[str] = []
+        for k, c in zip(order, cnt):
+            out.extend([k] * int(c))
+        return out[:n]
 
     def _image_rel_path(self, split: str, seq_id: int, frame_id: int) -> str:
         image_abs = self.output_root / "images" / split / f"seq_{seq_id:04d}_frame_{frame_id:04d}.png"
@@ -709,13 +736,14 @@ class Stage2Renderer:
                 prev_valid_trunc: float | None = None
                 prev_valid_angle: float | None = None
                 prev_valid_scale: float | None = None
+                stage_schedule = self._stage_schedule(frames_per_sequence)
                 # Keep target scale stable per sequence by default (more realistic temporal continuity).
                 fixed_scale_range = target_cfg.get("fixed_scale_range", [0.14, 0.20])
                 seq_target_scale = float(self.rng.uniform(float(fixed_scale_range[0]), float(fixed_scale_range[1])))
                 scale_mode = str(target_cfg.get("scale_mode", "fixed_sequence"))
 
                 for frame_idx, state in enumerate(motion):
-                    stage_name = self._stage_for_frame(frame_idx, frames_per_sequence)
+                    stage_name = stage_schedule[frame_idx]
                     stage_cfg = dict(stages_cfg[stage_name])
                     gsd = float(stage_cfg["gsd_m_per_px"])
                     center_jitter_px = float(stage_cfg["center_jitter_px"])
