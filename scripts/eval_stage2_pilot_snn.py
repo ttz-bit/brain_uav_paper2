@@ -24,26 +24,31 @@ def parse_args() -> argparse.Namespace:
             Path(__file__).resolve().parents[1]
             / "outputs"
             / "stage2_pilot_baselines"
-            / "cnn_fit"
+            / "snn_fit"
             / "model_best.pth"
         ),
     )
     p.add_argument(
         "--out-dir",
         type=str,
-        default=str(Path(__file__).resolve().parents[1] / "outputs" / "stage2_pilot_baselines" / "cnn_eval"),
+        default=str(Path(__file__).resolve().parents[1] / "outputs" / "stage2_pilot_baselines" / "snn_eval"),
     )
     return p.parse_args()
 
 
-def _import_torch():
+def _import_torch_and_snn():
     try:
         import torch
         import torch.nn as nn
         import torch.nn.functional as F
     except Exception as e:
-        raise RuntimeError("PyTorch is required. Install torch in your environment.") from e
-    return torch, nn, F
+        raise RuntimeError("PyTorch is required.") from e
+    try:
+        import snntorch as snn
+        from snntorch import surrogate
+    except Exception as e:
+        raise RuntimeError("snntorch is required. Install: pip install snntorch") from e
+    return torch, nn, F, snn, surrogate
 
 
 def _to_tensor_image(img_bgr: np.ndarray) -> np.ndarray:
@@ -83,7 +88,7 @@ def _make_visual(img_bgr: np.ndarray, pred: np.ndarray, gt: np.ndarray) -> np.nd
 
 def main() -> None:
     args = parse_args()
-    torch, nn, F = _import_torch()
+    torch, nn, F, snn, surrogate = _import_torch_and_snn()
 
     device = "cpu"
     if args.device == "cuda":
@@ -107,34 +112,45 @@ def main() -> None:
         max_samples=args.max_eval_samples,
     )
 
-    class _SmallCNN(nn.Module):
-        def __init__(self):
+    class _SmallSNN(nn.Module):
+        def __init__(self, beta: float, num_steps: int):
             super().__init__()
-            self.backbone = nn.Sequential(
-                nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-                nn.ReLU(inplace=True),
-                nn.AdaptiveAvgPool2d((1, 1)),
-            )
-            self.head = nn.Sequential(
-                nn.Flatten(),
-                nn.Linear(64, 64),
-                nn.ReLU(inplace=True),
-                nn.Linear(64, 3),
-            )
-
+            spike_grad = surrogate.fast_sigmoid(slope=25.0)
+            self.num_steps = int(num_steps)
+            self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1)
+            self.lif1 = snn.Leaky(beta=beta, spike_grad=spike_grad)
+            self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)
+            self.lif2 = snn.Leaky(beta=beta, spike_grad=spike_grad)
+            self.pool = nn.AdaptiveAvgPool2d((1, 1))
+            self.fc = nn.Linear(32, 3)
+            self.lif_out = snn.Leaky(beta=beta, spike_grad=spike_grad)
+        def _rate_encode(self, x):
+            return torch.rand_like(x).le(x).float()
         def forward(self, x):
-            return torch.sigmoid(self.head(self.backbone(x)))
+            mem1 = self.lif1.init_leaky()
+            mem2 = self.lif2.init_leaky()
+            mem_out = self.lif_out.init_leaky()
+            spk_out_list = []
+            for _ in range(self.num_steps):
+                x_t = self._rate_encode(x)
+                cur1 = self.conv1(x_t)
+                spk1, mem1 = self.lif1(cur1, mem1)
+                cur2 = self.conv2(spk1)
+                spk2, mem2 = self.lif2(cur2, mem2)
+                z = self.pool(spk2).flatten(1)
+                cur_out = self.fc(z)
+                spk_out, mem_out = self.lif_out(cur_out, mem_out)
+                spk_out_list.append(spk_out)
+            return torch.stack(spk_out_list, dim=0).mean(dim=0)
 
     weights = Path(args.weights).resolve()
     if not weights.exists():
         raise FileNotFoundError(f"Missing weights: {weights}")
 
-    model = _SmallCNN().to(device)
     ckpt = torch.load(weights, map_location=device)
+    num_steps = int(ckpt.get("num_steps", 12))
+    beta = float(ckpt.get("beta", 0.95))
+    model = _SmallSNN(beta=beta, num_steps=num_steps).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
 
@@ -142,9 +158,6 @@ def main() -> None:
     px_errors: list[float] = []
     conf_mae: list[float] = []
     per_stage: dict[str, list[float]] = {"far": [], "mid": [], "terminal": []}
-    per_background: dict[str, list[float]] = {}
-    per_stage_background: dict[str, dict[str, list[float]]] = {"far": {}, "mid": {}, "terminal": {}}
-    port_vs_non_port: dict[str, list[float]] = {"port": [], "non_port": []}
     rows_for_report: list[dict] = []
 
     with torch.no_grad():
@@ -168,31 +181,24 @@ def main() -> None:
             conf_mae.append(float(abs(pred[2] - gt[2])))
 
             st = str(s.meta.get("perception_stage", "unknown"))
-            bg = str(s.meta.get("background_category", "unknown")).lower()
             if st in per_stage:
                 per_stage[st].append(err)
-            per_background.setdefault(bg, []).append(err)
-            if st in per_stage_background:
-                per_stage_background[st].setdefault(bg, []).append(err)
-            port_vs_non_port["port" if bg == "port" else "non_port"].append(err)
 
             if i < 16:
                 vis = _make_visual(s.image, pred, gt)
                 cv2.imwrite(str(vis_dir / f"eval_sample_{i:02d}.jpg"), vis)
-
             if i < 200:
                 rows_for_report.append(
                     {
                         "sequence_id": str(s.sequence_id),
                         "frame_id": str(s.frame_id),
                         "stage": st,
-                        "background_category": bg,
                         "pixel_error": err,
                     }
                 )
 
     report = {
-        "task": "eval_stage2_pilot_cnn",
+        "task": "eval_stage2_pilot_snn",
         "purpose": "generalization_eval",
         "dataset": {
             "name": "stage2_rendered",
@@ -214,24 +220,7 @@ def main() -> None:
             "pixel_error_mean": float(np.mean(px_errors)) if px_errors else 0.0,
             "pixel_error_p90": float(np.percentile(px_errors, 90)) if px_errors else 0.0,
             "conf_mae_mean": float(np.mean(conf_mae)) if conf_mae else 0.0,
-            "stage_pixel_error_mean": {
-                k: (float(np.mean(v)) if v else 0.0) for k, v in per_stage.items()
-            },
-            "background_pixel_error_mean": {
-                k: (float(np.mean(v)) if v else 0.0) for k, v in per_background.items()
-            },
-            "port_vs_non_port_pixel_error_mean": {
-                k: (float(np.mean(v)) if v else 0.0) for k, v in port_vs_non_port.items()
-            },
-            "stage_background_pixel_error_mean": {
-                st: {bg: (float(np.mean(vals)) if vals else 0.0) for bg, vals in bg_map.items()}
-                for st, bg_map in per_stage_background.items()
-            },
-            "counts": {
-                "stage": {k: int(len(v)) for k, v in per_stage.items()},
-                "background": {k: int(len(v)) for k, v in per_background.items()},
-                "port_vs_non_port": {k: int(len(v)) for k, v in port_vs_non_port.items()},
-            },
+            "stage_pixel_error_mean": {k: (float(np.mean(v)) if v else 0.0) for k, v in per_stage.items()},
         },
         "artifacts": {
             "report_path": str(out_dir / "report.json"),
@@ -247,3 +236,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
