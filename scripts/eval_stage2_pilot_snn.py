@@ -18,6 +18,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-eval-samples", type=int, default=None)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument(
+        "--input-size",
+        type=int,
+        default=0,
+        help="Resize eval frames to NxN. If <=0, reuse value from checkpoint when available.",
+    )
+    p.add_argument(
+        "--eval-encoding",
+        type=str,
+        default="auto",
+        choices=["auto", "rate", "direct"],
+        help="Eval input encoding. 'auto' reuses checkpoint eval_encoding when available.",
+    )
+    p.add_argument(
         "--weights",
         type=str,
         default=str(
@@ -51,7 +64,12 @@ def _import_torch_and_snn():
     return torch, nn, F, snn, surrogate
 
 
-def _to_tensor_image(img_bgr: np.ndarray) -> np.ndarray:
+def _to_tensor_image(img_bgr: np.ndarray, input_size: int = 0) -> np.ndarray:
+    if int(input_size) > 0:
+        sz = int(input_size)
+        h, w = img_bgr.shape[:2]
+        if h != sz or w != sz:
+            img_bgr = cv2.resize(img_bgr, (sz, sz), interpolation=cv2.INTER_AREA)
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     return np.transpose(rgb, (2, 0, 1))
 
@@ -113,10 +131,12 @@ def main() -> None:
     )
 
     class _SmallSNN(nn.Module):
-        def __init__(self, beta: float, num_steps: int):
+        def __init__(self, beta: float, num_steps: int, train_encoding: str, eval_encoding: str):
             super().__init__()
             spike_grad = surrogate.fast_sigmoid(slope=25.0)
             self.num_steps = int(num_steps)
+            self.train_encoding = str(train_encoding)
+            self.eval_encoding = str(eval_encoding)
             self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1)
             self.lif1 = snn.Leaky(beta=beta, spike_grad=spike_grad)
             self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)
@@ -124,15 +144,23 @@ def main() -> None:
             self.pool = nn.AdaptiveAvgPool2d((1, 1))
             self.fc = nn.Linear(32, 3)
             self.lif_out = snn.Leaky(beta=beta, spike_grad=spike_grad)
+
         def _rate_encode(self, x):
             return torch.rand_like(x).le(x).float()
-        def forward(self, x):
+
+        def _encode(self, x, stochastic: bool):
+            mode = self.train_encoding if stochastic else self.eval_encoding
+            if mode == "rate":
+                return self._rate_encode(x)
+            return x
+
+        def forward(self, x, stochastic: bool = False):
             mem1 = self.lif1.init_leaky()
             mem2 = self.lif2.init_leaky()
             mem_out = self.lif_out.init_leaky()
             spk_out_list = []
             for _ in range(self.num_steps):
-                x_t = self._rate_encode(x)
+                x_t = self._encode(x, stochastic=stochastic)
                 cur1 = self.conv1(x_t)
                 spk1, mem1 = self.lif1(cur1, mem1)
                 cur2 = self.conv2(spk1)
@@ -150,7 +178,19 @@ def main() -> None:
     ckpt = torch.load(weights, map_location=device)
     num_steps = int(ckpt.get("num_steps", 12))
     beta = float(ckpt.get("beta", 0.95))
-    model = _SmallSNN(beta=beta, num_steps=num_steps).to(device)
+    ckpt_input_size = int(ckpt.get("input_size", 0))
+    input_size = int(args.input_size) if int(args.input_size) > 0 else ckpt_input_size
+
+    ckpt_train_encoding = str(ckpt.get("train_encoding", "rate"))
+    ckpt_eval_encoding = str(ckpt.get("eval_encoding", "direct"))
+    eval_encoding = ckpt_eval_encoding if args.eval_encoding == "auto" else str(args.eval_encoding)
+
+    model = _SmallSNN(
+        beta=beta,
+        num_steps=num_steps,
+        train_encoding=ckpt_train_encoding,
+        eval_encoding=eval_encoding,
+    ).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
 
@@ -163,10 +203,10 @@ def main() -> None:
     with torch.no_grad():
         for i in range(len(ds)):
             s = ds[i]
-            x_np = _to_tensor_image(s.image)
+            x_np = _to_tensor_image(s.image, input_size=input_size)
             gt = _target_from_sample(s)
             x = torch.from_numpy(x_np).unsqueeze(0).to(device)
-            pred = model(x)[0].detach().cpu().numpy()
+            pred = model(x, stochastic=False)[0].detach().cpu().numpy()
 
             pred_xy = torch.tensor(pred[:2], dtype=torch.float32)
             gt_xy = torch.tensor(gt[:2], dtype=torch.float32)
@@ -214,6 +254,13 @@ def main() -> None:
         },
         "weights_path": str(weights),
         "device": str(device),
+        "eval_config": {
+            "input_size": int(input_size),
+            "eval_encoding": str(eval_encoding),
+            "checkpoint_input_size": int(ckpt_input_size),
+            "checkpoint_train_encoding": str(ckpt_train_encoding),
+            "checkpoint_eval_encoding": str(ckpt_eval_encoding),
+        },
         "metrics": {
             "eval_loss_mean": float(np.mean(losses)) if losses else 0.0,
             "eval_loss_p90": float(np.percentile(losses, 90)) if losses else 0.0,
@@ -236,4 +283,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
