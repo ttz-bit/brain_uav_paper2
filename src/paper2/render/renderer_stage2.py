@@ -397,6 +397,21 @@ class Stage2Renderer:
         self.output_root = output_root
         self.rng = rng
 
+    def _build_sequence_perturb_cfg(self, base_cfg: dict) -> dict:
+        out = dict(base_cfg)
+        b_jitter = float(base_cfg.get("brightness_jitter", 0.0))
+        c_jitter = float(base_cfg.get("contrast_jitter", 0.0))
+        if b_jitter > 0:
+            out["brightness_factor"] = float(self.rng.uniform(1.0 - b_jitter, 1.0 + b_jitter))
+        if c_jitter > 0:
+            out["contrast_factor"] = float(self.rng.uniform(1.0 - c_jitter, 1.0 + c_jitter))
+
+        out["blur_kernel"] = int(self.rng.choice([3, 5])) if float(self.rng.random()) < float(base_cfg.get("blur_prob", 0.0)) else 0
+        out["haze_alpha"] = float(self.rng.uniform(0.08, 0.22)) if float(self.rng.random()) < float(base_cfg.get("haze_prob", 0.0)) else 0.0
+        out["cloud_alpha"] = float(self.rng.uniform(0.06, 0.14)) if float(self.rng.random()) < float(base_cfg.get("light_cloud_prob", 0.0)) else 0.0
+        out["compression_quality"] = int(self.rng.integers(55, 86)) if float(self.rng.random()) < float(base_cfg.get("compression_prob", 0.0)) else 0
+        return out
+
     def _stage_for_frame(self, frame_idx: int, frames_per_sequence: int) -> str:
         ratio = float(frame_idx) / max(1.0, float(frames_per_sequence - 1))
         if ratio < 0.4:
@@ -492,6 +507,27 @@ class Stage2Renderer:
                     else:
                         xw, yw = float(prev_x), float(prev_y)
 
+            # Final hard guard: world-step must not exceed threshold after all snapping.
+            if prev_x is not None and prev_y is not None:
+                dx2 = float(xw - prev_x)
+                dy2 = float(yw - prev_y)
+                d2 = float(np.hypot(dx2, dy2))
+                if d2 > float(max_world_step_m) and d2 > 1e-6:
+                    t2 = float(max_world_step_m) / d2
+                    cand_x = float(prev_x + dx2 * t2)
+                    cand_y = float(prev_y + dy2 * t2)
+                    cpx2, cpy2 = world_to_background_px(cand_x, cand_y, world_size_m, bg_w, bg_h)
+                    spx3, spy3 = _snap_to_water(
+                        water_mask_global,
+                        cpx2,
+                        cpy2,
+                        max_radius=max(2, int(max(6, snap_radius_px // 6))),
+                    )
+                    if _is_water_pixel(water_mask_global, spx3, spy3):
+                        xw, yw = background_px_to_world(spx3, spy3, world_size_m, bg_w, bg_h)
+                    else:
+                        xw, yw = float(prev_x), float(prev_y)
+
             if prev_x is None or prev_y is None:
                 vx = float(s.vx)
                 vy = float(s.vy)
@@ -576,6 +612,7 @@ class Stage2Renderer:
                 )
                 d_num = int(self.rng.integers(int(distractor_cfg["min_count"]), int(distractor_cfg["max_count"]) + 1))
                 distractors = self.registry.sample_many("distractor", split, d_num, self.rng)
+                seq_perturb_cfg = self._build_sequence_perturb_cfg(perturb_cfg)
 
                 used_background_ids.add(bg.asset_id)
                 for d in distractors:
@@ -1033,7 +1070,7 @@ class Stage2Renderer:
                         if not placed:
                             continue
 
-                    patch = apply_perturbations(patch, perturb_cfg, self.rng)
+                    patch = apply_perturbations(patch, seq_perturb_cfg, self.rng)
 
                     rel_img_path = self._image_rel_path(split, seq_idx, frame_idx)
                     abs_img_path = self.project_root / Path(rel_img_path)
