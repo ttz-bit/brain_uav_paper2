@@ -52,6 +52,18 @@ def parse_args() -> argparse.Namespace:
         default=16,
         help="Number of examples saved for each visual audit bucket.",
     )
+    p.add_argument(
+        "--min-center-improve-ratio",
+        type=float,
+        default=0.10,
+        help="Minimum relative improvement over a fixed-center baseline required to avoid a collapse warning.",
+    )
+    p.add_argument(
+        "--min-pred-std-px",
+        type=float,
+        default=2.0,
+        help="Minimum prediction x/y standard deviation in pixels required to avoid a constant-prediction warning.",
+    )
     return p.parse_args()
 
 
@@ -266,7 +278,13 @@ def main() -> None:
 
     losses: list[float] = []
     px_errors: list[float] = []
+    center_errors: list[float] = []
     conf_mae: list[float] = []
+    pred_x_px: list[float] = []
+    pred_y_px: list[float] = []
+    gt_x_px: list[float] = []
+    gt_y_px: list[float] = []
+    pred_center_distance: list[float] = []
     per_stage: dict[str, list[float]] = {"far": [], "mid": [], "terminal": []}
     per_background: dict[str, list[float]] = {}
     per_stage_background: dict[str, dict[str, list[float]]] = {"far": {}, "mid": {}, "terminal": {}}
@@ -291,8 +309,20 @@ def main() -> None:
 
             h, w = s.image.shape[:2]
             err = _pixel_error(pred, gt, h, w)
+            center_pred = np.array([0.5, 0.5, 1.0], dtype=np.float32)
+            center_err = _pixel_error(center_pred, gt, h, w)
             px_errors.append(err)
+            center_errors.append(center_err)
             conf_mae.append(float(abs(pred[2] - gt[2])))
+            px = float(np.clip(pred[0], 0.0, 1.0) * w)
+            py = float(np.clip(pred[1], 0.0, 1.0) * h)
+            gx = float(np.clip(gt[0], 0.0, 1.0) * w)
+            gy = float(np.clip(gt[1], 0.0, 1.0) * h)
+            pred_x_px.append(px)
+            pred_y_px.append(py)
+            gt_x_px.append(gx)
+            gt_y_px.append(gy)
+            pred_center_distance.append(float(np.hypot(px - (w / 2.0), py - (h / 2.0))))
 
             st = str(s.meta.get("perception_stage", "unknown"))
             bg = str(s.meta.get("background_category", "unknown")).lower()
@@ -310,8 +340,12 @@ def main() -> None:
                 "stage": st,
                 "background_category": bg,
                 "pixel_error": err,
+                "center_baseline_pixel_error": center_err,
+                "center_baseline_delta": center_err - err,
                 "pred": [float(v) for v in pred.tolist()],
                 "gt": [float(v) for v in gt.tolist()],
+                "pred_xy_px": [px, py],
+                "gt_xy_px": [gx, gy],
                 "pred_conf": float(pred[2]),
                 "gt_conf": float(gt[2]),
             }
@@ -345,6 +379,29 @@ def main() -> None:
             count=audit_count,
         )
 
+    px_error_mean = float(np.mean(px_errors)) if px_errors else 0.0
+    center_error_mean = float(np.mean(center_errors)) if center_errors else 0.0
+    center_improve_ratio = (
+        float((center_error_mean - px_error_mean) / max(center_error_mean, 1e-12)) if center_errors else 0.0
+    )
+    pred_x_mean = float(np.mean(pred_x_px)) if pred_x_px else 0.0
+    pred_y_mean = float(np.mean(pred_y_px)) if pred_y_px else 0.0
+    pred_x_std = float(np.std(pred_x_px)) if pred_x_px else 0.0
+    pred_y_std = float(np.std(pred_y_px)) if pred_y_px else 0.0
+    gt_x_mean = float(np.mean(gt_x_px)) if gt_x_px else 0.0
+    gt_y_mean = float(np.mean(gt_y_px)) if gt_y_px else 0.0
+    gt_x_std = float(np.std(gt_x_px)) if gt_x_px else 0.0
+    gt_y_std = float(np.std(gt_y_px)) if gt_y_px else 0.0
+    rounded_pred_xy = {(int(round(x)), int(round(y))) for x, y in zip(pred_x_px, pred_y_px)}
+    warnings: list[str] = []
+    if center_improve_ratio < float(args.min_center_improve_ratio):
+        warnings.append("snn_not_enough_better_than_fixed_center_baseline")
+    if min(pred_x_std, pred_y_std) < float(args.min_pred_std_px):
+        warnings.append("prediction_variance_too_low")
+    if pred_center_distance and float(np.mean(pred_center_distance)) < float(args.min_pred_std_px):
+        warnings.append("prediction_mean_near_image_center")
+    suspect_center_collapse = bool(warnings)
+
     report = {
         "task": "eval_stage2_pilot_snn",
         "purpose": "generalization_eval",
@@ -372,9 +429,36 @@ def main() -> None:
         "metrics": {
             "eval_loss_mean": float(np.mean(losses)) if losses else 0.0,
             "eval_loss_p90": float(np.percentile(losses, 90)) if losses else 0.0,
-            "pixel_error_mean": float(np.mean(px_errors)) if px_errors else 0.0,
+            "pixel_error_mean": px_error_mean,
             "pixel_error_p90": float(np.percentile(px_errors, 90)) if px_errors else 0.0,
+            "center_baseline_pixel_error_mean": center_error_mean,
+            "center_baseline_pixel_error_p90": float(np.percentile(center_errors, 90)) if center_errors else 0.0,
+            "center_baseline_improve_ratio": center_improve_ratio,
             "conf_mae_mean": float(np.mean(conf_mae)) if conf_mae else 0.0,
+            "prediction_stats": {
+                "pred_x_mean_px": pred_x_mean,
+                "pred_y_mean_px": pred_y_mean,
+                "pred_x_std_px": pred_x_std,
+                "pred_y_std_px": pred_y_std,
+                "gt_x_mean_px": gt_x_mean,
+                "gt_y_mean_px": gt_y_mean,
+                "gt_x_std_px": gt_x_std,
+                "gt_y_std_px": gt_y_std,
+                "rounded_unique_pred_xy": int(len(rounded_pred_xy)),
+                "pred_center_distance_mean_px": float(np.mean(pred_center_distance)) if pred_center_distance else 0.0,
+            },
+            "diagnostics": {
+                "suspect_center_collapse": suspect_center_collapse,
+                "warnings": warnings,
+                "thresholds": {
+                    "min_center_improve_ratio": float(args.min_center_improve_ratio),
+                    "min_pred_std_px": float(args.min_pred_std_px),
+                },
+                "interpretation": {
+                    "center_baseline_improve_ratio": "Higher is better. <=0 means worse than always predicting image center.",
+                    "pred_x_std_px_pred_y_std_px": "Both should be clearly above zero if the model is truly moving its prediction.",
+                },
+            },
             "stage_pixel_error_mean": {k: (float(np.mean(v)) if v else 0.0) for k, v in per_stage.items()},
             "background_pixel_error_mean": {
                 k: (float(np.mean(v)) if v else 0.0) for k, v in per_background.items()
