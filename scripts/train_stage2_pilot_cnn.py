@@ -24,6 +24,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    p.add_argument("--eval-batch-size", type=int, default=256, help="Batch size used for loss evaluation.")
+    p.add_argument(
+        "--eval-interval",
+        type=int,
+        default=1,
+        help="Run validation every N epochs (always runs on the last epoch).",
+    )
+    p.add_argument(
+        "--val-eval-max-samples",
+        type=int,
+        default=0,
+        help="If >0, cap number of val samples used for in-training checkpoint selection.",
+    )
     p.add_argument("--strict-no-leak", action="store_true", help="Fail if any split asset leakage is detected.")
     p.add_argument(
         "--out-dir",
@@ -228,22 +241,45 @@ def main() -> None:
         gt_c = target[:, 2]
         return F.smooth_l1_loss(pred_xy, gt_xy) + F.binary_cross_entropy(pred_c, gt_c)
 
-    xtr = torch.from_numpy(x_train).to(device)
-    ytr = torch.from_numpy(y_train).to(device)
-    xva = torch.from_numpy(x_val).to(device)
-    yva = torch.from_numpy(y_val).to(device)
+    eval_batch_size = max(1, int(args.eval_batch_size))
+
+    def _eval_loss_numpy(x_np: np.ndarray, y_np: np.ndarray) -> float:
+        model.eval()
+        total = 0.0
+        count = 0
+        with torch.no_grad():
+            for s in range(0, int(x_np.shape[0]), eval_batch_size):
+                e = min(s + eval_batch_size, int(x_np.shape[0]))
+                xb = torch.from_numpy(x_np[s:e]).to(device)
+                yb = torch.from_numpy(y_np[s:e]).to(device)
+                pred = model(xb)
+                v = float(_loss(pred, yb).item())
+                n = int(e - s)
+                total += v * n
+                count += n
+        return total / max(1, count)
 
     with torch.no_grad():
-        model.eval()
-        train_initial_loss = float(_loss(model(xtr), ytr).item())
-        val_initial_loss = float(_loss(model(xva), yva).item())
+        train_initial_loss = float(_eval_loss_numpy(x_train, y_train))
+        val_initial_loss = float(_eval_loss_numpy(x_val, y_val))
+
+    val_eval_x = x_val
+    val_eval_y = y_val
+    val_eval_count = int(x_val.shape[0])
+    if int(args.val_eval_max_samples) > 0 and int(x_val.shape[0]) > int(args.val_eval_max_samples):
+        idx = rng.choice(int(x_val.shape[0]), size=int(args.val_eval_max_samples), replace=False)
+        val_eval_x = x_val[idx]
+        val_eval_y = y_val[idx]
+        val_eval_count = int(args.val_eval_max_samples)
 
     best_val = float("inf")
     best_path = out_dir / "model_best.pth"
     loss_trace: list[dict] = []
     epochs = max(1, int(args.epochs))
+    eval_interval = max(1, int(args.eval_interval))
     for ep in range(epochs):
         model.train()
+        batch_losses: list[float] = []
         for xb, yb in loader:
             xb = xb.to(device)
             yb = yb.to(device)
@@ -252,13 +288,15 @@ def main() -> None:
             loss = _loss(pred, yb)
             loss.backward()
             optimizer.step()
+            batch_losses.append(float(loss.detach().item()))
 
-        with torch.no_grad():
-            model.eval()
-            train_loss = float(_loss(model(xtr), ytr).item())
-            val_loss = float(_loss(model(xva), yva).item())
+        do_eval = ((ep + 1) % eval_interval == 0) or (ep + 1 == epochs)
+        train_loss = float(np.mean(batch_losses)) if batch_losses else 0.0
+        val_loss = float("nan")
+        if do_eval:
+            val_loss = float(_eval_loss_numpy(val_eval_x, val_eval_y))
         loss_trace.append({"epoch": ep + 1, "train_loss": train_loss, "val_loss": val_loss})
-        if val_loss < best_val:
+        if do_eval and val_loss < best_val:
             best_val = val_loss
             torch.save(
                 {
@@ -272,7 +310,8 @@ def main() -> None:
                 },
                 best_path,
             )
-        print(f"[FIT] epoch={ep+1:03d}/{epochs} train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
+        val_msg = f"{val_loss:.6f}" if do_eval else "skip"
+        print(f"[FIT] epoch={ep+1:03d}/{epochs} train_loss={train_loss:.6f} val_loss={val_msg}")
 
     last_path = out_dir / "model_last.pth"
     torch.save(
@@ -289,12 +328,25 @@ def main() -> None:
     )
 
     # Load best model for final reporting/visualization.
+    if not best_path.exists():
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "seed": int(args.seed),
+                "dataset_root": str(dataset_root),
+                "train_split": str(args.train_split),
+                "val_split": str(args.val_split),
+                "num_train": int(len(train_ds)),
+                "num_val": int(len(val_ds)),
+            },
+            best_path,
+        )
+
     ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt["state_dict"])
     with torch.no_grad():
-        model.eval()
-        train_final_loss = float(_loss(model(xtr), ytr).item())
-        val_final_loss = float(_loss(model(xva), yva).item())
+        train_final_loss = float(_eval_loss_numpy(x_train, y_train))
+        val_final_loss = float(_eval_loss_numpy(x_val, y_val))
 
     train_improve_ratio = (train_initial_loss - train_final_loss) / max(train_initial_loss, 1e-12)
     val_improve_ratio = (val_initial_loss - val_final_loss) / max(val_initial_loss, 1e-12)
@@ -332,6 +384,9 @@ def main() -> None:
             "learning_rate": float(args.learning_rate),
             "weight_decay": float(args.weight_decay),
             "seed": int(args.seed),
+            "eval_batch_size": int(eval_batch_size),
+            "eval_interval": int(eval_interval),
+            "val_eval_max_samples": int(val_eval_count),
         },
         "leakage_check": {
             "split_asset_leakage": leak,
@@ -367,4 +422,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
