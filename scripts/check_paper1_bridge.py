@@ -24,7 +24,7 @@ def _default_paper1_root() -> Path | None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--paper1-root", type=str, default=None)
-    parser.add_argument("--world-size-m", type=float, default=4000.0)
+    parser.add_argument("--world-size-km", type=float, default=None)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--steps", type=int, default=10)
     args = parser.parse_args()
@@ -32,7 +32,7 @@ def main() -> None:
     paper1_root = Path(args.paper1_root) if args.paper1_root else _default_paper1_root()
     bridge = Paper1EnvBridge(
         paper1_root=paper1_root,
-        world_size_m=float(args.world_size_m),
+        world_size_km=args.world_size_km,
         seed=int(args.seed),
     )
     obs0 = bridge.reset(seed=int(args.seed))
@@ -48,13 +48,19 @@ def main() -> None:
 
     sample_xy = np.array([100.0, -50.0], dtype=float)
     round_trip = paper2_xy_to_paper1_xy(
-        paper1_xy_to_paper2_xy(sample_xy, world_size_m=float(args.world_size_m)),
-        world_size_m=float(args.world_size_m),
+        paper1_xy_to_paper2_xy(sample_xy, world_size_km=float(bridge.world_size_km)),
+        world_size_km=float(bridge.world_size_km),
     )
     report = {
         "task": "check_paper1_bridge",
         "paper1_root": None if paper1_root is None else str(paper1_root),
         "seed": int(args.seed),
+        "unit": "km",
+        "world_size_km": float(bridge.world_size_km),
+        "paper1_speed_km_s": float(bridge.env.scenario.speed),
+        "paper1_dt_s": float(bridge.env.scenario.dt),
+        "paper1_max_steps": int(bridge.env.scenario.max_steps),
+        "paper1_max_range_km": float(bridge.env.scenario.speed * bridge.env.scenario.dt * bridge.env.scenario.max_steps),
         "steps_requested": int(args.steps),
         "steps_executed": len(reasons),
         "done": done,

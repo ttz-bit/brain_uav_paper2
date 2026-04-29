@@ -31,17 +31,21 @@ class Paper1EnvBridge:
         env: Any | None = None,
         *,
         paper1_root: str | Path | None = None,
-        world_size_m: float = 4000.0,
+        world_size_km: float | None = None,
         seed: int | None = None,
     ) -> None:
         _add_paper1_src_to_path(paper1_root)
-        self.world_size_m = float(world_size_m)
         if env is None:
             from brain_uav.config import RewardConfig, ScenarioConfig
             from brain_uav.envs import StaticNoFlyTrajectoryEnv
 
             env = StaticNoFlyTrajectoryEnv(ScenarioConfig(), RewardConfig(), seed=seed)
         self.env = env
+        self.world_size_km = (
+            float(world_size_km)
+            if world_size_km is not None
+            else float(self.env.scenario.world_xy) * 2.0
+        )
         self._last_obs: np.ndarray | None = None
         self._last_info: dict[str, Any] = {}
 
@@ -78,7 +82,7 @@ class Paper1EnvBridge:
         state = np.asarray(self.env.state, dtype=float).reshape(-1)
         if state.size < 5:
             raise RuntimeError("paper1 env.state must be [x, y, z, gamma, psi].")
-        pos = paper1_xyz_to_paper2_xyz(state[:3], world_size_m=self.world_size_m)
+        pos = paper1_xyz_to_paper2_xyz(state[:3], world_size_km=self.world_size_km)
         gamma = float(state[3])
         psi = float(state[4])
         speed = float(self.env.scenario.speed)
@@ -103,14 +107,20 @@ class Paper1EnvBridge:
                 "delta_psi_max": float(self.env.scenario.delta_psi_max),
                 "gamma_max": float(self.env.scenario.gamma_max),
             },
-            meta={"source": "paper1", "state_order": ["x", "y", "z", "gamma", "psi"]},
+            meta={
+                "source": "paper1",
+                "unit": "km",
+                "speed_unit": "km/s",
+                "state_order": ["x", "y", "z", "gamma", "psi"],
+                "world_size_km": self.world_size_km,
+            },
         )
 
     def get_target_truth(self) -> TargetTruthState:
         goal = np.asarray(self.env.goal, dtype=float).reshape(-1)
         if goal.size < 3:
             raise RuntimeError("paper1 env.goal must be [x, y, z].")
-        pos = paper1_xyz_to_paper2_xyz(goal[:3], world_size_m=self.world_size_m)
+        pos = paper1_xyz_to_paper2_xyz(goal[:3], world_size_km=self.world_size_km)
         return TargetTruthState(
             t=float(getattr(self.env, "steps", 0) * self.env.scenario.dt),
             pos_world=pos,
@@ -122,14 +132,19 @@ class Paper1EnvBridge:
     def get_no_fly_zones(self) -> list[NoFlyZoneState]:
         zones: list[NoFlyZoneState] = []
         for zone in self.env.zones:
-            center_xy = paper1_xy_to_paper2_xy(zone.center_xy, world_size_m=self.world_size_m)
+            center_xy = paper1_xy_to_paper2_xy(zone.center_xy, world_size_km=self.world_size_km)
             zones.append(
                 NoFlyZoneState(
                     center_world=np.array([center_xy[0], center_xy[1], 0.0], dtype=float),
                     radius_world=float(zone.radius),
                     geometry="hemisphere",
                     safety_margin=float(self.env.scenario.warning_distance),
-                    meta={"source": "paper1", "paper1_center_xy": np.asarray(zone.center_xy).tolist()},
+                    meta={
+                        "source": "paper1",
+                        "unit": "km",
+                        "paper1_center_xy": np.asarray(zone.center_xy).tolist(),
+                        "world_size_km": self.world_size_km,
+                    },
                 )
             )
         return zones

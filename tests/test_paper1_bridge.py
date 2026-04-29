@@ -22,7 +22,7 @@ def _paper1_root() -> Path | None:
 
 def test_world_frame_round_trip():
     xy = np.array([123.0, -456.0], dtype=float)
-    got = paper2_xy_to_paper1_xy(paper1_xy_to_paper2_xy(xy, world_size_m=4000.0), world_size_m=4000.0)
+    got = paper2_xy_to_paper1_xy(paper1_xy_to_paper2_xy(xy, world_size_km=2625.0), world_size_km=2625.0)
     assert np.allclose(got, xy)
 
 
@@ -33,6 +33,7 @@ def test_paper1_bridge_reset_step_contract():
 
     bridge = Paper1EnvBridge(paper1_root=root, seed=7)
     obs = bridge.reset(seed=7)
+    assert np.isclose(bridge.world_size_km, 2625.0)
     assert obs.aircraft_pos_world.shape == (3,)
     assert obs.target_pos_world.shape == (3,)
     assert obs.truth_crop_center_world.shape == (2,)
@@ -41,8 +42,11 @@ def test_paper1_bridge_reset_step_contract():
     assert aircraft.pos_world.shape == (3,)
     assert aircraft.vel_world.shape == (3,)
     assert aircraft.speed is not None
+    assert np.isclose(aircraft.speed, 2.5)
     assert aircraft.gamma is not None
     assert aircraft.psi is not None
+    assert aircraft.meta is not None
+    assert aircraft.meta["unit"] == "km"
 
     zones = bridge.get_no_fly_zones()
     assert zones
