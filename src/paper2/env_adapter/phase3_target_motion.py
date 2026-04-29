@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 
 from paper2.common.types import TargetTruthState
+from paper2.env_adapter.water_constraint import WaterConstraint, build_water_constraint
 
 
 MOTION_MODES = ("cv", "turn", "piecewise", "evasive")
@@ -32,6 +33,7 @@ def sample_phase3_initial_target(
     rng: np.random.Generator,
     *,
     mode: str | None = None,
+    water_constraint: WaterConstraint | None = None,
 ) -> tuple[TargetTruthState, Phase3TargetInternalState]:
     mode_name = sample_phase3_motion_mode(cfg, rng) if mode is None else str(mode)
     if mode_name not in MOTION_MODES:
@@ -46,7 +48,16 @@ def sample_phase3_initial_target(
     if x_min >= x_max or y_min >= y_max:
         raise ValueError("phase3_target_motion init_margin leaves no valid sampling area.")
 
-    pos = np.array([rng.uniform(x_min, x_max), rng.uniform(y_min, y_max)], dtype=float)
+    water = water_constraint or build_water_constraint(cfg.get("water_constraint"))
+    attempts = int(cfg.get("water_constraint", {}).get("max_resample_attempts", 16))
+    pos = None
+    for _ in range(max(1, attempts)):
+        candidate = np.array([rng.uniform(x_min, x_max), rng.uniform(y_min, y_max)], dtype=float)
+        if water.is_water_world(candidate):
+            pos = candidate
+            break
+    if pos is None:
+        raise RuntimeError("Failed to sample phase3 target initial position on water.")
     speed = _sample_speed(cfg, rng)
     heading = float(rng.uniform(-math.pi, math.pi))
     truth = TargetTruthState(
@@ -71,6 +82,7 @@ def propagate_phase3_target_truth(
     rng: np.random.Generator,
     *,
     aircraft_pos_world: np.ndarray | None = None,
+    water_constraint: WaterConstraint | None = None,
 ) -> TargetTruthState:
     dt = float(cfg["dt"])
     speed = _clip_speed(float(np.linalg.norm(truth.vel_world)), cfg)
@@ -94,9 +106,21 @@ def propagate_phase3_target_truth(
     else:
         raise ValueError(f"Unsupported phase3 target motion mode: {internal.mode}")
 
-    vel = _from_heading_speed(heading, speed)
-    next_pos = np.asarray(truth.pos_world, dtype=float) + vel * dt
-    next_pos, heading = _reflect_if_needed(next_pos, heading, cfg)
+    water = water_constraint or build_water_constraint(cfg.get("water_constraint"))
+    attempts = int(cfg.get("water_constraint", {}).get("max_resample_attempts", 16))
+    next_pos = None
+    for attempt in range(max(1, attempts)):
+        candidate_heading = heading if attempt == 0 else float(rng.uniform(-math.pi, math.pi))
+        vel = _from_heading_speed(candidate_heading, speed)
+        candidate_pos = np.asarray(truth.pos_world, dtype=float) + vel * dt
+        candidate_pos, candidate_heading = _reflect_if_needed(candidate_pos, candidate_heading, cfg)
+        if water.is_water_world(candidate_pos):
+            next_pos = candidate_pos
+            heading = candidate_heading
+            break
+    if next_pos is None:
+        next_pos = np.asarray(truth.pos_world, dtype=float).copy()
+        heading = float(truth.heading)
     vel = _from_heading_speed(heading, speed)
     return TargetTruthState(
         t=float(truth.t + dt),
@@ -114,13 +138,15 @@ def generate_phase3_target_trajectory(
     frames: int | None = None,
     mode: str | None = None,
     aircraft_positions_world: list[np.ndarray] | None = None,
+    water_constraint: WaterConstraint | None = None,
 ) -> list[TargetTruthState]:
     rng = np.random.default_rng(int(seed))
     frame_count = int(frames if frames is not None else cfg["frames_per_sequence"])
     if frame_count <= 0:
         raise ValueError("frames must be positive.")
 
-    truth, internal = sample_phase3_initial_target(cfg, rng, mode=mode)
+    water = water_constraint or build_water_constraint(cfg.get("water_constraint"))
+    truth, internal = sample_phase3_initial_target(cfg, rng, mode=mode, water_constraint=water)
     rows = [truth]
     for idx in range(1, frame_count):
         aircraft_pos = None
@@ -132,6 +158,7 @@ def generate_phase3_target_trajectory(
             cfg,
             rng,
             aircraft_pos_world=aircraft_pos,
+            water_constraint=water,
         )
         rows.append(truth)
     return rows
