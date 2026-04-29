@@ -11,7 +11,7 @@ class HeatmapSNN(nn.Module):
         *,
         beta: float = 0.95,
         num_steps: int = 12,
-        train_encoding: str = "rate",
+        train_encoding: str = "direct",
         eval_encoding: str = "direct",
     ):
         super().__init__()
@@ -118,11 +118,21 @@ def heatmap_loss(
     softargmax_temperature: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     target_heatmaps = make_gaussian_heatmaps(targets, heatmap_size=heatmap_size, sigma=sigma)
-    pred_heatmaps = torch.sigmoid(outputs["heatmap_logits"])
-    heatmap_weight_map = 1.0 + target_heatmaps * 20.0
-    hm_loss = ((pred_heatmaps - target_heatmaps).pow(2) * heatmap_weight_map).mean()
+    valid = targets[:, 2] > 0.5
+    target_flat = target_heatmaps.flatten(1)
+    target_probs = target_flat / target_flat.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    log_probs = F.log_softmax(outputs["heatmap_logits"].flatten(1), dim=1)
+    hm_per_sample = -(target_probs * log_probs).sum(dim=1)
+    has_valid = bool(valid.any().detach().cpu().item())
+    if has_valid:
+        hm_loss = hm_per_sample[valid].mean()
+    else:
+        hm_loss = hm_per_sample.mean() * 0.0
     pred_xy = soft_argmax_2d(outputs["heatmap_logits"], temperature=softargmax_temperature)
-    coord_loss = F.smooth_l1_loss(pred_xy, targets[:, :2])
+    if has_valid:
+        coord_loss = F.smooth_l1_loss(pred_xy[valid], targets[valid, :2])
+    else:
+        coord_loss = pred_xy.sum() * 0.0
     conf_loss = F.binary_cross_entropy_with_logits(outputs["conf_logits"], targets[:, 2])
     total = float(heatmap_weight) * hm_loss + float(coord_weight) * coord_loss + float(conf_weight) * conf_loss
     parts = {

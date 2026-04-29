@@ -32,14 +32,14 @@ def parse_args() -> argparse.Namespace:
             Path(__file__).resolve().parents[1]
             / "outputs"
             / "stage2_pre_baselines"
-            / "snn_heatmap_fit_v1"
+            / "snn_heatmap_fit_v2"
             / "model_best.pth"
         ),
     )
     p.add_argument(
         "--out-dir",
         type=str,
-        default=str(Path(__file__).resolve().parents[1] / "outputs" / "stage2_pre_baselines" / "snn_heatmap_eval_v1"),
+        default=str(Path(__file__).resolve().parents[1] / "outputs" / "stage2_pre_baselines" / "snn_heatmap_eval_v2"),
     )
     return p.parse_args()
 
@@ -209,6 +209,10 @@ def main() -> None:
     input_size = int(args.input_size) if int(args.input_size) > 0 else int(ckpt.get("input_size", 256))
     heatmap_size = int(ckpt.get("heatmap_size", 64))
     heatmap_sigma = float(ckpt.get("heatmap_sigma", 1.5))
+    heatmap_weight = float(ckpt.get("heatmap_weight", 1.0))
+    coord_weight = float(ckpt.get("coord_weight", 5.0))
+    conf_weight = float(ckpt.get("conf_weight", 0.2))
+    softargmax_temperature = float(ckpt.get("softargmax_temperature", 20.0))
     ckpt_train_encoding = str(ckpt.get("train_encoding", "rate"))
     ckpt_eval_encoding = str(ckpt.get("eval_encoding", "direct"))
     eval_encoding = ckpt_eval_encoding if args.eval_encoding == "auto" else str(args.eval_encoding)
@@ -250,10 +254,10 @@ def main() -> None:
                 y,
                 heatmap_size=heatmap_size,
                 sigma=heatmap_sigma,
-                coord_weight=5.0,
-                heatmap_weight=1.0,
-                conf_weight=0.2,
-                softargmax_temperature=10.0,
+                coord_weight=coord_weight,
+                heatmap_weight=heatmap_weight,
+                conf_weight=conf_weight,
+                softargmax_temperature=softargmax_temperature,
             )
             losses.append(float(loss.item()))
             pred_xy = peak_argmax_2d(outputs["heatmap_logits"])[0].detach().cpu().numpy()
@@ -372,10 +376,15 @@ def main() -> None:
             "input_size": int(input_size),
             "heatmap_size": int(heatmap_size),
             "heatmap_sigma": float(heatmap_sigma),
+            "heatmap_weight": float(heatmap_weight),
+            "coord_weight": float(coord_weight),
+            "conf_weight": float(conf_weight),
+            "softargmax_temperature": float(softargmax_temperature),
             "eval_encoding": str(eval_encoding),
             "checkpoint_train_encoding": str(ckpt_train_encoding),
             "checkpoint_eval_encoding": str(ckpt_eval_encoding),
             "decode_method": "heatmap_argmax",
+            "loss_kind": str(ckpt.get("loss_kind", "unknown")),
         },
         "metrics": {
             "eval_loss_mean": _mean(losses),

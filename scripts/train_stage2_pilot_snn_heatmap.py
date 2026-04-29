@@ -35,8 +35,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--heatmap-weight", type=float, default=1.0)
     p.add_argument("--coord-weight", type=float, default=5.0)
     p.add_argument("--conf-weight", type=float, default=0.2)
-    p.add_argument("--softargmax-temperature", type=float, default=10.0)
-    p.add_argument("--train-encoding", type=str, default="rate", choices=["rate", "direct"])
+    p.add_argument("--softargmax-temperature", type=float, default=20.0)
+    p.add_argument("--train-encoding", type=str, default="direct", choices=["rate", "direct"])
     p.add_argument("--eval-encoding", type=str, default="direct", choices=["rate", "direct"])
     p.add_argument("--eval-interval", type=int, default=1)
     p.add_argument("--eval-batch-size", type=int, default=128)
@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--out-dir",
         type=str,
-        default=str(Path(__file__).resolve().parents[1] / "outputs" / "stage2_pre_baselines" / "snn_heatmap_fit_v1"),
+        default=str(Path(__file__).resolve().parents[1] / "outputs" / "stage2_pre_baselines" / "snn_heatmap_fit_v2"),
     )
     return p.parse_args()
 
@@ -344,6 +344,11 @@ def main() -> None:
                     "input_size": int(args.input_size),
                     "heatmap_size": int(args.heatmap_size),
                     "heatmap_sigma": float(args.heatmap_sigma),
+                    "heatmap_weight": float(args.heatmap_weight),
+                    "coord_weight": float(args.coord_weight),
+                    "conf_weight": float(args.conf_weight),
+                    "softargmax_temperature": float(args.softargmax_temperature),
+                    "loss_kind": "spatial_cross_entropy_plus_coordinate",
                     "num_steps": int(args.num_steps),
                     "beta": float(args.beta),
                     "train_encoding": str(args.train_encoding),
@@ -371,6 +376,11 @@ def main() -> None:
             "input_size": int(args.input_size),
             "heatmap_size": int(args.heatmap_size),
             "heatmap_sigma": float(args.heatmap_sigma),
+            "heatmap_weight": float(args.heatmap_weight),
+            "coord_weight": float(args.coord_weight),
+            "conf_weight": float(args.conf_weight),
+            "softargmax_temperature": float(args.softargmax_temperature),
+            "loss_kind": "spatial_cross_entropy_plus_coordinate",
             "num_steps": int(args.num_steps),
             "beta": float(args.beta),
             "train_encoding": str(args.train_encoding),
