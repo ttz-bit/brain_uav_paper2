@@ -46,6 +46,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=str(Path(__file__).resolve().parents[1] / "outputs" / "stage2_pilot_baselines" / "snn_eval"),
     )
+    p.add_argument(
+        "--visual-audit-count",
+        type=int,
+        default=16,
+        help="Number of examples saved for each visual audit bucket.",
+    )
     return p.parse_args()
 
 
@@ -90,7 +96,15 @@ def _pixel_error(pred: np.ndarray, gt: np.ndarray, h: int, w: int) -> float:
     return float(np.hypot(px - gx, py - gy))
 
 
-def _make_visual(img_bgr: np.ndarray, pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
+def _make_visual(
+    img_bgr: np.ndarray,
+    pred: np.ndarray,
+    gt: np.ndarray,
+    *,
+    pixel_error: float | None = None,
+    stage: str | None = None,
+    background: str | None = None,
+) -> np.ndarray:
     h_img, w_img = img_bgr.shape[:2]
     pred_x = int(np.clip(pred[0], 0.0, 1.0) * w_img)
     pred_y = int(np.clip(pred[1], 0.0, 1.0) * h_img)
@@ -100,8 +114,64 @@ def _make_visual(img_bgr: np.ndarray, pred: np.ndarray, gt: np.ndarray) -> np.nd
     cv2.circle(vis, (gt_x, gt_y), 4, (0, 255, 0), -1)
     cv2.circle(vis, (pred_x, pred_y), 4, (0, 0, 255), -1)
     cv2.line(vis, (gt_x, gt_y), (pred_x, pred_y), (255, 255, 0), 1)
-    cv2.putText(vis, f"gt=({gt_x},{gt_y}) pred=({pred_x},{pred_y})", (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    title = f"gt=({gt_x},{gt_y}) pred=({pred_x},{pred_y})"
+    if pixel_error is not None:
+        title += f" err={pixel_error:.1f}px"
+    if stage:
+        title += f" {stage}"
+    if background:
+        title += f" {background}"
+    cv2.putText(vis, title, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
     return vis
+
+
+def _select_median(records: list[dict], count: int) -> list[dict]:
+    if not records or count <= 0:
+        return []
+    ordered = sorted(records, key=lambda r: float(r["pixel_error"]))
+    mid = len(ordered) // 2
+    half = count // 2
+    start = max(0, mid - half)
+    end = min(len(ordered), start + count)
+    start = max(0, end - count)
+    return ordered[start:end]
+
+
+def _save_visual_bucket(
+    *,
+    ds,
+    records: list[dict],
+    bucket_dir: Path,
+    input_size: int,
+    count: int,
+) -> list[str]:
+    bucket_dir.mkdir(parents=True, exist_ok=True)
+    saved: list[str] = []
+    for rank, rec in enumerate(records[: max(0, int(count))]):
+        sample = ds[int(rec["sample_index"])]
+        pred = np.array(rec["pred"], dtype=np.float32)
+        gt = np.array(rec["gt"], dtype=np.float32)
+        img = sample.image
+        if int(input_size) > 0:
+            h, w = img.shape[:2]
+            if h != int(input_size) or w != int(input_size):
+                img = cv2.resize(img, (int(input_size), int(input_size)), interpolation=cv2.INTER_AREA)
+        vis = _make_visual(
+            img,
+            pred,
+            gt,
+            pixel_error=float(rec["pixel_error"]),
+            stage=str(rec["stage"]),
+            background=str(rec["background_category"]),
+        )
+        name = (
+            f"{rank:02d}_err{float(rec['pixel_error']):06.2f}_"
+            f"{rec['stage']}_{rec['sequence_id']}_f{rec['frame_id']}.jpg"
+        )
+        out_path = bucket_dir / name
+        cv2.imwrite(str(out_path), vis)
+        saved.append(str(out_path))
+    return saved
 
 
 def main() -> None:
@@ -198,7 +268,11 @@ def main() -> None:
     px_errors: list[float] = []
     conf_mae: list[float] = []
     per_stage: dict[str, list[float]] = {"far": [], "mid": [], "terminal": []}
+    per_background: dict[str, list[float]] = {}
+    per_stage_background: dict[str, dict[str, list[float]]] = {"far": {}, "mid": {}, "terminal": {}}
+    port_vs_non_port: dict[str, list[float]] = {"port": [], "non_port": []}
     rows_for_report: list[dict] = []
+    all_rows: list[dict] = []
 
     with torch.no_grad():
         for i in range(len(ds)):
@@ -221,21 +295,55 @@ def main() -> None:
             conf_mae.append(float(abs(pred[2] - gt[2])))
 
             st = str(s.meta.get("perception_stage", "unknown"))
+            bg = str(s.meta.get("background_category", "unknown")).lower()
             if st in per_stage:
                 per_stage[st].append(err)
+            per_background.setdefault(bg, []).append(err)
+            if st in per_stage_background:
+                per_stage_background[st].setdefault(bg, []).append(err)
+            port_vs_non_port["port" if bg == "port" else "non_port"].append(err)
+
+            row = {
+                "sample_index": int(i),
+                "sequence_id": str(s.sequence_id),
+                "frame_id": str(s.frame_id),
+                "stage": st,
+                "background_category": bg,
+                "pixel_error": err,
+                "pred": [float(v) for v in pred.tolist()],
+                "gt": [float(v) for v in gt.tolist()],
+                "pred_conf": float(pred[2]),
+                "gt_conf": float(gt[2]),
+            }
+            all_rows.append(row)
 
             if i < 16:
-                vis = _make_visual(s.image, pred, gt)
+                vis = _make_visual(s.image, pred, gt, pixel_error=err, stage=st, background=bg)
                 cv2.imwrite(str(vis_dir / f"eval_sample_{i:02d}.jpg"), vis)
             if i < 200:
-                rows_for_report.append(
-                    {
-                        "sequence_id": str(s.sequence_id),
-                        "frame_id": str(s.frame_id),
-                        "stage": st,
-                        "pixel_error": err,
-                    }
-                )
+                rows_for_report.append(row)
+
+    audit_count = max(0, int(args.visual_audit_count))
+    audit_dir = vis_dir / "audit"
+    best = sorted(all_rows, key=lambda r: float(r["pixel_error"]))[:audit_count]
+    worst = sorted(all_rows, key=lambda r: float(r["pixel_error"]), reverse=True)[:audit_count]
+    median = _select_median(all_rows, audit_count)
+    visual_audit = {
+        "best": _save_visual_bucket(ds=ds, records=best, bucket_dir=audit_dir / "best", input_size=input_size, count=audit_count),
+        "median": _save_visual_bucket(ds=ds, records=median, bucket_dir=audit_dir / "median", input_size=input_size, count=audit_count),
+        "worst": _save_visual_bucket(ds=ds, records=worst, bucket_dir=audit_dir / "worst", input_size=input_size, count=audit_count),
+        "stage_worst": {},
+    }
+    for stage in ("far", "mid", "terminal"):
+        stage_rows = [r for r in all_rows if r["stage"] == stage]
+        stage_worst = sorted(stage_rows, key=lambda r: float(r["pixel_error"]), reverse=True)[:audit_count]
+        visual_audit["stage_worst"][stage] = _save_visual_bucket(
+            ds=ds,
+            records=stage_worst,
+            bucket_dir=audit_dir / f"{stage}_worst",
+            input_size=input_size,
+            count=audit_count,
+        )
 
     report = {
         "task": "eval_stage2_pilot_snn",
@@ -268,15 +376,34 @@ def main() -> None:
             "pixel_error_p90": float(np.percentile(px_errors, 90)) if px_errors else 0.0,
             "conf_mae_mean": float(np.mean(conf_mae)) if conf_mae else 0.0,
             "stage_pixel_error_mean": {k: (float(np.mean(v)) if v else 0.0) for k, v in per_stage.items()},
+            "background_pixel_error_mean": {
+                k: (float(np.mean(v)) if v else 0.0) for k, v in per_background.items()
+            },
+            "port_vs_non_port_pixel_error_mean": {
+                k: (float(np.mean(v)) if v else 0.0) for k, v in port_vs_non_port.items()
+            },
+            "stage_background_pixel_error_mean": {
+                st: {bg: (float(np.mean(vals)) if vals else 0.0) for bg, vals in bg_map.items()}
+                for st, bg_map in per_stage_background.items()
+            },
+            "counts": {
+                "stage": {k: int(len(v)) for k, v in per_stage.items()},
+                "background": {k: int(len(v)) for k, v in per_background.items()},
+                "port_vs_non_port": {k: int(len(v)) for k, v in port_vs_non_port.items()},
+            },
         },
         "artifacts": {
             "report_path": str(out_dir / "report.json"),
             "sample_errors_path": str(out_dir / "sample_errors_head.json"),
+            "sample_errors_all_path": str(out_dir / "sample_errors_all.json"),
             "visual_dir": str(vis_dir),
+            "visual_audit_dir": str(audit_dir),
+            "visual_audit": visual_audit,
         },
     }
 
     (out_dir / "sample_errors_head.json").write_text(json.dumps(rows_for_report, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "sample_errors_all.json").write_text(json.dumps(all_rows, ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
