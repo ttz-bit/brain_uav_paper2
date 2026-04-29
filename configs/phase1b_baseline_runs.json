@@ -1,34 +1,22 @@
 {
   "runs": [
     {
-      "run_name": "run2_train",
-      "report_path": "outputs/train/public_vision/run2_lr1e3/report.json",
+      "run_name": "smoke_train",
+      "report_path": "outputs/train/smoke_public_vision/seadronessee_train/report.json",
       "expected_split": "train",
       "purpose": "fit_check"
     },
     {
-      "run_name": "run2_val_fit",
-      "report_path": "outputs/train/public_vision/run2_lr1e3_val/report.json",
-      "expected_split": "val",
-      "purpose": "fit_check"
-    },
-    {
-      "run_name": "run3_train_seed7",
-      "report_path": "outputs/train/public_vision/run3_train_seed7/report.json",
+      "run_name": "smoke_train_recheck",
+      "report_path": "outputs/train/smoke_public_vision/seadronessee_train_recheck/report.json",
       "expected_split": "train",
       "purpose": "fit_check"
     },
     {
-      "run_name": "run3_val_seed7_fit",
-      "report_path": "outputs/train/public_vision/run3_val_seed7/report.json",
+      "run_name": "smoke_val_recheck",
+      "report_path": "outputs/train/smoke_public_vision/seadronessee_val_recheck/report.json",
       "expected_split": "val",
       "purpose": "fit_check"
-    },
-    {
-      "run_name": "run3_val_seed7_eval",
-      "report_path": "outputs/eval/public_vision/run3_val_seed7_eval/report.json",
-      "expected_split": "val",
-      "purpose": "evaluation"
     }
   ]
 }

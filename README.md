@@ -21,6 +21,10 @@ Current focus:
   - unified schema validation enabled;
   - split leakage / QC / mismatch checks implemented;
   - training entry script for public vision available.
+- Phase 3A (SNN public vision): training/evaluation summary accepted on server.
+  - summary gate: `all_overall_ok=true`, `all_artifacts_ok=true`, `train_eval_separation_ok=true`;
+  - frozen record: `docs/phase3a_snn_freeze_note.md`;
+  - summary artifacts: `outputs/reports/phase3a_snn_summary.json` and `.csv`.
 
 Not finalized yet:
 
@@ -33,6 +37,9 @@ Not finalized yet:
 - `scripts/prepare_seadronessee.py`: convert raw SeaDronesSee to processed crops + manifests.
 - `scripts/check_phase1b_seadronessee.py`: phase 1B acceptance checks.
 - `scripts/train_public_vision.py`: baseline public vision training entry.
+- `scripts/train_public_vision_snn.py`: phase3a SNN training entry.
+- `scripts/eval_public_vision_snn.py`: phase3a SNN evaluation entry.
+- `scripts/summarize_phase3a_snn.py`: phase3a SNN summary + acceptance check.
 - `src/paper2/datasets/unified_schema.py`: manifest schema and hard validation.
 - `src/paper2/datasets/seadronessee_dataset.py`: dataset reader using crop-space labels.
 - `src/paper2/env_adapter/interfaces.py`: frozen environment protocol.

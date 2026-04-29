@@ -1,0 +1,110 @@
+dataset:
+  name: paper2_render_v1.0.0_pre
+  image_size: 256
+  heatmap_size: 64
+  frames_per_sequence: 40
+  world_size_m: 4000.0
+stage_ratios:
+  far: 0.15
+  mid: 0.4
+  terminal: 0.45
+splits:
+  train:
+    sequences: 336
+  val:
+    sequences: 72
+  test:
+    sequences: 72
+stages:
+  far:
+    gsd_m_per_px: 25.0
+    perception_dt: 1.0
+    observation_source: external_cue
+    center_jitter_px: 5.0
+    target_scale_range:
+    - 0.06
+    - 0.12
+  mid:
+    gsd_m_per_px: 25.0
+    perception_dt: 1.0
+    observation_source: onboard_midrange
+    center_jitter_px: 4.0
+    target_scale_range:
+    - 0.09
+    - 0.16
+  terminal:
+    gsd_m_per_px: 10.0
+    perception_dt: 0.5
+    observation_source: onboard_terminal
+    center_jitter_px: 3.0
+    target_scale_range:
+    - 0.14
+    - 0.24
+motion_modes:
+  cv: 0.35
+  turn: 0.25
+  piecewise: 0.25
+  evasive: 0.15
+distractors:
+  min_count: 0
+  max_count: 2
+  scale_range:
+  - 0.04
+  - 0.12
+visibility:
+  min_positive_visibility: 0.35
+  max_low_visibility_ratio: 0.1
+perturbations:
+  brightness_jitter: 0.2
+  contrast_jitter: 0.2
+  blur_prob: 0.25
+  haze_prob: 0.2
+  light_cloud_prob: 0.15
+  compression_prob: 0.15
+target:
+  scale_mode: stage_progressive
+  fixed_scale_range:
+  - 0.1
+  - 0.14
+  max_step_px: 4.0
+  allowed_categories:
+  - boat_top
+  heading_noise_deg: 4.0
+continuity:
+  max_position_shift_ratio: 0.15
+  max_scale_change_ratio: 0.05
+  max_angle_change_deg: 12.0
+  max_crop_shift_ratio: 0.15
+placement:
+  require_water_mask: true
+  max_land_overlap: 0.0
+  max_shore_buffer_overlap: 0.0
+  min_visibility: 0.35
+  max_truncation_ratio: 0.15
+  min_shore_clearance_px: 14
+  port_min_shore_clearance_px: 22
+seed:
+  global_seed: 20260429
+assets:
+  root: D:/Projects/brain_uav_paper2/data/assets/source_stage2
+  inventory_csv: data/assets/stage2/asset_inventory.csv
+background:
+  allowed_categories:
+  - open_sea
+  - coastal
+  - island_complex
+  - port
+  excluded_categories: []
+  require_all_categories_per_split: true
+  required_categories:
+  - open_sea
+  - coastal
+  - island_complex
+  - port
+  strict_required_categories: true
+trajectory:
+  force_target_on_water: true
+  water_snap_radius_px: 56
+  max_world_step_m: 50.0
+  port_water_snap_radius_px: 44
+  port_max_world_step_m: 30.0

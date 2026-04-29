@@ -7,6 +7,10 @@ __pycache__/
 .mypy_cache/
 .vscode/
 outputs/
+data/assets/
+data/rendered/
+*.tar.gz
+*.bak
 dist/
 build/
 *.egg-info/

@@ -1,4 +1,4 @@
-dataset:
+﻿dataset:
   name: stage2_smoke_v0
   image_size: 256
   heatmap_size: 64
@@ -81,5 +81,6 @@ seed:
   global_seed: 20260427
 
 assets:
-  root: D:/paper2_assets
+  root: D:/Projects/brain_uav_paper2/data/assets/source_stage2
   inventory_csv: data/assets/stage2/asset_inventory.csv
+
