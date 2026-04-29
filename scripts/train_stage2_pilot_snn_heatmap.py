@@ -1,0 +1,493 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import time
+
+import cv2
+import numpy as np
+
+from paper2.datasets.stage2_rendered_dataset import build_stage2_rendered_dataset
+from paper2.models.snn_heatmap import HeatmapSNN, heatmap_loss, peak_argmax_2d
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--dataset-root", type=str, default="data/rendered/stage2_pilot_v6")
+    p.add_argument("--project-root", type=str, default=str(Path(__file__).resolve().parents[1]))
+    p.add_argument("--train-split", type=str, default="train", choices=["train", "val", "test"])
+    p.add_argument("--val-split", type=str, default="val", choices=["train", "val", "test"])
+    p.add_argument("--max-train-samples", type=int, default=None)
+    p.add_argument("--max-val-samples", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--learning-rate", type=float, default=1e-3)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    p.add_argument("--num-steps", type=int, default=12)
+    p.add_argument("--beta", type=float, default=0.95)
+    p.add_argument("--input-size", type=int, default=256)
+    p.add_argument("--heatmap-size", type=int, default=64)
+    p.add_argument("--heatmap-sigma", type=float, default=1.5)
+    p.add_argument("--heatmap-weight", type=float, default=1.0)
+    p.add_argument("--coord-weight", type=float, default=5.0)
+    p.add_argument("--conf-weight", type=float, default=0.2)
+    p.add_argument("--softargmax-temperature", type=float, default=10.0)
+    p.add_argument("--train-encoding", type=str, default="rate", choices=["rate", "direct"])
+    p.add_argument("--eval-encoding", type=str, default="direct", choices=["rate", "direct"])
+    p.add_argument("--eval-interval", type=int, default=1)
+    p.add_argument("--eval-batch-size", type=int, default=128)
+    p.add_argument("--val-eval-max-samples", type=int, default=0)
+    p.add_argument("--num-threads", type=int, default=0)
+    p.add_argument("--num-interop-threads", type=int, default=0)
+    p.add_argument("--strict-no-leak", action="store_true")
+    p.add_argument(
+        "--out-dir",
+        type=str,
+        default=str(Path(__file__).resolve().parents[1] / "outputs" / "stage2_pre_baselines" / "snn_heatmap_fit_v1"),
+    )
+    return p.parse_args()
+
+
+def _import_torch():
+    try:
+        import torch
+        from torch.utils.data import DataLoader, Dataset
+    except Exception as e:
+        raise RuntimeError("PyTorch is required.") from e
+    return torch, DataLoader, Dataset
+
+
+def _to_tensor_image(img_bgr: np.ndarray, input_size: int) -> np.ndarray:
+    if int(input_size) > 0:
+        sz = int(input_size)
+        h, w = img_bgr.shape[:2]
+        if h != sz or w != sz:
+            img_bgr = cv2.resize(img_bgr, (sz, sz), interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    return np.transpose(rgb, (2, 0, 1))
+
+
+def _target_from_sample(sample) -> np.ndarray:
+    h, w = sample.image.shape[:2]
+    cx = float(sample.target_center[0]) / max(1.0, float(w))
+    cy = float(sample.target_center[1]) / max(1.0, float(h))
+    conf = 1.0 if bool(sample.valid) else 0.0
+    return np.array([cx, cy, conf], dtype=np.float32)
+
+
+def _pixel_error_norm(pred_xy: np.ndarray, gt_xy: np.ndarray, h: int, w: int) -> float:
+    px = float(np.clip(pred_xy[0], 0.0, 1.0) * w)
+    py = float(np.clip(pred_xy[1], 0.0, 1.0) * h)
+    gx = float(np.clip(gt_xy[0], 0.0, 1.0) * w)
+    gy = float(np.clip(gt_xy[1], 0.0, 1.0) * h)
+    return float(np.hypot(px - gx, py - gy))
+
+
+def _make_visual(img_bgr: np.ndarray, pred_xy: np.ndarray, gt: np.ndarray, tag: str, err: float) -> np.ndarray:
+    h_img, w_img = img_bgr.shape[:2]
+    pred_x = int(np.clip(pred_xy[0], 0.0, 1.0) * w_img)
+    pred_y = int(np.clip(pred_xy[1], 0.0, 1.0) * h_img)
+    gt_x = int(np.clip(gt[0], 0.0, 1.0) * w_img)
+    gt_y = int(np.clip(gt[1], 0.0, 1.0) * h_img)
+    vis = img_bgr.copy()
+    cv2.circle(vis, (gt_x, gt_y), 4, (0, 255, 0), -1)
+    cv2.circle(vis, (pred_x, pred_y), 4, (0, 0, 255), -1)
+    cv2.line(vis, (gt_x, gt_y), (pred_x, pred_y), (255, 255, 0), 1)
+    cv2.putText(
+        vis,
+        f"{tag} gt=({gt_x},{gt_y}) pred=({pred_x},{pred_y}) err={err:.1f}px",
+        (8, 18),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    return vis
+
+
+def _read_split_rows(dataset_root: Path, split: str) -> list[dict]:
+    rows: list[dict] = []
+    p = dataset_root / "labels" / f"{split}.jsonl"
+    if not p.exists():
+        return rows
+    with p.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def _split_asset_leakage(dataset_root: Path) -> dict[str, int]:
+    def _sets(rows: list[dict], key: str) -> set[str]:
+        out: set[str] = set()
+        for r in rows:
+            if key == "distractor_asset_ids":
+                for d in r.get(key, []):
+                    out.add(str(d))
+            else:
+                out.add(str(r.get(key, "")))
+        return out
+
+    tr = _read_split_rows(dataset_root, "train")
+    va = _read_split_rows(dataset_root, "val")
+    te = _read_split_rows(dataset_root, "test")
+    out: dict[str, int] = {}
+    for name, key in [("background", "background_asset_id"), ("target", "target_asset_id"), ("distractor", "distractor_asset_ids")]:
+        a, b, c = _sets(tr, key), _sets(va, key), _sets(te, key)
+        out[name] = len(a.intersection(b)) + len(a.intersection(c)) + len(b.intersection(c))
+    return out
+
+
+def main() -> None:
+    args = parse_args()
+    torch, DataLoader, Dataset = _import_torch()
+    if int(args.num_threads) > 0:
+        torch.set_num_threads(int(args.num_threads))
+    if int(args.num_interop_threads) > 0:
+        torch.set_num_interop_threads(int(args.num_interop_threads))
+    rng = np.random.default_rng(int(args.seed))
+    torch.manual_seed(int(args.seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(args.seed))
+
+    device = "cpu"
+    if args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but unavailable.")
+        device = "cuda"
+    elif args.device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    dataset_root = Path(args.dataset_root).resolve()
+    project_root = Path(args.project_root).resolve()
+    out_dir = Path(args.out_dir).resolve()
+    vis_dir = out_dir / "visuals"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    vis_dir.mkdir(parents=True, exist_ok=True)
+
+    leak = _split_asset_leakage(dataset_root)
+    has_leak = any(v > 0 for v in leak.values())
+    if args.strict_no_leak and has_leak:
+        raise RuntimeError(f"Asset leakage detected: {leak}")
+
+    train_ds = build_stage2_rendered_dataset(root=dataset_root, split=args.train_split, project_root=project_root, max_samples=args.max_train_samples)
+    val_ds = build_stage2_rendered_dataset(root=dataset_root, split=args.val_split, project_root=project_root, max_samples=args.max_val_samples)
+
+    t_materialize_begin = time.perf_counter()
+
+    def _materialize(ds):
+        xs = []
+        ys = []
+        for i in range(len(ds)):
+            s = ds[i]
+            xs.append(_to_tensor_image(s.image, input_size=int(args.input_size)))
+            ys.append(_target_from_sample(s))
+        return np.stack(xs, axis=0).astype(np.float32), np.stack(ys, axis=0).astype(np.float32)
+
+    x_train, y_train = _materialize(train_ds)
+    x_val, y_val = _materialize(val_ds)
+    materialize_sec = float(time.perf_counter() - t_materialize_begin)
+
+    class _NumpyDataset(Dataset):
+        def __init__(self, x: np.ndarray, y: np.ndarray):
+            self.x = x
+            self.y = y
+
+        def __len__(self) -> int:
+            return int(self.x.shape[0])
+
+        def __getitem__(self, idx: int):
+            return torch.from_numpy(self.x[idx]), torch.from_numpy(self.y[idx])
+
+    loader = DataLoader(_NumpyDataset(x_train, y_train), batch_size=max(1, int(args.batch_size)), shuffle=True, drop_last=False)
+    model = HeatmapSNN(
+        beta=float(args.beta),
+        num_steps=int(args.num_steps),
+        train_encoding=str(args.train_encoding),
+        eval_encoding=str(args.eval_encoding),
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=float(args.learning_rate), weight_decay=float(args.weight_decay))
+
+    def _loss(outputs, targets):
+        return heatmap_loss(
+            outputs,
+            targets,
+            heatmap_size=int(args.heatmap_size),
+            sigma=float(args.heatmap_sigma),
+            coord_weight=float(args.coord_weight),
+            heatmap_weight=float(args.heatmap_weight),
+            conf_weight=float(args.conf_weight),
+            softargmax_temperature=float(args.softargmax_temperature),
+        )
+
+    eval_batch_size = max(1, int(args.eval_batch_size))
+
+    def _eval_numpy(x_np: np.ndarray, y_np: np.ndarray) -> dict[str, float]:
+        model.eval()
+        total = 0.0
+        count = 0
+        px_errors: list[float] = []
+        center_errors: list[float] = []
+        pred_x_px: list[float] = []
+        pred_y_px: list[float] = []
+        with torch.no_grad():
+            for s in range(0, int(x_np.shape[0]), eval_batch_size):
+                e = min(s + eval_batch_size, int(x_np.shape[0]))
+                xb = torch.from_numpy(x_np[s:e]).to(device)
+                yb = torch.from_numpy(y_np[s:e]).to(device)
+                outputs = model(xb, stochastic=False)
+                loss, _ = _loss(outputs, yb)
+                n = int(e - s)
+                total += float(loss.item()) * n
+                count += n
+                pred_xy = peak_argmax_2d(outputs["heatmap_logits"]).detach().cpu().numpy()
+                gt_xy = y_np[s:e, :2]
+                for pxy, gxy in zip(pred_xy, gt_xy):
+                    err = _pixel_error_norm(pxy, gxy, int(args.input_size), int(args.input_size))
+                    center_err = _pixel_error_norm(np.array([0.5, 0.5], dtype=np.float32), gxy, int(args.input_size), int(args.input_size))
+                    px_errors.append(err)
+                    center_errors.append(center_err)
+                    pred_x_px.append(float(np.clip(pxy[0], 0.0, 1.0) * int(args.input_size)))
+                    pred_y_px.append(float(np.clip(pxy[1], 0.0, 1.0) * int(args.input_size)))
+        px_mean = float(np.mean(px_errors)) if px_errors else 0.0
+        center_mean = float(np.mean(center_errors)) if center_errors else 0.0
+        rounded_unique = {(int(round(x)), int(round(y))) for x, y in zip(pred_x_px, pred_y_px)}
+        return {
+            "loss": total / max(1, count),
+            "pixel_error_mean": px_mean,
+            "pixel_error_p90": float(np.percentile(px_errors, 90)) if px_errors else 0.0,
+            "center_baseline_pixel_error_mean": center_mean,
+            "center_baseline_improve_ratio": float((center_mean - px_mean) / max(center_mean, 1e-12)) if center_errors else 0.0,
+            "pred_x_std_px": float(np.std(pred_x_px)) if pred_x_px else 0.0,
+            "pred_y_std_px": float(np.std(pred_y_px)) if pred_y_px else 0.0,
+            "rounded_unique_pred_xy": int(len(rounded_unique)),
+        }
+
+    with torch.no_grad():
+        train_initial = _eval_numpy(x_train, y_train)
+        val_initial = _eval_numpy(x_val, y_val)
+
+    val_eval_x, val_eval_y = x_val, y_val
+    val_eval_count = int(x_val.shape[0])
+    if int(args.val_eval_max_samples) > 0 and int(x_val.shape[0]) > int(args.val_eval_max_samples):
+        idx = rng.choice(int(x_val.shape[0]), size=int(args.val_eval_max_samples), replace=False)
+        val_eval_x = x_val[idx]
+        val_eval_y = y_val[idx]
+        val_eval_count = int(args.val_eval_max_samples)
+
+    best_val = float("inf")
+    best_path = out_dir / "model_best.pth"
+    loss_trace: list[dict] = []
+    epochs = max(1, int(args.epochs))
+    eval_interval = max(1, int(args.eval_interval))
+    epoch_time_sec: list[float] = []
+    train_loop_sec_total = 0.0
+    val_eval_sec_total = 0.0
+    for ep in range(epochs):
+        t_epoch_begin = time.perf_counter()
+        model.train()
+        batch_losses: list[float] = []
+        batch_parts: list[dict[str, float]] = []
+        t_train_loop_begin = time.perf_counter()
+        for xb, yb in loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            outputs = model(xb, stochastic=True)
+            loss, parts = _loss(outputs, yb)
+            loss.backward()
+            optimizer.step()
+            batch_losses.append(float(loss.detach().item()))
+            batch_parts.append(parts)
+        train_loop_sec_total += float(time.perf_counter() - t_train_loop_begin)
+
+        do_eval = ((ep + 1) % eval_interval == 0) or (ep + 1 == epochs)
+        train_loss = float(np.mean(batch_losses)) if batch_losses else 0.0
+        val_loss = float("nan")
+        if do_eval:
+            t_eval_begin = time.perf_counter()
+            val_metrics = _eval_numpy(val_eval_x, val_eval_y)
+            val_loss = float(val_metrics["loss"])
+            val_eval_sec_total += float(time.perf_counter() - t_eval_begin)
+        else:
+            val_metrics = {}
+        loss_trace.append(
+            {
+                "epoch": int(ep + 1),
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "train_parts_mean": {
+                    k: float(np.mean([p[k] for p in batch_parts])) if batch_parts else 0.0
+                    for k in ("heatmap_loss", "coord_loss", "conf_loss")
+                },
+                "val_metrics": val_metrics,
+            }
+        )
+        if do_eval and val_loss < best_val:
+            best_val = val_loss
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "model_type": "snn_heatmap",
+                    "seed": int(args.seed),
+                    "dataset_root": str(dataset_root),
+                    "train_split": str(args.train_split),
+                    "val_split": str(args.val_split),
+                    "num_train": int(len(train_ds)),
+                    "num_val": int(len(val_ds)),
+                    "input_size": int(args.input_size),
+                    "heatmap_size": int(args.heatmap_size),
+                    "heatmap_sigma": float(args.heatmap_sigma),
+                    "num_steps": int(args.num_steps),
+                    "beta": float(args.beta),
+                    "train_encoding": str(args.train_encoding),
+                    "eval_encoding": str(args.eval_encoding),
+                    "decode_method": "heatmap_argmax",
+                },
+                best_path,
+            )
+        epoch_sec = float(time.perf_counter() - t_epoch_begin)
+        epoch_time_sec.append(epoch_sec)
+        val_msg = f"{val_loss:.6f}" if do_eval else "skip"
+        print(f"[SNN-HEATMAP-FIT] epoch={ep+1:03d}/{epochs} train_loss={train_loss:.6f} val_loss={val_msg}")
+
+    last_path = out_dir / "model_last.pth"
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "model_type": "snn_heatmap",
+            "seed": int(args.seed),
+            "dataset_root": str(dataset_root),
+            "train_split": str(args.train_split),
+            "val_split": str(args.val_split),
+            "num_train": int(len(train_ds)),
+            "num_val": int(len(val_ds)),
+            "input_size": int(args.input_size),
+            "heatmap_size": int(args.heatmap_size),
+            "heatmap_sigma": float(args.heatmap_sigma),
+            "num_steps": int(args.num_steps),
+            "beta": float(args.beta),
+            "train_encoding": str(args.train_encoding),
+            "eval_encoding": str(args.eval_encoding),
+            "decode_method": "heatmap_argmax",
+        },
+        last_path,
+    )
+
+    ckpt = torch.load(best_path, map_location=device)
+    model.load_state_dict(ckpt["state_dict"])
+    train_final = _eval_numpy(x_train, y_train)
+    val_final = _eval_numpy(x_val, y_val)
+    train_improve_ratio = (float(train_initial["loss"]) - float(train_final["loss"])) / max(float(train_initial["loss"]), 1e-12)
+    val_improve_ratio = (float(val_initial["loss"]) - float(val_final["loss"])) / max(float(val_initial["loss"]), 1e-12)
+
+    for tag, ds, n_vis in [("train", train_ds, 8), ("val", val_ds, 8)]:
+        idxs = rng.choice(len(ds), size=min(n_vis, len(ds)), replace=False)
+        with torch.no_grad():
+            model.eval()
+            for rank, idx in enumerate(idxs):
+                s = ds[int(idx)]
+                x = torch.from_numpy(_to_tensor_image(s.image, input_size=int(args.input_size))).unsqueeze(0).to(device)
+                outputs = model(x, stochastic=False)
+                pred_xy = peak_argmax_2d(outputs["heatmap_logits"])[0].detach().cpu().numpy()
+                gt = _target_from_sample(s)
+                err = _pixel_error_norm(pred_xy, gt[:2], s.image.shape[0], s.image.shape[1])
+                vis = _make_visual(s.image, pred_xy, gt, tag=tag, err=err)
+                cv2.imwrite(str(vis_dir / f"{tag}_sample_{rank:02d}.jpg"), vis)
+
+    report = {
+        "task": "train_stage2_pilot_snn_heatmap",
+        "purpose": "fit_check",
+        "dataset": {
+            "name": "stage2_rendered",
+            "root": str(dataset_root),
+            "train_split": str(args.train_split),
+            "val_split": str(args.val_split),
+            "num_train": int(len(train_ds)),
+            "num_val": int(len(val_ds)),
+        },
+        "device": str(device),
+        "model": {
+            "type": "snn_heatmap",
+            "output": "64x64 heatmap + confidence by default",
+            "decode_method": "heatmap_argmax",
+        },
+        "hyperparams": {
+            "batch_size": int(args.batch_size),
+            "epochs": int(epochs),
+            "learning_rate": float(args.learning_rate),
+            "weight_decay": float(args.weight_decay),
+            "seed": int(args.seed),
+            "num_steps": int(args.num_steps),
+            "beta": float(args.beta),
+            "train_encoding": str(args.train_encoding),
+            "eval_encoding": str(args.eval_encoding),
+            "input_size": int(args.input_size),
+            "heatmap_size": int(args.heatmap_size),
+            "heatmap_sigma": float(args.heatmap_sigma),
+            "heatmap_weight": float(args.heatmap_weight),
+            "coord_weight": float(args.coord_weight),
+            "conf_weight": float(args.conf_weight),
+            "softargmax_temperature": float(args.softargmax_temperature),
+            "eval_interval": int(eval_interval),
+            "eval_batch_size": int(eval_batch_size),
+            "val_eval_max_samples": int(val_eval_count),
+            "num_threads": int(torch.get_num_threads()),
+            "num_interop_threads": int(torch.get_num_interop_threads()),
+        },
+        "timing": {
+            "materialize_sec": float(materialize_sec),
+            "train_loop_sec_total": float(train_loop_sec_total),
+            "val_eval_sec_total": float(val_eval_sec_total),
+            "epoch_sec_mean": float(np.mean(epoch_time_sec)) if epoch_time_sec else 0.0,
+            "epoch_sec_p90": float(np.percentile(epoch_time_sec, 90)) if epoch_time_sec else 0.0,
+            "total_epochs": int(epochs),
+            "cpu_count_os": int(os.cpu_count() or 0),
+        },
+        "leakage_check": {
+            "split_asset_leakage": leak,
+            "has_leakage": bool(has_leak),
+            "strict_no_leak": bool(args.strict_no_leak),
+        },
+        "metrics": {
+            "train_initial_loss": float(train_initial["loss"]),
+            "train_final_loss": float(train_final["loss"]),
+            "train_improve_ratio": float(train_improve_ratio),
+            "val_initial_loss": float(val_initial["loss"]),
+            "val_final_loss": float(val_final["loss"]),
+            "val_improve_ratio": float(val_improve_ratio),
+            "train_final_pixel_error_mean": float(train_final["pixel_error_mean"]),
+            "val_final_pixel_error_mean": float(val_final["pixel_error_mean"]),
+            "train_center_baseline_improve_ratio": float(train_final["center_baseline_improve_ratio"]),
+            "val_center_baseline_improve_ratio": float(val_final["center_baseline_improve_ratio"]),
+            "val_rounded_unique_pred_xy": int(val_final["rounded_unique_pred_xy"]),
+        },
+        "success_criteria": {
+            "train_final_lt_initial": bool(train_final["loss"] < train_initial["loss"]),
+            "train_improve_ratio_gt_0": bool(train_improve_ratio > 0.0),
+            "val_final_lt_initial": bool(val_final["loss"] < val_initial["loss"]),
+            "val_improve_ratio_gt_0": bool(val_improve_ratio > 0.0),
+            "val_beats_center_baseline": bool(val_final["center_baseline_improve_ratio"] > 0.0),
+            "val_prediction_not_constant": bool(val_final["rounded_unique_pred_xy"] > 5),
+        },
+        "artifacts": {
+            "report_path": str(out_dir / "report.json"),
+            "loss_trace_path": str(out_dir / "loss_trace.json"),
+            "best_weights_path": str(best_path),
+            "last_weights_path": str(last_path),
+            "visual_dir": str(vis_dir),
+        },
+    }
+    (out_dir / "loss_trace.json").write_text(json.dumps(loss_trace, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
