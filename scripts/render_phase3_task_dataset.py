@@ -9,6 +9,7 @@ import numpy as np
 
 from paper2.common.config import load_yaml
 from paper2.render.phase3_task_sampler import Phase3TaskFrame, sample_phase3_task_sequence
+from paper2.render.compositor import alpha_blend_center, read_bgra, rotate_bgra
 
 
 STAGE_SCALE_PX = {
@@ -16,6 +17,8 @@ STAGE_SCALE_PX = {
     "mid": 18.0,
     "terminal": 32.0,
 }
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 
 
 def _split_for_sequence(seq_idx: int, total: int) -> str:
@@ -43,6 +46,193 @@ def _make_ocean_background(image_size: int, rng: np.random.Generator) -> np.ndar
     wave = 8.0 * np.sin(np.linspace(0.0, 10.0, image_size, dtype=np.float32))[None, :, None]
     img = np.clip(base + noise + wave, 0.0, 255.0).astype(np.uint8)
     return cv2.GaussianBlur(img, (3, 3), 0.0)
+
+
+def _iter_images(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+
+
+def _infer_split(path: Path) -> str | None:
+    parts = {p.lower() for p in path.parts}
+    for split in ("train", "val", "test"):
+        if split in parts:
+            return split
+    return None
+
+
+def _collect_backgrounds(assets_root: Path, water_mask_root: Path, skip_review: bool) -> dict[str, list[dict]]:
+    backgrounds_root = assets_root / "backgrounds"
+    review_paths = _load_review_backgrounds(water_mask_root) if skip_review else set()
+    out: dict[str, list[dict]] = {"train": [], "val": [], "test": []}
+    for image_path in _iter_images(backgrounds_root):
+        split = _infer_split(image_path)
+        if split is None:
+            continue
+        if str(image_path.resolve()) in review_paths:
+            continue
+        try:
+            rel = image_path.resolve().relative_to(backgrounds_root.resolve())
+        except ValueError:
+            continue
+        mask_path = water_mask_root / "deep_water_masks" / rel.parent / f"{image_path.stem}_deep_water_mask.png"
+        if not mask_path.exists():
+            mask_path = water_mask_root / "masks" / rel.parent / f"{image_path.stem}_water_mask.png"
+        if not mask_path.exists():
+            continue
+        out[split].append({"image_path": image_path, "mask_path": mask_path})
+    return out
+
+
+def _load_review_backgrounds(water_mask_root: Path) -> set[str]:
+    report_path = water_mask_root / "reports" / "water_mask_report.json"
+    if not report_path.exists():
+        return set()
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return set()
+    out = set()
+    for row in report.get("rows", []):
+        if bool(row.get("review", False)):
+            out.add(str(Path(row["image_path"]).resolve()))
+    return out
+
+
+def _collect_targets(assets_root: Path) -> dict[str, list[Path]]:
+    roots = [
+        assets_root / "target_templates" / "alpha_png",
+        assets_root / "target_templates",
+    ]
+    out: dict[str, list[Path]] = {"train": [], "val": [], "test": []}
+    seen: set[Path] = set()
+    for root in roots:
+        for path in _iter_images(root):
+            if path.suffix.lower() != ".png":
+                continue
+            split = _infer_split(path)
+            if split is None:
+                continue
+            rp = path.resolve()
+            if rp in seen:
+                continue
+            seen.add(rp)
+            out[split].append(path)
+    return out
+
+
+def _extract_patch_inside(background_bgr: np.ndarray, x1: int, y1: int, image_size: int) -> np.ndarray:
+    return background_bgr[y1 : y1 + image_size, x1 : x1 + image_size].copy()
+
+
+def _resize_bgra_to_long_side(img_bgra: np.ndarray, long_side_px: float, image_size: int) -> np.ndarray:
+    h, w = img_bgra.shape[:2]
+    target_long = max(2, min(int(round(float(long_side_px))), int(image_size * 0.85)))
+    ratio = target_long / max(1.0, float(max(h, w)))
+    new_w = max(1, int(round(w * ratio)))
+    new_h = max(1, int(round(h * ratio)))
+    return cv2.resize(img_bgra, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+
+def _alpha_water_ratio(mask_u8: np.ndarray, overlay_bgra: np.ndarray, center_x: float, center_y: float) -> float:
+    h, w = mask_u8.shape[:2]
+    oh, ow = overlay_bgra.shape[:2]
+    x1 = int(round(center_x - ow / 2))
+    y1 = int(round(center_y - oh / 2))
+    x2 = x1 + ow
+    y2 = y1 + oh
+    ix1 = max(0, x1)
+    iy1 = max(0, y1)
+    ix2 = min(w, x2)
+    iy2 = min(h, y2)
+    if ix1 >= ix2 or iy1 >= iy2:
+        return 0.0
+    ox1 = ix1 - x1
+    oy1 = iy1 - y1
+    ox2 = ox1 + (ix2 - ix1)
+    oy2 = oy1 + (iy2 - iy1)
+    alpha = overlay_bgra[oy1:oy2, ox1:ox2, 3] > 10
+    denom = int(alpha.sum())
+    if denom <= 0:
+        return 0.0
+    water = mask_u8[iy1:iy2, ix1:ix2] > 0
+    return float((alpha & water).sum() / float(denom))
+
+
+def _render_real_asset_frame(
+    frame: Phase3TaskFrame,
+    *,
+    split: str,
+    backgrounds_by_split: dict[str, list[dict]],
+    targets_by_split: dict[str, list[Path]],
+    image_size: int,
+    rng: np.random.Generator,
+    min_target_water_ratio: float,
+) -> tuple[np.ndarray, list[float], float, dict]:
+    bg_pool = backgrounds_by_split.get(split, [])
+    target_pool = targets_by_split.get(split, [])
+    if not bg_pool:
+        raise RuntimeError(f"No usable real backgrounds for split={split}.")
+    if not target_pool:
+        raise RuntimeError(f"No target templates for split={split}.")
+
+    cx = float(frame.center_px[0])
+    cy = float(frame.center_px[1])
+    margin = int(max(4, round(STAGE_SCALE_PX.get(frame.stage, 18.0))))
+    for _ in range(80):
+        bg_rec = bg_pool[int(rng.integers(0, len(bg_pool)))]
+        bg_path = Path(bg_rec["image_path"])
+        mask_path = Path(bg_rec["mask_path"])
+        bg = cv2.imread(str(bg_path), cv2.IMREAD_COLOR)
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if bg is None or mask is None:
+            continue
+        h, w = bg.shape[:2]
+        if h < image_size or w < image_size:
+            continue
+        if mask.shape[:2] != bg.shape[:2]:
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        target_path = target_pool[int(rng.integers(0, len(target_pool)))]
+        target = read_bgra(target_path)
+        target = _resize_bgra_to_long_side(target, STAGE_SCALE_PX.get(frame.stage, 18.0), image_size)
+        angle_deg = -float(np.degrees(frame.target_state_world["heading"]))
+        target = rotate_bgra(target, angle_deg)
+
+        valid = mask > 0
+        yy, xx = np.where(valid)
+        if len(xx) <= 0:
+            continue
+        for _inner in range(16):
+            idx = int(rng.integers(0, len(xx)))
+            target_bg_x = float(xx[idx])
+            target_bg_y = float(yy[idx])
+            x1 = int(round(target_bg_x - cx))
+            y1 = int(round(target_bg_y - cy))
+            if x1 < 0 or y1 < 0 or x1 + image_size > w or y1 + image_size > h:
+                continue
+            patch_mask = mask[y1 : y1 + image_size, x1 : x1 + image_size]
+            if patch_mask[int(round(cy)), int(round(cx))] <= 0:
+                continue
+            if cx < margin or cy < margin or cx >= image_size - margin or cy >= image_size - margin:
+                continue
+            ratio = _alpha_water_ratio(patch_mask, target, cx, cy)
+            if ratio < min_target_water_ratio:
+                continue
+            canvas = _extract_patch_inside(bg, x1, y1, image_size)
+            bbox_tuple, visibility = alpha_blend_center(canvas, target, cx, cy)
+            bbox = [float(v) for v in bbox_tuple]
+            asset_meta = {
+                "asset_mode": "real",
+                "background_path": str(bg_path),
+                "water_mask_path": str(mask_path),
+                "target_asset_path": str(target_path),
+                "target_water_ratio": float(ratio),
+            }
+            return canvas, bbox, float(visibility), asset_meta
+
+    raise RuntimeError(f"Could not place target on water for split={split}, stage={frame.stage}.")
 
 
 def _draw_target(canvas: np.ndarray, frame: Phase3TaskFrame, rng: np.random.Generator) -> tuple[list[float], float]:
@@ -80,7 +270,17 @@ def _draw_target(canvas: np.ndarray, frame: Phase3TaskFrame, rng: np.random.Gene
     return bbox, visibility
 
 
-def _label_row(frame: Phase3TaskFrame, image_path: Path, project_root: Path, split: str, seq_idx: int, bbox: list[float], visibility: float) -> dict:
+def _label_row(
+    frame: Phase3TaskFrame,
+    image_path: Path,
+    project_root: Path,
+    dataset_name: str,
+    split: str,
+    seq_idx: int,
+    bbox: list[float],
+    visibility: float,
+    asset_meta: dict | None = None,
+) -> dict:
     try:
         rel_image = image_path.relative_to(project_root).as_posix()
     except ValueError:
@@ -98,8 +298,8 @@ def _label_row(frame: Phase3TaskFrame, image_path: Path, project_root: Path, spl
         "target_center_px": [float(frame.center_px[0]), float(frame.center_px[1])],
         "bbox_xywh": bbox,
         "visibility": float(visibility),
-        "background_asset_id": f"phase3_ocean_{split}_{seq_idx:06d}",
-        "target_asset_id": f"phase3_target_{split}",
+        "background_asset_id": Path(str((asset_meta or {}).get("background_path", f"phase3_ocean_{split}_{seq_idx:06d}"))).stem,
+        "target_asset_id": Path(str((asset_meta or {}).get("target_asset_path", f"phase3_target_{split}"))).stem,
         "distractor_asset_ids": [],
         "motion_mode": frame.motion_mode,
         "land_overlap_ratio": 0.0,
@@ -108,7 +308,7 @@ def _label_row(frame: Phase3TaskFrame, image_path: Path, project_root: Path, spl
         "angle_deg": float(np.degrees(target["heading"])),
         "obs_valid": bool(visibility > 0.0),
         "meta": {
-            "dataset_name": "paper2_task_v1.0.0_smoke",
+            "dataset_name": str(dataset_name),
             "unit": "km",
             "range_xy_km": float(frame.range_xy_km),
             "range_3d_km": float(frame.range_3d_km),
@@ -141,6 +341,11 @@ def _label_row(frame: Phase3TaskFrame, image_path: Path, project_root: Path, spl
             "shore_buffer_overlap_ratio": 0.0,
             "scale_px": float(STAGE_SCALE_PX.get(frame.stage, 18.0)),
             "obs_valid": bool(visibility > 0.0),
+            "asset_mode": str((asset_meta or {}).get("asset_mode", "procedural")),
+            "background_path": (asset_meta or {}).get("background_path"),
+            "water_mask_path": (asset_meta or {}).get("water_mask_path"),
+            "target_asset_path": (asset_meta or {}).get("target_asset_path"),
+            "target_water_ratio": float((asset_meta or {}).get("target_water_ratio", 1.0)),
         },
     }
     return row
@@ -153,6 +358,11 @@ def main() -> None:
     parser.add_argument("--sequences", type=int, default=8)
     parser.add_argument("--frames", type=int, default=40)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--asset-mode", choices=["procedural", "real"], default="procedural")
+    parser.add_argument("--assets-root", type=str, default="data/assets/source_stage2_v2")
+    parser.add_argument("--water-mask-root", type=str, default=None)
+    parser.add_argument("--include-review-backgrounds", action="store_true")
+    parser.add_argument("--min-target-water-ratio", type=float, default=0.98)
     args = parser.parse_args()
 
     project_root = Path.cwd().resolve()
@@ -161,6 +371,28 @@ def main() -> None:
     stage_cfg = cfg["phase3_task_stages"]
     image_size = int(stage_cfg.get("image_size", 256))
     base_seed = int(args.seed if args.seed is not None else target_cfg["seed"])
+    assets_root = Path(args.assets_root).resolve()
+    water_mask_root = (
+        Path(args.water_mask_root).resolve()
+        if args.water_mask_root is not None
+        else (assets_root / "water_masks_auto").resolve()
+    )
+    backgrounds_by_split: dict[str, list[dict]] = {"train": [], "val": [], "test": []}
+    targets_by_split: dict[str, list[Path]] = {"train": [], "val": [], "test": []}
+    if args.asset_mode == "real":
+        backgrounds_by_split = _collect_backgrounds(
+            assets_root,
+            water_mask_root,
+            skip_review=not bool(args.include_review_backgrounds),
+        )
+        targets_by_split = _collect_targets(assets_root)
+        missing_bg = [s for s in ("train", "val", "test") if not backgrounds_by_split.get(s)]
+        missing_target = [s for s in ("train", "val", "test") if not targets_by_split.get(s)]
+        if missing_bg or missing_target:
+            raise RuntimeError(
+                f"Missing real assets. missing_background_splits={missing_bg}, missing_target_splits={missing_target}, "
+                f"assets_root={assets_root}, water_mask_root={water_mask_root}"
+            )
 
     out_root = Path(args.out_root)
     images_dir = out_root / "images"
@@ -188,13 +420,36 @@ def main() -> None:
                 )
                 for frame in rows:
                     rng = np.random.default_rng(base_seed + seq_idx * 100000 + int(frame.frame_id))
-                    canvas = _make_ocean_background(image_size, rng)
-                    bbox, visibility = _draw_target(canvas, frame, rng)
+                    asset_meta: dict | None = None
+                    if args.asset_mode == "real":
+                        canvas, bbox, visibility, asset_meta = _render_real_asset_frame(
+                            frame,
+                            split=split,
+                            backgrounds_by_split=backgrounds_by_split,
+                            targets_by_split=targets_by_split,
+                            image_size=image_size,
+                            rng=rng,
+                            min_target_water_ratio=float(args.min_target_water_ratio),
+                        )
+                    else:
+                        canvas = _make_ocean_background(image_size, rng)
+                        bbox, visibility = _draw_target(canvas, frame, rng)
+                        asset_meta = {"asset_mode": "procedural"}
                     image_path = images_dir / split / frame.sequence_id / f"{int(frame.frame_id):04d}.png"
                     image_path.parent.mkdir(parents=True, exist_ok=True)
                     cv2.imwrite(str(image_path), canvas)
 
-                    label = _label_row(frame, image_path.resolve(), project_root, split, seq_idx, bbox, visibility)
+                    label = _label_row(
+                        frame,
+                        image_path.resolve(),
+                        project_root,
+                        out_root.name,
+                        split,
+                        seq_idx,
+                        bbox,
+                        visibility,
+                        asset_meta,
+                    )
                     line = json.dumps(label, ensure_ascii=False)
                     label_files[split].write(line + "\n")
                     manifest_f.write(line + "\n")
@@ -214,6 +469,11 @@ def main() -> None:
         "frames_per_sequence": int(args.frames),
         "image_size": image_size,
         "unit": "km",
+        "asset_mode": str(args.asset_mode),
+        "assets_root": str(assets_root) if args.asset_mode == "real" else None,
+        "water_mask_root": str(water_mask_root) if args.asset_mode == "real" else None,
+        "background_counts": {k: len(v) for k, v in backgrounds_by_split.items()} if args.asset_mode == "real" else None,
+        "target_counts": {k: len(v) for k, v in targets_by_split.items()} if args.asset_mode == "real" else None,
         "stage_counts": stage_counts,
         "split_counts": split_counts,
         "total_frames": total_rows,
