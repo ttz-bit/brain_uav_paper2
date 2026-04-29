@@ -9,12 +9,20 @@ class AircraftState:
     pos_world: np.ndarray
     vel_world: np.ndarray
     heading: float
+    speed: Optional[float] = None
+    gamma: Optional[float] = None
+    psi: Optional[float] = None
+    control_limits: Optional[Dict[str, float]] = None
+    meta: Optional[Dict[str, Any]] = None
 
 
 @dataclass
 class NoFlyZoneState:
     center_world: np.ndarray
     radius_world: float
+    geometry: str = "circle"
+    safety_margin: float = 0.0
+    meta: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -47,3 +55,12 @@ class TargetEstimateState:
     cov: np.ndarray
     obs_conf: float
     obs_age: float
+    meta: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class ControllerCommand:
+    t: float
+    action: np.ndarray
+    command_type: str
+    meta: Optional[Dict[str, Any]] = None
