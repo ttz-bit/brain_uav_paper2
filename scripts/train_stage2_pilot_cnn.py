@@ -51,10 +51,10 @@ def _import_torch():
         import torch
         import torch.nn as nn
         import torch.nn.functional as F
-        from torch.utils.data import DataLoader, Dataset
+        from torch.utils.data import DataLoader, Dataset, Subset
     except Exception as e:
         raise RuntimeError("PyTorch is required. Install torch in your environment.") from e
-    return torch, nn, F, DataLoader, Dataset
+    return torch, nn, F, DataLoader, Dataset, Subset
 
 
 def _to_tensor_image(img_bgr: np.ndarray) -> np.ndarray:
@@ -137,7 +137,7 @@ def _split_asset_leakage(dataset_root: Path) -> dict[str, int]:
 
 def main() -> None:
     args = parse_args()
-    torch, nn, F, DataLoader, Dataset = _import_torch()
+    torch, nn, F, DataLoader, Dataset, Subset = _import_torch()
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -170,35 +170,22 @@ def main() -> None:
         root=dataset_root, split=args.val_split, project_root=project_root, max_samples=args.max_val_samples
     )
 
-    train_images, train_targets = [], []
-    for i in range(len(train_ds)):
-        s = train_ds[i]
-        train_images.append(_to_tensor_image(s.image))
-        train_targets.append(_target_from_sample(s))
-    x_train = np.stack(train_images, axis=0).astype(np.float32)
-    y_train = np.stack(train_targets, axis=0).astype(np.float32)
-
-    val_images, val_targets = [], []
-    for i in range(len(val_ds)):
-        s = val_ds[i]
-        val_images.append(_to_tensor_image(s.image))
-        val_targets.append(_target_from_sample(s))
-    x_val = np.stack(val_images, axis=0).astype(np.float32)
-    y_val = np.stack(val_targets, axis=0).astype(np.float32)
-
-    class _NumpyDataset(Dataset):
-        def __init__(self, x: np.ndarray, y: np.ndarray):
-            self.x = x
-            self.y = y
+    class _TorchStage2Dataset(Dataset):
+        def __init__(self, base_ds):
+            self.base_ds = base_ds
 
         def __len__(self) -> int:
-            return int(self.x.shape[0])
+            return int(len(self.base_ds))
 
         def __getitem__(self, idx: int):
-            return torch.from_numpy(self.x[idx]), torch.from_numpy(self.y[idx])
+            s = self.base_ds[int(idx)]
+            return torch.from_numpy(_to_tensor_image(s.image)), torch.from_numpy(_target_from_sample(s))
+
+    train_torch_ds = _TorchStage2Dataset(train_ds)
+    val_torch_ds = _TorchStage2Dataset(val_ds)
 
     loader = DataLoader(
-        _NumpyDataset(x_train, y_train),
+        train_torch_ds,
         batch_size=max(1, int(args.batch_size)),
         shuffle=True,
         drop_last=False,
@@ -243,33 +230,31 @@ def main() -> None:
 
     eval_batch_size = max(1, int(args.eval_batch_size))
 
-    def _eval_loss_numpy(x_np: np.ndarray, y_np: np.ndarray) -> float:
+    def _eval_loss_dataset(eval_ds) -> float:
         model.eval()
         total = 0.0
         count = 0
+        eval_loader = DataLoader(eval_ds, batch_size=eval_batch_size, shuffle=False, drop_last=False)
         with torch.no_grad():
-            for s in range(0, int(x_np.shape[0]), eval_batch_size):
-                e = min(s + eval_batch_size, int(x_np.shape[0]))
-                xb = torch.from_numpy(x_np[s:e]).to(device)
-                yb = torch.from_numpy(y_np[s:e]).to(device)
+            for xb, yb in eval_loader:
+                n = int(xb.shape[0])
+                xb = xb.to(device)
+                yb = yb.to(device)
                 pred = model(xb)
                 v = float(_loss(pred, yb).item())
-                n = int(e - s)
                 total += v * n
                 count += n
         return total / max(1, count)
 
     with torch.no_grad():
-        train_initial_loss = float(_eval_loss_numpy(x_train, y_train))
-        val_initial_loss = float(_eval_loss_numpy(x_val, y_val))
+        train_initial_loss = float(_eval_loss_dataset(train_torch_ds))
+        val_initial_loss = float(_eval_loss_dataset(val_torch_ds))
 
-    val_eval_x = x_val
-    val_eval_y = y_val
-    val_eval_count = int(x_val.shape[0])
-    if int(args.val_eval_max_samples) > 0 and int(x_val.shape[0]) > int(args.val_eval_max_samples):
-        idx = rng.choice(int(x_val.shape[0]), size=int(args.val_eval_max_samples), replace=False)
-        val_eval_x = x_val[idx]
-        val_eval_y = y_val[idx]
+    val_eval_ds = val_torch_ds
+    val_eval_count = int(len(val_torch_ds))
+    if int(args.val_eval_max_samples) > 0 and int(len(val_torch_ds)) > int(args.val_eval_max_samples):
+        idx = rng.choice(int(len(val_torch_ds)), size=int(args.val_eval_max_samples), replace=False)
+        val_eval_ds = Subset(val_torch_ds, [int(i) for i in idx.tolist()])
         val_eval_count = int(args.val_eval_max_samples)
 
     best_val = float("inf")
@@ -294,7 +279,7 @@ def main() -> None:
         train_loss = float(np.mean(batch_losses)) if batch_losses else 0.0
         val_loss = float("nan")
         if do_eval:
-            val_loss = float(_eval_loss_numpy(val_eval_x, val_eval_y))
+            val_loss = float(_eval_loss_dataset(val_eval_ds))
         loss_trace.append({"epoch": ep + 1, "train_loss": train_loss, "val_loss": val_loss})
         if do_eval and val_loss < best_val:
             best_val = val_loss
@@ -345,8 +330,8 @@ def main() -> None:
     ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt["state_dict"])
     with torch.no_grad():
-        train_final_loss = float(_eval_loss_numpy(x_train, y_train))
-        val_final_loss = float(_eval_loss_numpy(x_val, y_val))
+        train_final_loss = float(_eval_loss_dataset(train_torch_ds))
+        val_final_loss = float(_eval_loss_dataset(val_torch_ds))
 
     train_improve_ratio = (train_initial_loss - train_final_loss) / max(train_initial_loss, 1e-12)
     val_improve_ratio = (val_initial_loss - val_final_loss) / max(val_initial_loss, 1e-12)
