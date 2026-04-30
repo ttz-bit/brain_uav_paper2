@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 from collections import deque
 from pathlib import Path
@@ -21,6 +22,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--replay-size", type=int, default=200000)
     p.add_argument("--warmup-steps", type=int, default=2000)
+    p.add_argument("--warmup-strategy", choices=["random", "expert"], default="random")
+    p.add_argument("--bc-steps", type=int, default=0)
+    p.add_argument("--bc-updates", type=int, default=0)
+    p.add_argument("--bc-batch-size", type=int, default=128)
+    p.add_argument("--bc-learning-rate", type=float, default=1e-3)
     p.add_argument("--actor-lr", type=float, default=1e-3)
     p.add_argument("--critic-lr", type=float, default=1e-3)
     p.add_argument("--gamma", type=float, default=0.99)
@@ -113,6 +119,20 @@ def main() -> None:
     actor_opt = torch.optim.Adam(actor.parameters(), lr=float(args.actor_lr))
     critic_opt = torch.optim.Adam(list(critic1.parameters()) + list(critic2.parameters()), lr=float(args.critic_lr))
     replay = ReplayBuffer(int(args.replay_size))
+    bc_trace: list[dict[str, Any]] = []
+
+    if int(args.bc_steps) > 0:
+        bc_trace = _behavior_clone_actor(
+            torch=torch,
+            actor=actor,
+            actor_target=actor_target,
+            env=env,
+            replay=replay,
+            args=args,
+            device=device,
+            action_low=action_low,
+            action_high=action_high,
+        )
 
     obs, _ = env.reset(seed=int(args.seed))
     ep_return = 0.0
@@ -128,7 +148,10 @@ def main() -> None:
 
     for step in range(1, int(args.total_timesteps) + 1):
         if step <= int(args.warmup_steps):
-            action = np.random.uniform(action_low, action_high).astype(np.float32)
+            if str(args.warmup_strategy) == "expert":
+                action = _expert_action(env, action_low, action_high)
+            else:
+                action = np.random.uniform(action_low, action_high).astype(np.float32)
         else:
             action = _select_action(torch, actor, obs, device, float(args.exploration_noise), action_low, action_high)
         next_obs, reward, terminated, truncated, info = env.step(action)
@@ -214,13 +237,19 @@ def main() -> None:
             )
             eval_row["step"] = int(step)
             eval_trace.append(eval_row)
-            score = float(eval_row["capture_rate"]) * 1000.0 - float(eval_row["collision_count"]) * 100.0
+            score = (
+                float(eval_row["capture_rate"]) * 1000.0
+                - float(eval_row["collision_count"]) * 100.0
+                - float(eval_row["ground_count"]) * 100.0
+                - float(eval_row["boundary_count"]) * 100.0
+            )
             if score > best_eval_score:
                 best_eval_score = score
                 _save_checkpoint(out_dir / "model_best.pth", actor, args, env, state_dim, action_dim, eval_row)
             print(
                 f"[EVAL] step={step} capture_rate={eval_row['capture_rate']:.3f} "
-                f"collision_count={eval_row['collision_count']} timeout_count={eval_row['timeout_count']}"
+                f"collision_count={eval_row['collision_count']} ground_count={eval_row['ground_count']} "
+                f"boundary_count={eval_row['boundary_count']} timeout_count={eval_row['timeout_count']}"
             )
 
     _save_checkpoint(out_dir / "model_last.pth", actor, args, env, state_dim, action_dim, eval_trace[-1] if eval_trace else {})
@@ -230,6 +259,14 @@ def main() -> None:
         "model": str(args.model),
         "device": device,
         "total_timesteps": int(args.total_timesteps),
+        "bc_pretrain": {
+            "bc_steps": int(args.bc_steps),
+            "bc_updates": int(args.bc_updates),
+            "bc_batch_size": int(args.bc_batch_size),
+            "bc_learning_rate": float(args.bc_learning_rate),
+            "final_bc_loss": float(bc_trace[-1]["bc_loss"]) if bc_trace else None,
+        },
+        "warmup_strategy": str(args.warmup_strategy),
         "state_dim": state_dim,
         "action_dim": action_dim,
         "outcomes": outcomes,
@@ -238,15 +275,158 @@ def main() -> None:
         "artifacts": {
             "report_path": str(out_dir / "report.json"),
             "loss_trace_path": str(out_dir / "loss_trace.json"),
+            "bc_trace_path": str(out_dir / "bc_trace.json"),
             "eval_trace_path": str(out_dir / "eval_trace.json"),
             "best_weights_path": str(out_dir / "model_best.pth"),
             "last_weights_path": str(out_dir / "model_last.pth"),
         },
     }
     (out_dir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "bc_trace.json").write_text(json.dumps(bc_trace, ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / "loss_trace.json").write_text(json.dumps(loss_trace, ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / "eval_trace.json").write_text(json.dumps(eval_trace, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def _behavior_clone_actor(
+    *,
+    torch: Any,
+    actor: Any,
+    actor_target: Any,
+    env: Any,
+    replay: ReplayBuffer,
+    args: argparse.Namespace,
+    device: str,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+) -> list[dict[str, Any]]:
+    obs_arr, action_arr, expert_outcomes = _collect_expert_rollout(
+        env=env,
+        replay=replay,
+        seed=int(args.seed) + 7919,
+        steps=int(args.bc_steps),
+        action_low=action_low,
+        action_high=action_high,
+    )
+    if obs_arr.size == 0:
+        return []
+
+    optimizer = torch.optim.Adam(actor.parameters(), lr=float(args.bc_learning_rate))
+    updates = int(args.bc_updates) if int(args.bc_updates) > 0 else int(args.bc_steps)
+    updates = max(1, updates)
+    batch_size = max(1, min(int(args.bc_batch_size), int(obs_arr.shape[0])))
+    trace: list[dict[str, Any]] = []
+    log_every = max(1, updates // 10)
+
+    for update in range(1, updates + 1):
+        idx = np.random.randint(0, int(obs_arr.shape[0]), size=batch_size)
+        obs_batch = torch.tensor(obs_arr[idx], dtype=torch.float32, device=device)
+        action_batch = torch.tensor(action_arr[idx], dtype=torch.float32, device=device)
+        pred = actor(obs_batch)
+        loss = torch.nn.functional.mse_loss(pred, action_batch)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        if update == 1 or update % log_every == 0 or update == updates:
+            row = {
+                "update": int(update),
+                "bc_loss": float(loss.detach().cpu()),
+                "expert_samples": int(obs_arr.shape[0]),
+                "expert_outcomes": dict(expert_outcomes),
+            }
+            trace.append(row)
+            print(
+                f"[BC] update={update}/{updates} loss={row['bc_loss']:.6f} "
+                f"samples={obs_arr.shape[0]} expert_outcomes={expert_outcomes}"
+            )
+
+    actor_target.load_state_dict(actor.state_dict())
+    return trace
+
+
+def _collect_expert_rollout(
+    *,
+    env: Any,
+    replay: ReplayBuffer,
+    seed: int,
+    steps: int,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
+    obs_list: list[np.ndarray] = []
+    action_list: list[np.ndarray] = []
+    outcomes: dict[str, int] = {}
+    obs, _ = env.reset(seed=int(seed))
+    for _ in range(max(0, int(steps))):
+        action = _expert_action(env, action_low, action_high)
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        done = bool(terminated or truncated)
+        replay.add(obs, action, float(reward), next_obs, done)
+        obs_list.append(np.asarray(obs, dtype=np.float32))
+        action_list.append(np.asarray(action, dtype=np.float32))
+        if done:
+            outcome = str(info.get("outcome", "unknown"))
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            obs, _ = env.reset()
+        else:
+            obs = next_obs
+    if not obs_list:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32), outcomes
+    return np.stack(obs_list).astype(np.float32), np.stack(action_list).astype(np.float32), outcomes
+
+
+def _expert_action(env: Any, action_low: np.ndarray, action_high: np.ndarray) -> np.ndarray:
+    state = np.asarray(env.state, dtype=float)
+    pos = state[:3]
+    goal = np.asarray(env.goal, dtype=float)
+    command = goal - pos
+
+    scenario = env.scenario
+    ground_guard = max(float(scenario.ground_warning_height) * 1.4, float(scenario.world_z_min) + 5.0)
+    if pos[2] < ground_guard:
+        command[2] += (ground_guard - pos[2]) * 6.0
+    upper_guard = float(scenario.world_z_max) - 10.0
+    if pos[2] > upper_guard:
+        command[2] -= (pos[2] - upper_guard) * 6.0
+
+    for zone in env.zones:
+        center = np.asarray(zone.center_xy, dtype=float)
+        away_xy = pos[:2] - center
+        dxy = max(float(np.linalg.norm(away_xy)), 1e-6)
+        influence = float(zone.radius) + float(scenario.warning_distance) + 40.0
+        to_goal_xy = goal[:2] - pos[:2]
+        path_len = max(float(np.linalg.norm(to_goal_xy)), 1e-6)
+        path_unit = to_goal_xy / path_len
+        to_center = center - pos[:2]
+        along = float(np.dot(to_center, path_unit))
+        closest = pos[:2] + np.clip(along, 0.0, path_len) * path_unit
+        cross_vec = center - closest
+        cross_dist = float(np.linalg.norm(cross_vec))
+        corridor = float(zone.radius) + float(scenario.warning_distance)
+        if 0.0 < along < min(path_len, corridor * 3.0) and cross_dist < corridor:
+            normal = np.array([-path_unit[1], path_unit[0]], dtype=float)
+            side = 1.0 if float(np.dot(center - pos[:2], normal)) <= 0.0 else -1.0
+            command[:2] += normal * side * (corridor - cross_dist + 1.0) * 8.0
+            target_clearance_z = float(zone.radius) + float(scenario.no_fly_clearance) * 0.7
+            if pos[2] < target_clearance_z:
+                command[2] += (target_clearance_z - pos[2]) * 8.0
+        if dxy < influence:
+            strength = ((influence - dxy) / influence) ** 2
+            command[:2] += (away_xy / dxy) * strength * influence * 8.0
+        if dxy < float(zone.radius):
+            z_cap = math.sqrt(max(float(zone.radius) ** 2 - dxy * dxy, 0.0))
+            target_clearance_z = z_cap + float(scenario.no_fly_clearance) * 0.8
+            if pos[2] < target_clearance_z:
+                command[2] += (target_clearance_z - pos[2]) * 8.0
+
+    xy_norm = max(float(np.linalg.norm(command[:2])), 1e-6)
+    desired_gamma = math.atan2(float(command[2]), xy_norm)
+    desired_gamma = float(np.clip(desired_gamma, -float(scenario.gamma_max), float(scenario.gamma_max)))
+    desired_psi = math.atan2(float(command[1]), float(command[0]))
+    delta_gamma = desired_gamma - float(state[3])
+    delta_psi = _wrap_angle(desired_psi - float(state[4]))
+    action = np.array([delta_gamma, delta_psi], dtype=np.float32)
+    return np.clip(action, action_low, action_high).astype(np.float32)
 
 
 def _make_actor(args: argparse.Namespace, scenario: Any, state_dim: int, action_dim: int, action_limit: Any) -> Any:
@@ -296,9 +476,12 @@ def _evaluate_policy(
 ) -> dict[str, Any]:
     captures = 0
     collisions = 0
+    ground = 0
+    boundary = 0
     timeouts = 0
     steps_total = 0
     returns = []
+    outcomes: dict[str, int] = {}
     for ep in range(int(episodes)):
         bridge = Paper1EnvBridge(seed=int(seed) + ep)
         obs, _ = bridge.env.reset(seed=int(seed) + ep)
@@ -312,15 +495,21 @@ def _evaluate_policy(
             steps_total += 1
             done = bool(terminated or truncated)
         outcome = str(info.get("outcome", "unknown"))
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
         captures += int(outcome == "goal")
         collisions += int(outcome == "collision")
+        ground += int(outcome == "ground")
+        boundary += int(outcome == "boundary")
         timeouts += int(outcome == "timeout")
         returns.append(ep_return)
     return {
         "episodes": int(episodes),
+        "outcomes": outcomes,
         "capture_count": int(captures),
         "capture_rate": float(captures / max(1, episodes)),
         "collision_count": int(collisions),
+        "ground_count": int(ground),
+        "boundary_count": int(boundary),
         "timeout_count": int(timeouts),
         "steps_total": int(steps_total),
         "avg_return": float(np.mean(returns)) if returns else 0.0,
@@ -361,6 +550,10 @@ def _save_checkpoint(
 def _soft_update(model: Any, target: Any, tau: float) -> None:
     for param, target_param in zip(model.parameters(), target.parameters()):
         target_param.data.copy_(float(tau) * param.data + (1.0 - float(tau)) * target_param.data)
+
+
+def _wrap_angle(value: float) -> float:
+    return float((value + math.pi) % (2.0 * math.pi) - math.pi)
 
 
 def _seed_everything(torch: Any, seed: int) -> None:
