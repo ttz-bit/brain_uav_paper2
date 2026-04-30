@@ -4,7 +4,6 @@ import argparse
 import csv
 import json
 import math
-import os
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +23,12 @@ from paper2.tracking.vision_to_estimate import oracle_target_estimate
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=str, default="configs/env.yaml")
-    p.add_argument("--paper1-root", type=str, default=None)
+    p.add_argument(
+        "--paper1-root",
+        type=str,
+        default=None,
+        help="Optional original Paper1 repo root for compatibility checks. Omit to use Paper2 local physics.",
+    )
     p.add_argument("--observer", choices=["gt", "noisy"], default="gt")
     p.add_argument("--episodes", type=int, default=8)
     p.add_argument("--steps", type=int, default=120)
@@ -34,16 +38,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--capture-radius-km", type=float, default=50.0)
     p.add_argument("--out-dir", type=str, default="outputs/phase3_paper1_oracle/gt_smoke")
     return p.parse_args()
-
-
-def _default_paper1_root() -> Path | None:
-    env_root = os.environ.get("PAPER1_REPO_ROOT")
-    if env_root:
-        return Path(env_root)
-    local = Path(__file__).resolve().parents[1] / ".external" / "brain_uav"
-    if local.exists():
-        return local
-    return None
 
 
 def _truth_with_z(truth: TargetTruthState, z_km: float) -> TargetTruthState:
@@ -157,7 +151,7 @@ def main() -> None:
     args = parse_args()
     cfg = load_yaml(args.config)
     target_cfg = cfg["phase3_target_motion"]
-    paper1_root = Path(args.paper1_root) if args.paper1_root else _default_paper1_root()
+    paper1_root = Path(args.paper1_root) if args.paper1_root else None
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -253,6 +247,7 @@ def main() -> None:
         "purpose": "closed_loop_interface_smoke",
         "config": str(args.config),
         "paper1_root": None if paper1_root is None else str(paper1_root),
+        "env_source": "paper2_local_paper1_physics" if paper1_root is None else "external_paper1",
         "observer": str(args.observer),
         "episodes": int(args.episodes),
         "steps_per_episode": int(args.steps),

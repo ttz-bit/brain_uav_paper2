@@ -27,12 +27,9 @@ def test_world_frame_round_trip():
 
 
 def test_paper1_bridge_reset_step_contract():
-    root = _paper1_root()
-    if root is None:
-        pytest.skip("paper1 repo not available; set PAPER1_REPO_ROOT")
-
-    bridge = Paper1EnvBridge(paper1_root=root, seed=7)
+    bridge = Paper1EnvBridge(seed=7)
     obs = bridge.reset(seed=7)
+    assert bridge.env_source == "paper2_local_paper1_physics"
     assert np.isclose(bridge.world_size_km, 2625.0)
     assert obs.aircraft_pos_world.shape == (3,)
     assert obs.target_pos_world.shape == (3,)
@@ -63,3 +60,16 @@ def test_paper1_bridge_reset_step_contract():
         "target_out_of_bounds",
         "safety_violation",
     }
+
+
+def test_paper1_bridge_external_compatibility_if_available():
+    root = _paper1_root()
+    if root is None:
+        pytest.skip("paper1 repo not available; set PAPER1_REPO_ROOT")
+
+    bridge = Paper1EnvBridge(paper1_root=root, seed=7)
+    obs = bridge.reset(seed=7)
+    assert bridge.env_source == "external_paper1"
+    assert np.isclose(bridge.world_size_km, 2625.0)
+    assert obs.aircraft_pos_world.shape == (3,)
+    assert np.isclose(bridge.get_aircraft_state().speed, 2.5)

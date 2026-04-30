@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 
 import numpy as np
@@ -11,25 +10,20 @@ from paper2.env_adapter.paper1_bridge import Paper1EnvBridge
 from paper2.env_adapter.world_frame import paper1_xy_to_paper2_xy, paper2_xy_to_paper1_xy
 
 
-def _default_paper1_root() -> Path | None:
-    env_root = os.environ.get("PAPER1_REPO_ROOT")
-    if env_root:
-        return Path(env_root)
-    local = Path(__file__).resolve().parents[1] / ".external" / "brain_uav"
-    if local.exists():
-        return local
-    return None
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--paper1-root", type=str, default=None)
+    parser.add_argument(
+        "--paper1-root",
+        type=str,
+        default=None,
+        help="Optional original Paper1 repo root for compatibility checks. Omit to use Paper2 local physics.",
+    )
     parser.add_argument("--world-size-km", type=float, default=None)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--steps", type=int, default=10)
     args = parser.parse_args()
 
-    paper1_root = Path(args.paper1_root) if args.paper1_root else _default_paper1_root()
+    paper1_root = Path(args.paper1_root) if args.paper1_root else None
     bridge = Paper1EnvBridge(
         paper1_root=paper1_root,
         world_size_km=args.world_size_km,
@@ -54,6 +48,7 @@ def main() -> None:
     report = {
         "task": "check_paper1_bridge",
         "paper1_root": None if paper1_root is None else str(paper1_root),
+        "env_source": bridge.env_source,
         "seed": int(args.seed),
         "unit": "km",
         "world_size_km": float(bridge.world_size_km),

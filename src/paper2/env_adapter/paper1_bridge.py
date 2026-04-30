@@ -24,7 +24,12 @@ def _add_paper1_src_to_path(paper1_root: str | Path | None) -> None:
 
 
 class Paper1EnvBridge:
-    """Adapt paper1 StaticNoFlyTrajectoryEnv to the paper2 environment protocol."""
+    """Adapt Paper1-style aircraft physics to the paper2 environment protocol.
+
+    By default this uses the self-contained Paper2 local implementation of the
+    Paper1 physical口径. Passing ``paper1_root`` remains available only for
+    compatibility checks against the original Paper1 repository.
+    """
 
     def __init__(
         self,
@@ -34,13 +39,21 @@ class Paper1EnvBridge:
         world_size_km: float | None = None,
         seed: int | None = None,
     ) -> None:
-        _add_paper1_src_to_path(paper1_root)
         if env is None:
-            from brain_uav.config import RewardConfig, ScenarioConfig
-            from brain_uav.envs import StaticNoFlyTrajectoryEnv
+            if paper1_root is None:
+                from paper2.env_adapter.paper1_local_env import (
+                    RewardConfig,
+                    ScenarioConfig,
+                    StaticNoFlyTrajectoryEnv,
+                )
+            else:
+                _add_paper1_src_to_path(paper1_root)
+                from brain_uav.config import RewardConfig, ScenarioConfig
+                from brain_uav.envs import StaticNoFlyTrajectoryEnv
 
             env = StaticNoFlyTrajectoryEnv(ScenarioConfig(), RewardConfig(), seed=seed)
         self.env = env
+        self.env_source = str(getattr(self.env, "source_name", "external_paper1"))
         self.world_size_km = (
             float(world_size_km)
             if world_size_km is not None
@@ -108,7 +121,7 @@ class Paper1EnvBridge:
                 "gamma_max": float(self.env.scenario.gamma_max),
             },
             meta={
-                "source": "paper1",
+                "source": self.env_source,
                 "unit": "km",
                 "speed_unit": "km/s",
                 "state_order": ["x", "y", "z", "gamma", "psi"],
@@ -140,7 +153,7 @@ class Paper1EnvBridge:
                     geometry="hemisphere",
                     safety_margin=float(self.env.scenario.warning_distance),
                     meta={
-                        "source": "paper1",
+                        "source": self.env_source,
                         "unit": "km",
                         "paper1_center_xy": np.asarray(zone.center_xy).tolist(),
                         "world_size_km": self.world_size_km,
