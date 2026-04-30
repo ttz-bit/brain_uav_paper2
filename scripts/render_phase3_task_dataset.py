@@ -169,6 +169,8 @@ def _render_real_asset_frame(
     image_size: int,
     rng: np.random.Generator,
     min_target_water_ratio: float,
+    placement_attempts: int,
+    points_per_background: int,
 ) -> tuple[np.ndarray, list[float], float, dict]:
     bg_pool = backgrounds_by_split.get(split, [])
     target_pool = targets_by_split.get(split, [])
@@ -180,7 +182,7 @@ def _render_real_asset_frame(
     cx = float(frame.center_px[0])
     cy = float(frame.center_px[1])
     margin = int(max(4, round(STAGE_SCALE_PX.get(frame.stage, 18.0))))
-    for _ in range(80):
+    for _ in range(max(1, int(placement_attempts))):
         bg_rec = bg_pool[int(rng.integers(0, len(bg_pool)))]
         bg_path = Path(bg_rec["image_path"])
         mask_path = Path(bg_rec["mask_path"])
@@ -200,12 +202,31 @@ def _render_real_asset_frame(
         angle_deg = -float(np.degrees(frame.target_state_world["heading"]))
         target = rotate_bgra(target, angle_deg)
 
+        x_min = int(np.ceil(cx))
+        y_min = int(np.ceil(cy))
+        x_max = int(np.floor(float(w - image_size) + cx))
+        y_max = int(np.floor(float(h - image_size) + cy))
+        if x_min > x_max or y_min > y_max:
+            continue
         valid = mask > 0
+        bounded = np.zeros_like(valid, dtype=bool)
+        bounded[y_min : y_max + 1, x_min : x_max + 1] = True
+        valid &= bounded
+
+        target_radius = int(max(2, round(0.45 * max(target.shape[:2]))))
+        if target_radius > 2:
+            dist = cv2.distanceTransform((mask > 0).astype(np.uint8), distanceType=cv2.DIST_L2, maskSize=3)
+            preferred = valid & (dist >= float(target_radius))
+            if int(preferred.sum()) > 0:
+                valid = preferred
+
         yy, xx = np.where(valid)
         if len(xx) <= 0:
             continue
-        for _inner in range(16):
-            idx = int(rng.integers(0, len(xx)))
+        sample_n = min(max(1, int(points_per_background)), len(xx))
+        sample_idx = rng.choice(len(xx), size=sample_n, replace=False)
+        for idx_raw in sample_idx:
+            idx = int(idx_raw)
             target_bg_x = float(xx[idx])
             target_bg_y = float(yy[idx])
             x1 = int(round(target_bg_x - cx))
@@ -363,6 +384,8 @@ def main() -> None:
     parser.add_argument("--water-mask-root", type=str, default=None)
     parser.add_argument("--include-review-backgrounds", action="store_true")
     parser.add_argument("--min-target-water-ratio", type=float, default=0.98)
+    parser.add_argument("--placement-attempts", type=int, default=160)
+    parser.add_argument("--points-per-background", type=int, default=64)
     args = parser.parse_args()
 
     project_root = Path.cwd().resolve()
@@ -430,6 +453,8 @@ def main() -> None:
                             image_size=image_size,
                             rng=rng,
                             min_target_water_ratio=float(args.min_target_water_ratio),
+                            placement_attempts=int(args.placement_attempts),
+                            points_per_background=int(args.points_per_background),
                         )
                     else:
                         canvas = _make_ocean_background(image_size, rng)
