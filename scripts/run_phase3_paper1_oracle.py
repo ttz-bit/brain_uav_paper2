@@ -281,6 +281,7 @@ def main() -> None:
     report["accepted"] = bool(
         report["acceptance"]["all_episodes_ran"]
         and report["acceptance"]["finite_ranges"]
+        and report["acceptance"]["no_zone_violations"]
         and (str(args.observer) != "gt" or report["acceptance"]["gt_est_error_zero"])
     )
     (out_dir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
