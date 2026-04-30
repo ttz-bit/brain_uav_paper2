@@ -169,6 +169,7 @@ def _render_real_asset_frame(
     image_size: int,
     rng: np.random.Generator,
     min_target_water_ratio: float,
+    min_target_visibility: float,
     placement_attempts: int,
     points_per_background: int,
 ) -> tuple[np.ndarray, list[float], float, dict]:
@@ -181,7 +182,7 @@ def _render_real_asset_frame(
 
     cx = float(frame.center_px[0])
     cy = float(frame.center_px[1])
-    margin = int(max(4, round(STAGE_SCALE_PX.get(frame.stage, 18.0))))
+    best_candidate: tuple[float, np.ndarray, list[float], float, dict] | None = None
     for _ in range(max(1, int(placement_attempts))):
         bg_rec = bg_pool[int(rng.integers(0, len(bg_pool)))]
         bg_path = Path(bg_rec["image_path"])
@@ -236,13 +237,11 @@ def _render_real_asset_frame(
             patch_mask = mask[y1 : y1 + image_size, x1 : x1 + image_size]
             if patch_mask[int(round(cy)), int(round(cx))] <= 0:
                 continue
-            if cx < margin or cy < margin or cx >= image_size - margin or cy >= image_size - margin:
-                continue
             ratio = _alpha_water_ratio(patch_mask, target, cx, cy)
-            if ratio < min_target_water_ratio:
-                continue
             canvas = _extract_patch_inside(bg, x1, y1, image_size)
             bbox_tuple, visibility = alpha_blend_center(canvas, target, cx, cy)
+            if visibility < min_target_visibility:
+                continue
             bbox = [float(v) for v in bbox_tuple]
             asset_meta = {
                 "asset_mode": "real",
@@ -251,8 +250,17 @@ def _render_real_asset_frame(
                 "target_asset_path": str(target_path),
                 "target_water_ratio": float(ratio),
             }
-            return canvas, bbox, float(visibility), asset_meta
+            if ratio >= min_target_water_ratio:
+                return canvas, bbox, float(visibility), asset_meta
+            score = float(ratio) + 0.05 * float(visibility)
+            if ratio >= 0.85 and (best_candidate is None or score > best_candidate[0]):
+                best_candidate = (score, canvas, bbox, float(visibility), asset_meta)
 
+    if best_candidate is not None:
+        _, canvas, bbox, visibility, asset_meta = best_candidate
+        asset_meta = dict(asset_meta)
+        asset_meta["placement_fallback"] = "relaxed_water_ratio"
+        return canvas, bbox, visibility, asset_meta
     raise RuntimeError(f"Could not place target on water for split={split}, stage={frame.stage}.")
 
 
@@ -384,6 +392,7 @@ def main() -> None:
     parser.add_argument("--water-mask-root", type=str, default=None)
     parser.add_argument("--include-review-backgrounds", action="store_true")
     parser.add_argument("--min-target-water-ratio", type=float, default=0.98)
+    parser.add_argument("--min-target-visibility", type=float, default=0.35)
     parser.add_argument("--placement-attempts", type=int, default=160)
     parser.add_argument("--points-per-background", type=int, default=64)
     args = parser.parse_args()
@@ -453,6 +462,7 @@ def main() -> None:
                             image_size=image_size,
                             rng=rng,
                             min_target_water_ratio=float(args.min_target_water_ratio),
+                            min_target_visibility=float(args.min_target_visibility),
                             placement_attempts=int(args.placement_attempts),
                             points_per_background=int(args.points_per_background),
                         )
