@@ -5,6 +5,7 @@ import json
 import math
 import random
 from collections import deque
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--noise-clip", type=float, default=0.03)
     p.add_argument("--exploration-noise", type=float, default=0.02)
     p.add_argument("--policy-delay", type=int, default=2)
+    p.add_argument("--actor-freeze-steps", type=int, default=25000)
+    p.add_argument("--actor-grad-clip-norm", type=float, default=1.0)
+    p.add_argument("--critic-grad-clip-norm", type=float, default=1.0)
+    p.add_argument("--actor-rl-scale-alpha", type=float, default=2.5)
+    p.add_argument("--bc-regularization", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--terminal-geo-regularization", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--terminal-geo-radius", type=float, default=250.0)
+    p.add_argument("--terminal-geo-lambda", type=float, default=3000.0)
     p.add_argument("--hidden-dim", type=int, default=128)
     p.add_argument("--snn-time-window", type=int, default=4)
     p.add_argument("--snn-backend", choices=["torch", "cupy"], default="torch")
@@ -120,6 +129,7 @@ def main() -> None:
     critic_opt = torch.optim.Adam(list(critic1.parameters()) + list(critic2.parameters()), lr=float(args.critic_lr))
     replay = ReplayBuffer(int(args.replay_size))
     bc_trace: list[dict[str, Any]] = []
+    bc_reference_actor = None
 
     if int(args.bc_steps) > 0:
         bc_trace = _behavior_clone_actor(
@@ -133,6 +143,11 @@ def main() -> None:
             action_low=action_low,
             action_high=action_high,
         )
+        if bool(args.bc_regularization):
+            bc_reference_actor = deepcopy(actor).to(device)
+            bc_reference_actor.eval()
+            for param in bc_reference_actor.parameters():
+                param.requires_grad = False
 
     obs, _ = env.reset(seed=int(args.seed))
     ep_return = 0.0
@@ -145,6 +160,13 @@ def main() -> None:
     eval_trace: list[dict[str, Any]] = []
     last_actor_loss = 0.0
     last_critic_loss = 0.0
+    last_rl_actor_loss = 0.0
+    last_scaled_rl_actor_loss = 0.0
+    last_actor_rl_scale = 1.0
+    last_bc_loss = 0.0
+    last_bc_lambda = 0.0
+    last_terminal_geo_loss = 0.0
+    last_terminal_geo_lambda = 0.0
 
     for step in range(1, int(args.total_timesteps) + 1):
         if step <= int(args.warmup_steps):
@@ -186,18 +208,52 @@ def main() -> None:
             )
             critic_opt.zero_grad()
             critic_loss.backward()
+            if float(args.critic_grad_clip_norm) > 0.0:
+                torch.nn.utils.clip_grad_norm_(
+                    list(critic1.parameters()) + list(critic2.parameters()),
+                    max_norm=float(args.critic_grad_clip_norm),
+                )
             critic_opt.step()
             last_critic_loss = float(critic_loss.detach().cpu())
 
             if step % int(args.policy_delay) == 0:
-                actor_loss = -critic1(batch["obs"], actor(batch["obs"])).mean()
-                actor_opt.zero_grad()
-                actor_loss.backward()
-                actor_opt.step()
-                last_actor_loss = float(actor_loss.detach().cpu())
-                _soft_update(actor, actor_target, float(args.tau))
                 _soft_update(critic1, critic1_target, float(args.tau))
                 _soft_update(critic2, critic2_target, float(args.tau))
+                if step > int(args.actor_freeze_steps):
+                    (
+                        actor_loss,
+                        rl_actor_loss,
+                        scaled_rl_actor_loss,
+                        bc_loss,
+                        bc_lambda,
+                        actor_rl_scale,
+                        terminal_geo_loss,
+                        terminal_geo_lambda,
+                    ) = _compute_actor_loss_terms(
+                        torch=torch,
+                        actor=actor,
+                        critic1=critic1,
+                        obs=batch["obs"],
+                        action_low=torch.tensor(action_low, dtype=torch.float32, device=device),
+                        action_high=torch.tensor(action_high, dtype=torch.float32, device=device),
+                        args=args,
+                        step=step,
+                        bc_reference_actor=bc_reference_actor,
+                    )
+                    actor_opt.zero_grad()
+                    actor_loss.backward()
+                    if float(args.actor_grad_clip_norm) > 0.0:
+                        torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=float(args.actor_grad_clip_norm))
+                    actor_opt.step()
+                    _soft_update(actor, actor_target, float(args.tau))
+                    last_actor_loss = float(actor_loss.detach().cpu())
+                    last_rl_actor_loss = float(rl_actor_loss.detach().cpu())
+                    last_scaled_rl_actor_loss = float(scaled_rl_actor_loss.detach().cpu())
+                    last_bc_loss = float(bc_loss.detach().cpu())
+                    last_bc_lambda = float(bc_lambda)
+                    last_actor_rl_scale = float(actor_rl_scale)
+                    last_terminal_geo_loss = float(terminal_geo_loss.detach().cpu())
+                    last_terminal_geo_lambda = float(terminal_geo_lambda)
 
         if done:
             outcome = str(info.get("outcome", "unknown"))
@@ -216,12 +272,21 @@ def main() -> None:
                 "avg_length_20": float(np.mean(episode_lengths)) if episode_lengths else 0.0,
                 "actor_loss": float(last_actor_loss),
                 "critic_loss": float(last_critic_loss),
+                "actor_phase": "frozen" if step <= int(args.actor_freeze_steps) else "active",
+                "rl_actor_loss": float(last_rl_actor_loss),
+                "scaled_rl_actor_loss": float(last_scaled_rl_actor_loss),
+                "actor_rl_scale": float(last_actor_rl_scale),
+                "bc_loss": float(last_bc_loss),
+                "bc_lambda": float(last_bc_lambda),
+                "terminal_geo_loss": float(last_terminal_geo_loss),
+                "terminal_geo_lambda": float(last_terminal_geo_lambda),
                 "outcomes": dict(outcomes),
             }
             loss_trace.append(row)
             print(
                 f"[TD3] step={step}/{args.total_timesteps} replay={len(replay)} "
-                f"avg_return_20={row['avg_return_20']:.3f} actor_loss={last_actor_loss:.4f} "
+                f"avg_return_20={row['avg_return_20']:.3f} actor_phase={row['actor_phase']} "
+                f"actor_loss={last_actor_loss:.4f} "
                 f"critic_loss={last_critic_loss:.4f} outcomes={outcomes}"
             )
 
@@ -265,8 +330,16 @@ def main() -> None:
             "bc_batch_size": int(args.bc_batch_size),
             "bc_learning_rate": float(args.bc_learning_rate),
             "final_bc_loss": float(bc_trace[-1]["bc_loss"]) if bc_trace else None,
+            "bc_regularization": bool(args.bc_regularization),
         },
         "warmup_strategy": str(args.warmup_strategy),
+        "actor_freeze_steps": int(args.actor_freeze_steps),
+        "actor_grad_clip_norm": float(args.actor_grad_clip_norm),
+        "critic_grad_clip_norm": float(args.critic_grad_clip_norm),
+        "actor_rl_scale_alpha": float(args.actor_rl_scale_alpha),
+        "terminal_geo_regularization": bool(args.terminal_geo_regularization),
+        "terminal_geo_radius": float(args.terminal_geo_radius),
+        "terminal_geo_lambda": float(args.terminal_geo_lambda),
         "state_dim": state_dim,
         "action_dim": action_dim,
         "outcomes": outcomes,
@@ -514,6 +587,108 @@ def _evaluate_policy(
         "steps_total": int(steps_total),
         "avg_return": float(np.mean(returns)) if returns else 0.0,
     }
+
+
+def _compute_actor_loss_terms(
+    *,
+    torch: Any,
+    actor: Any,
+    critic1: Any,
+    obs: Any,
+    action_low: Any,
+    action_high: Any,
+    args: argparse.Namespace,
+    step: int,
+    bc_reference_actor: Any | None,
+) -> tuple[Any, Any, Any, Any, float, float, Any, float]:
+    actor_actions = actor(obs)
+    q_values = critic1(obs, actor_actions)
+    rl_actor_loss = -q_values.mean()
+    q_scale = q_values.detach().abs().mean().clamp(min=1.0)
+    actor_rl_scale = float(float(args.actor_rl_scale_alpha) / float(q_scale.item()))
+    scaled_rl_actor_loss = rl_actor_loss * actor_rl_scale
+
+    bc_lambda = 0.0
+    bc_loss = torch.zeros((), dtype=torch.float32, device=obs.device)
+    if bc_reference_actor is not None:
+        bc_lambda = _bc_lambda(step_hint=int(step))
+        with torch.no_grad():
+            bc_actions = bc_reference_actor(obs)
+        bc_loss = torch.nn.functional.mse_loss(actor_actions, bc_actions)
+
+    terminal_geo_lambda = 0.0
+    terminal_geo_loss = torch.zeros((), dtype=torch.float32, device=obs.device)
+    if bool(args.terminal_geo_regularization):
+        terminal_geo_loss = _terminal_geo_loss(
+            torch=torch,
+            obs=obs,
+            actor_actions=actor_actions,
+            action_low=action_low,
+            action_high=action_high,
+            terminal_geo_radius=float(args.terminal_geo_radius),
+        )
+        if float(terminal_geo_loss.detach().abs().cpu()) > 0.0:
+            terminal_geo_lambda = float(args.terminal_geo_lambda)
+
+    actor_loss = scaled_rl_actor_loss + bc_lambda * bc_loss + terminal_geo_lambda * terminal_geo_loss
+    return (
+        actor_loss,
+        rl_actor_loss,
+        scaled_rl_actor_loss,
+        bc_loss,
+        bc_lambda,
+        actor_rl_scale,
+        terminal_geo_loss,
+        terminal_geo_lambda,
+    )
+
+
+def _bc_lambda(*, step_hint: int) -> float:
+    if step_hint < 75000:
+        return 500.0
+    if step_hint < 150000:
+        return 150.0
+    if step_hint < 250000:
+        return 30.0
+    return 5.0
+
+
+def _terminal_geo_loss(
+    *,
+    torch: Any,
+    obs: Any,
+    actor_actions: Any,
+    action_low: Any,
+    action_high: Any,
+    terminal_geo_radius: float,
+) -> Any:
+    rel_goal = obs[:, 5:8]
+    goal_distance = torch.linalg.norm(rel_goal, dim=1)
+    eligible_mask = goal_distance <= float(terminal_geo_radius)
+    if not torch.any(eligible_mask):
+        return torch.zeros((), dtype=torch.float32, device=obs.device)
+
+    gamma = obs[:, 3]
+    psi = obs[:, 4]
+    dx = rel_goal[:, 0]
+    dy = rel_goal[:, 1]
+    dz = rel_goal[:, 2]
+    horizontal = torch.sqrt(torch.clamp(dx.square() + dy.square(), min=1e-9))
+    target_gamma = torch.atan2(dz, horizontal)
+    target_psi = torch.atan2(dy, dx)
+    delta_gamma = torch.clamp(target_gamma - gamma, min=float(action_low[0].item()), max=float(action_high[0].item()))
+    delta_psi = torch.clamp(
+        _wrap_angle_tensor(torch, target_psi - psi),
+        min=float(action_low[1].item()),
+        max=float(action_high[1].item()),
+    )
+    target_action = torch.stack([delta_gamma, delta_psi], dim=-1)
+    return torch.nn.functional.mse_loss(actor_actions[eligible_mask], target_action[eligible_mask])
+
+
+def _wrap_angle_tensor(torch: Any, value: Any) -> Any:
+    two_pi = float(2.0 * np.pi)
+    return torch.remainder(value + float(np.pi), two_pi) - float(np.pi)
 
 
 def _save_checkpoint(

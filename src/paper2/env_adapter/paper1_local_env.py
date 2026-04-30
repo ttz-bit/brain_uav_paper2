@@ -27,7 +27,7 @@ class ScenarioConfig:
     no_fly_count_range: tuple[int, int] = (1, 3)
     no_fly_radius_range: tuple[float, float] = (200.0, 250.0)
     warning_distance: float = 80.0
-    ground_warning_height: float = 40.0
+    ground_warning_height: float = 4.0
     no_fly_clearance: float = 120.0
     start_z_ratio_range: tuple[float, float] = (0.18, 0.36)
     goal_z_ratio_range: tuple[float, float] = (0.18, 0.36)
@@ -41,12 +41,16 @@ class ScenarioConfig:
 
 @dataclass
 class RewardConfig:
-    progress_weight: float = 1.0
-    step_penalty: float = 0.01
-    goal_bonus: float = 100.0
-    collision_penalty: float = 100.0
-    boundary_penalty: float = 100.0
-    warning_penalty: float = 2.0
+    progress_weight: float = 2.4
+    step_penalty: float = 2.5
+    goal_reward: float = 5000.0
+    collision_penalty: float = 12000.0
+    boundary_penalty: float = 10000.0
+    timeout_penalty: float = 5000.0
+    zone_penalty_weight: float = 300.0
+    zone_penalty_cap: float = 800.0
+    ground_soft_penalty_weight: float = 120.0
+    ground_soft_penalty_cap: float = 200.0
 
 
 @dataclass
@@ -200,27 +204,31 @@ class StaticNoFlyTrajectoryEnv:
         s = self.scenario
         if self._goal_distance() <= float(s.goal_radius):
             return True, False, "goal"
-        if self._in_no_fly_zone(self.state[:3]):
-            return True, False, "collision"
+        if float(self.state[2]) <= float(s.world_z_min):
+            return True, False, "ground"
         if abs(float(self.state[0])) > float(s.world_xy) or abs(float(self.state[1])) > float(s.world_xy):
             return True, False, "boundary"
-        if float(self.state[2]) < float(s.world_z_min) or float(self.state[2]) > float(s.world_z_max):
-            return True, False, "ground"
+        if float(self.state[2]) > float(s.world_z_max):
+            return True, False, "boundary"
+        if self._in_no_fly_zone(self.state[:3]):
+            return True, False, "collision"
         if int(self.steps) >= int(s.max_steps):
             return False, True, "timeout"
         return False, False, "running"
 
     def _compute_reward(self, prev_dist: float, outcome: str) -> float:
         progress = float(prev_dist - self._goal_distance())
-        reward = float(self.reward.progress_weight) * progress - float(self.reward.step_penalty)
-        if self._near_no_fly_zone(self.state[:3]):
-            reward -= float(self.reward.warning_penalty)
+        reward = float(self.reward.progress_weight) * progress * 10.0 - float(self.reward.step_penalty)
+        reward -= self._zone_warning_penalty(self.state[:3])
+        reward -= self._ground_warning_penalty(self.state[:3])
         if outcome == "goal":
-            reward += float(self.reward.goal_bonus)
-        elif outcome == "collision":
+            reward += float(self.reward.goal_reward)
+        elif outcome in {"collision", "ground"}:
             reward -= float(self.reward.collision_penalty)
-        elif outcome in {"boundary", "ground"}:
+        elif outcome == "boundary":
             reward -= float(self.reward.boundary_penalty)
+        elif outcome == "timeout":
+            reward -= float(self.reward.timeout_penalty)
         return float(reward)
 
     def _get_obs(self) -> np.ndarray:
@@ -287,6 +295,38 @@ class StaticNoFlyTrajectoryEnv:
             ):
                 return True
         return False
+
+    def _zone_warning_penalty(self, pos: np.ndarray) -> float:
+        p = np.asarray(pos, dtype=float).reshape(-1)
+        penalty = 0.0
+        for zone in self.zones:
+            surface_clearance = self._zone_surface_clearance(p, zone)
+            if surface_clearance >= float(self.scenario.warning_distance):
+                continue
+            ratio = (float(self.scenario.warning_distance) - surface_clearance) / max(
+                float(self.scenario.warning_distance),
+                1e-6,
+            )
+            penalty += float(self.reward.zone_penalty_weight) * ratio * ratio
+        return float(min(penalty, float(self.reward.zone_penalty_cap)))
+
+    def _ground_warning_penalty(self, pos: np.ndarray) -> float:
+        height = float(np.asarray(pos, dtype=float).reshape(-1)[2])
+        warning_height = float(self.scenario.ground_warning_height)
+        if height >= warning_height:
+            return 0.0
+        ratio = (warning_height - height) / max(warning_height, 1e-6)
+        penalty = float(self.reward.ground_soft_penalty_weight) * ratio * ratio
+        return float(min(penalty, float(self.reward.ground_soft_penalty_cap)))
+
+    @staticmethod
+    def _zone_surface_clearance(pos: np.ndarray, zone: Zone) -> float:
+        distance = math.sqrt(
+            float(pos[0] - zone.center_xy[0]) ** 2
+            + float(pos[1] - zone.center_xy[1]) ** 2
+            + float(pos[2]) ** 2
+        )
+        return float(distance - float(zone.radius))
 
 
 def _wrap_angle(value: float) -> float:
