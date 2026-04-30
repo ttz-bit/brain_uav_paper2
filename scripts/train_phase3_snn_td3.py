@@ -1,0 +1,391 @@
+from __future__ import annotations
+
+import argparse
+import json
+import random
+from collections import deque
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from paper2.env_adapter.paper1_bridge import Paper1EnvBridge
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--model", choices=["snn", "ann"], default="snn")
+    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    p.add_argument("--total-timesteps", type=int, default=100000)
+    p.add_argument("--seed", type=int, default=20260430)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--replay-size", type=int, default=200000)
+    p.add_argument("--warmup-steps", type=int, default=2000)
+    p.add_argument("--actor-lr", type=float, default=1e-3)
+    p.add_argument("--critic-lr", type=float, default=1e-3)
+    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--tau", type=float, default=0.005)
+    p.add_argument("--policy-noise", type=float, default=0.015)
+    p.add_argument("--noise-clip", type=float, default=0.03)
+    p.add_argument("--exploration-noise", type=float, default=0.02)
+    p.add_argument("--policy-delay", type=int, default=2)
+    p.add_argument("--hidden-dim", type=int, default=128)
+    p.add_argument("--snn-time-window", type=int, default=4)
+    p.add_argument("--snn-backend", choices=["torch", "cupy"], default="torch")
+    p.add_argument("--eval-interval", type=int, default=10000)
+    p.add_argument("--eval-episodes", type=int, default=8)
+    p.add_argument("--log-interval", type=int, default=1000)
+    p.add_argument("--out-dir", type=str, default="outputs/phase3_snn_td3/train_snn_td3")
+    return p.parse_args()
+
+
+class ReplayBuffer:
+    def __init__(self, capacity: int) -> None:
+        self.capacity = int(capacity)
+        self.obs: np.ndarray | None = None
+        self.action: np.ndarray | None = None
+        self.reward = np.zeros((self.capacity, 1), dtype=np.float32)
+        self.next_obs: np.ndarray | None = None
+        self.done = np.zeros((self.capacity, 1), dtype=np.float32)
+        self.size = 0
+        self.pos = 0
+
+    def __len__(self) -> int:
+        return int(self.size)
+
+    def add(self, obs: np.ndarray, action: np.ndarray, reward: float, next_obs: np.ndarray, done: bool) -> None:
+        obs = np.asarray(obs, dtype=np.float32)
+        action = np.asarray(action, dtype=np.float32)
+        next_obs = np.asarray(next_obs, dtype=np.float32)
+        if self.obs is None:
+            self.obs = np.zeros((self.capacity, *obs.shape), dtype=np.float32)
+            self.action = np.zeros((self.capacity, *action.shape), dtype=np.float32)
+            self.next_obs = np.zeros((self.capacity, *next_obs.shape), dtype=np.float32)
+        idx = self.pos
+        self.obs[idx] = obs
+        self.action[idx] = action
+        self.reward[idx, 0] = float(reward)
+        self.next_obs[idx] = next_obs
+        self.done[idx, 0] = float(done)
+        self.pos = (self.pos + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size: int, torch: Any, device: str) -> dict[str, Any]:
+        idx = np.random.randint(0, self.size, size=int(batch_size))
+        return {
+            "obs": torch.tensor(self.obs[idx], dtype=torch.float32, device=device),
+            "action": torch.tensor(self.action[idx], dtype=torch.float32, device=device),
+            "reward": torch.tensor(self.reward[idx], dtype=torch.float32, device=device),
+            "next_obs": torch.tensor(self.next_obs[idx], dtype=torch.float32, device=device),
+            "done": torch.tensor(self.done[idx], dtype=torch.float32, device=device),
+        }
+
+
+def main() -> None:
+    args = parse_args()
+    torch = _import_torch()
+    device = _resolve_device(torch, str(args.device))
+    _seed_everything(torch, int(args.seed))
+
+    out_dir = Path(args.out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    bridge = Paper1EnvBridge(seed=int(args.seed))
+    obs = bridge.env.reset(seed=int(args.seed))[0]
+    env = bridge.env
+    state_dim = int(obs.shape[0])
+    action_dim = 2
+    action_low = np.array([-float(env.scenario.delta_gamma_max), -float(env.scenario.delta_psi_max)], dtype=np.float32)
+    action_high = np.array([float(env.scenario.delta_gamma_max), float(env.scenario.delta_psi_max)], dtype=np.float32)
+    action_limit = torch.tensor(action_high, dtype=torch.float32)
+    from paper2.planning.models import ANNCritic
+
+    actor = _make_actor(args, env.scenario, state_dim, action_dim, action_limit).to(device)
+    actor_target = _make_actor(args, env.scenario, state_dim, action_dim, action_limit).to(device)
+    actor_target.load_state_dict(actor.state_dict())
+    critic1 = ANNCritic(state_dim, action_dim, int(args.hidden_dim), env.scenario).to(device)
+    critic2 = ANNCritic(state_dim, action_dim, int(args.hidden_dim), env.scenario).to(device)
+    critic1_target = ANNCritic(state_dim, action_dim, int(args.hidden_dim), env.scenario).to(device)
+    critic2_target = ANNCritic(state_dim, action_dim, int(args.hidden_dim), env.scenario).to(device)
+    critic1_target.load_state_dict(critic1.state_dict())
+    critic2_target.load_state_dict(critic2.state_dict())
+
+    actor_opt = torch.optim.Adam(actor.parameters(), lr=float(args.actor_lr))
+    critic_opt = torch.optim.Adam(list(critic1.parameters()) + list(critic2.parameters()), lr=float(args.critic_lr))
+    replay = ReplayBuffer(int(args.replay_size))
+
+    obs, _ = env.reset(seed=int(args.seed))
+    ep_return = 0.0
+    ep_len = 0
+    episode_returns: deque[float] = deque(maxlen=20)
+    episode_lengths: deque[int] = deque(maxlen=20)
+    outcomes: dict[str, int] = {}
+    best_eval_score = -float("inf")
+    loss_trace: list[dict[str, Any]] = []
+    eval_trace: list[dict[str, Any]] = []
+    last_actor_loss = 0.0
+    last_critic_loss = 0.0
+
+    for step in range(1, int(args.total_timesteps) + 1):
+        if step <= int(args.warmup_steps):
+            action = np.random.uniform(action_low, action_high).astype(np.float32)
+        else:
+            action = _select_action(torch, actor, obs, device, float(args.exploration_noise), action_low, action_high)
+        next_obs, reward, terminated, truncated, info = env.step(action)
+        done = bool(terminated or truncated)
+        replay.add(obs, action, float(reward), next_obs, done)
+        obs = next_obs
+        ep_return += float(reward)
+        ep_len += 1
+
+        if len(replay) >= int(args.batch_size):
+            batch = replay.sample(int(args.batch_size), torch, device)
+            with torch.no_grad():
+                noise = (torch.randn_like(batch["action"]) * float(args.policy_noise)).clamp(
+                    -float(args.noise_clip),
+                    float(args.noise_clip),
+                )
+                next_action = (actor_target(batch["next_obs"]) + noise).clamp(
+                    torch.tensor(action_low, dtype=torch.float32, device=device),
+                    torch.tensor(action_high, dtype=torch.float32, device=device),
+                )
+                target_q = torch.min(
+                    critic1_target(batch["next_obs"], next_action),
+                    critic2_target(batch["next_obs"], next_action),
+                )
+                target_q = batch["reward"] + (1.0 - batch["done"]) * float(args.gamma) * target_q
+
+            current_q1 = critic1(batch["obs"], batch["action"])
+            current_q2 = critic2(batch["obs"], batch["action"])
+            critic_loss = torch.nn.functional.mse_loss(current_q1, target_q) + torch.nn.functional.mse_loss(
+                current_q2,
+                target_q,
+            )
+            critic_opt.zero_grad()
+            critic_loss.backward()
+            critic_opt.step()
+            last_critic_loss = float(critic_loss.detach().cpu())
+
+            if step % int(args.policy_delay) == 0:
+                actor_loss = -critic1(batch["obs"], actor(batch["obs"])).mean()
+                actor_opt.zero_grad()
+                actor_loss.backward()
+                actor_opt.step()
+                last_actor_loss = float(actor_loss.detach().cpu())
+                _soft_update(actor, actor_target, float(args.tau))
+                _soft_update(critic1, critic1_target, float(args.tau))
+                _soft_update(critic2, critic2_target, float(args.tau))
+
+        if done:
+            outcome = str(info.get("outcome", "unknown"))
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            episode_returns.append(float(ep_return))
+            episode_lengths.append(int(ep_len))
+            obs, _ = env.reset()
+            ep_return = 0.0
+            ep_len = 0
+
+        if step % int(args.log_interval) == 0 or step == int(args.total_timesteps):
+            row = {
+                "step": int(step),
+                "replay_size": int(len(replay)),
+                "avg_return_20": float(np.mean(episode_returns)) if episode_returns else 0.0,
+                "avg_length_20": float(np.mean(episode_lengths)) if episode_lengths else 0.0,
+                "actor_loss": float(last_actor_loss),
+                "critic_loss": float(last_critic_loss),
+                "outcomes": dict(outcomes),
+            }
+            loss_trace.append(row)
+            print(
+                f"[TD3] step={step}/{args.total_timesteps} replay={len(replay)} "
+                f"avg_return_20={row['avg_return_20']:.3f} actor_loss={last_actor_loss:.4f} "
+                f"critic_loss={last_critic_loss:.4f} outcomes={outcomes}"
+            )
+
+        if step % int(args.eval_interval) == 0 or step == int(args.total_timesteps):
+            eval_row = _evaluate_policy(
+                torch,
+                actor,
+                device,
+                seed=int(args.seed) + step,
+                episodes=int(args.eval_episodes),
+                action_low=action_low,
+                action_high=action_high,
+            )
+            eval_row["step"] = int(step)
+            eval_trace.append(eval_row)
+            score = float(eval_row["capture_rate"]) * 1000.0 - float(eval_row["collision_count"]) * 100.0
+            if score > best_eval_score:
+                best_eval_score = score
+                _save_checkpoint(out_dir / "model_best.pth", actor, args, env, state_dim, action_dim, eval_row)
+            print(
+                f"[EVAL] step={step} capture_rate={eval_row['capture_rate']:.3f} "
+                f"collision_count={eval_row['collision_count']} timeout_count={eval_row['timeout_count']}"
+            )
+
+    _save_checkpoint(out_dir / "model_last.pth", actor, args, env, state_dim, action_dim, eval_trace[-1] if eval_trace else {})
+    report = {
+        "task": "train_phase3_snn_td3",
+        "purpose": "main_planner_training",
+        "model": str(args.model),
+        "device": device,
+        "total_timesteps": int(args.total_timesteps),
+        "state_dim": state_dim,
+        "action_dim": action_dim,
+        "outcomes": outcomes,
+        "final_train": loss_trace[-1] if loss_trace else {},
+        "best_eval": max(eval_trace, key=lambda r: float(r["capture_rate"])) if eval_trace else {},
+        "artifacts": {
+            "report_path": str(out_dir / "report.json"),
+            "loss_trace_path": str(out_dir / "loss_trace.json"),
+            "eval_trace_path": str(out_dir / "eval_trace.json"),
+            "best_weights_path": str(out_dir / "model_best.pth"),
+            "last_weights_path": str(out_dir / "model_last.pth"),
+        },
+    }
+    (out_dir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "loss_trace.json").write_text(json.dumps(loss_trace, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "eval_trace.json").write_text(json.dumps(eval_trace, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def _make_actor(args: argparse.Namespace, scenario: Any, state_dim: int, action_dim: int, action_limit: Any) -> Any:
+    if args.model == "snn":
+        from paper2.planning.models import SNNPolicyActor
+
+        return SNNPolicyActor(
+            state_dim,
+            action_dim,
+            int(args.hidden_dim),
+            int(args.snn_time_window),
+            action_limit,
+            scenario,
+            backend=str(args.snn_backend),
+        )
+    from paper2.planning.models import ANNPolicyActor
+
+    return ANNPolicyActor(state_dim, action_dim, int(args.hidden_dim), action_limit, scenario)
+
+
+def _select_action(
+    torch: Any,
+    actor: Any,
+    obs: np.ndarray,
+    device: str,
+    exploration_noise: float,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+) -> np.ndarray:
+    with torch.no_grad():
+        obs_tensor = torch.tensor(obs[None, :], dtype=torch.float32, device=device)
+        action = actor(obs_tensor).detach().cpu().numpy()[0]
+    if exploration_noise > 0.0:
+        action = action + np.random.normal(0.0, float(exploration_noise), size=action.shape)
+    return np.clip(action, action_low, action_high).astype(np.float32)
+
+
+def _evaluate_policy(
+    torch: Any,
+    actor: Any,
+    device: str,
+    *,
+    seed: int,
+    episodes: int,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+) -> dict[str, Any]:
+    captures = 0
+    collisions = 0
+    timeouts = 0
+    steps_total = 0
+    returns = []
+    for ep in range(int(episodes)):
+        bridge = Paper1EnvBridge(seed=int(seed) + ep)
+        obs, _ = bridge.env.reset(seed=int(seed) + ep)
+        done = False
+        ep_return = 0.0
+        info: dict[str, Any] = {}
+        while not done:
+            action = _select_action(torch, actor, obs, device, 0.0, action_low, action_high)
+            obs, reward, terminated, truncated, info = bridge.env.step(action)
+            ep_return += float(reward)
+            steps_total += 1
+            done = bool(terminated or truncated)
+        outcome = str(info.get("outcome", "unknown"))
+        captures += int(outcome == "goal")
+        collisions += int(outcome == "collision")
+        timeouts += int(outcome == "timeout")
+        returns.append(ep_return)
+    return {
+        "episodes": int(episodes),
+        "capture_count": int(captures),
+        "capture_rate": float(captures / max(1, episodes)),
+        "collision_count": int(collisions),
+        "timeout_count": int(timeouts),
+        "steps_total": int(steps_total),
+        "avg_return": float(np.mean(returns)) if returns else 0.0,
+    }
+
+
+def _save_checkpoint(
+    path: Path,
+    actor: Any,
+    args: argparse.Namespace,
+    env: Any,
+    state_dim: int,
+    action_dim: int,
+    eval_row: dict[str, Any],
+) -> None:
+    torch = _import_torch()
+    payload = {
+        "state_dict": actor.state_dict(),
+        "config": {
+            "training": {
+                "hidden_dim": int(args.hidden_dim),
+                "snn_time_window": int(args.snn_time_window),
+                "snn_backend": str(args.snn_backend),
+            },
+            "scenario": env.scenario.__dict__,
+        },
+        "metadata": {
+            "model": str(args.model),
+            "state_dim": int(state_dim),
+            "action_dim": int(action_dim),
+            "unit": "km",
+            "eval": eval_row,
+        },
+    }
+    torch.save(payload, path)
+
+
+def _soft_update(model: Any, target: Any, tau: float) -> None:
+    for param, target_param in zip(model.parameters(), target.parameters()):
+        target_param.data.copy_(float(tau) * param.data + (1.0 - float(tau)) * target_param.data)
+
+
+def _seed_everything(torch: Any, seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _resolve_device(torch: Any, device: str) -> str:
+    if device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but torch.cuda.is_available() is False.")
+    return device
+
+
+def _import_torch() -> Any:
+    try:
+        import torch
+    except Exception as exc:
+        raise RuntimeError("PyTorch is required for train_phase3_snn_td3.py.") from exc
+    return torch
+
+
+if __name__ == "__main__":
+    main()
