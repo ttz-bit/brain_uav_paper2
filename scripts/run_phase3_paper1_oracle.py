@@ -11,6 +11,7 @@ import numpy as np
 
 from paper2.common.config import load_yaml
 from paper2.common.types import AircraftState, NoFlyZoneState, TargetEstimateState, TargetTruthState
+from paper2.control.phase3_safe_controller import Phase3SafeController
 from paper2.env_adapter.paper1_bridge import Paper1EnvBridge
 from paper2.env_adapter.phase3_target_motion import (
     propagate_phase3_target_truth,
@@ -36,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--noise-std-km", type=float, default=2.0)
     p.add_argument("--target-z-km", type=float, default=0.0)
     p.add_argument("--capture-radius-km", type=float, default=50.0)
+    p.add_argument("--controller", choices=["naive", "safe_apf"], default="safe_apf")
     p.add_argument("--out-dir", type=str, default="outputs/phase3_paper1_oracle/gt_smoke")
     return p.parse_args()
 
@@ -105,13 +107,30 @@ def _controller_action(aircraft: AircraftState, estimate: TargetEstimateState) -
     return np.array([delta_gamma, delta_psi], dtype=np.float32)
 
 
-def _zone_violation(pos_world: np.ndarray, zones: list[NoFlyZoneState]) -> bool:
+def _select_controller_action(
+    aircraft: AircraftState,
+    estimate: TargetEstimateState,
+    zones: list[NoFlyZoneState],
+    *,
+    controller: str,
+    safe_controller: Phase3SafeController,
+) -> np.ndarray:
+    if controller == "naive":
+        return _controller_action(aircraft, estimate)
+    if controller == "safe_apf":
+        return safe_controller.act(aircraft, estimate, zones)
+    raise ValueError(f"Unsupported controller: {controller}")
+
+
+def _zone_violation(pos_world: np.ndarray, zones: list[NoFlyZoneState], *, include_safety_margin: bool) -> bool:
     pos = np.asarray(pos_world, dtype=float).reshape(-1)
     if pos.size < 3:
         return False
     for zone in zones:
         center = np.asarray(zone.center_world, dtype=float).reshape(-1)
-        radius = float(zone.radius_world) + float(zone.safety_margin)
+        radius = float(zone.radius_world)
+        if include_safety_margin:
+            radius += float(zone.safety_margin)
         dxy = float(np.linalg.norm(pos[:2] - center[:2]))
         if zone.geometry == "hemisphere":
             if dxy <= radius:
@@ -132,10 +151,12 @@ def _episode_summary(rows: list[dict[str, Any]], capture_radius_km: float) -> di
             "final_range_km": 0.0,
             "mean_est_error_km": 0.0,
             "zone_violation_count": 0,
+            "safety_margin_violation_count": 0,
         }
     ranges = np.asarray([float(r["range_to_target_km"]) for r in rows], dtype=float)
     est_errors = np.asarray([float(r["target_est_error_km"]) for r in rows], dtype=float)
     violations = int(sum(1 for r in rows if bool(r["zone_violation"])))
+    safety_violations = int(sum(1 for r in rows if bool(r["safety_margin_violation"])))
     return {
         "steps_executed": int(len(rows)),
         "captured": bool(float(ranges.min()) <= float(capture_radius_km)),
@@ -143,6 +164,7 @@ def _episode_summary(rows: list[dict[str, Any]], capture_radius_km: float) -> di
         "final_range_km": float(ranges[-1]),
         "mean_est_error_km": float(est_errors.mean()) if est_errors.size else 0.0,
         "zone_violation_count": violations,
+        "safety_margin_violation_count": safety_violations,
         "done_reason": str(rows[-1]["done_reason"]),
     }
 
@@ -156,6 +178,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(int(args.seed))
+    safe_controller = Phase3SafeController()
     all_rows: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
     for ep in range(int(args.episodes)):
@@ -178,12 +201,19 @@ def main() -> None:
                 rng=rng,
             )
             _set_paper1_goal_from_estimate(bridge, estimate, float(args.target_z_km))
-            action = _controller_action(aircraft, estimate)
+            action = _select_controller_action(
+                aircraft,
+                estimate,
+                zones,
+                controller=str(args.controller),
+                safe_controller=safe_controller,
+            )
             target_pos = np.asarray(truth.pos_world, dtype=float)
             aircraft_pos = np.asarray(aircraft.pos_world, dtype=float)
             range_to_target = float(np.linalg.norm(aircraft_pos[:3] - target_pos[:3]))
             est_error = float(np.linalg.norm(np.asarray(estimate.pos_world_est, dtype=float)[:3] - target_pos[:3]))
-            violation = _zone_violation(aircraft_pos, zones)
+            violation = _zone_violation(aircraft_pos, zones, include_safety_margin=False)
+            safety_violation = _zone_violation(aircraft_pos, zones, include_safety_margin=True)
 
             step_result = bridge.step(action)
             done_reason = str(step_result.info.reason)
@@ -192,6 +222,7 @@ def main() -> None:
                 "step": int(step_idx),
                 "t": float(aircraft.t),
                 "observer": str(args.observer),
+                "controller": str(args.controller),
                 "aircraft_x": float(aircraft_pos[0]),
                 "aircraft_y": float(aircraft_pos[1]),
                 "aircraft_z": float(aircraft_pos[2]),
@@ -206,6 +237,7 @@ def main() -> None:
                 "range_to_target_km": range_to_target,
                 "target_est_error_km": est_error,
                 "zone_violation": bool(violation),
+                "safety_margin_violation": bool(safety_violation),
                 "done": bool(step_result.done),
                 "done_reason": done_reason,
                 "reward": float(step_result.reward),
@@ -242,6 +274,10 @@ def main() -> None:
     final_ranges = np.asarray([float(s["final_range_km"]) for s in summaries], dtype=float)
     est_errors = np.asarray([float(s["mean_est_error_km"]) for s in summaries], dtype=float)
     violation_counts = np.asarray([int(s["zone_violation_count"]) for s in summaries], dtype=int)
+    safety_violation_counts = np.asarray(
+        [int(s["safety_margin_violation_count"]) for s in summaries],
+        dtype=int,
+    )
     report = {
         "task": "run_phase3_paper1_oracle",
         "purpose": "closed_loop_interface_smoke",
@@ -249,6 +285,7 @@ def main() -> None:
         "paper1_root": None if paper1_root is None else str(paper1_root),
         "env_source": "paper2_local_paper1_physics" if paper1_root is None else "external_paper1",
         "observer": str(args.observer),
+        "controller": str(args.controller),
         "episodes": int(args.episodes),
         "steps_per_episode": int(args.steps),
         "seed": int(args.seed),
@@ -265,10 +302,19 @@ def main() -> None:
             "target_est_error_mean_km": float(est_errors.mean()) if est_errors.size else 0.0,
             "zone_violation_total": int(violation_counts.sum()) if violation_counts.size else 0,
             "zone_violation_episode_count": int((violation_counts > 0).sum()) if violation_counts.size else 0,
+            "safety_margin_violation_total": int(safety_violation_counts.sum())
+            if safety_violation_counts.size
+            else 0,
+            "safety_margin_violation_episode_count": int((safety_violation_counts > 0).sum())
+            if safety_violation_counts.size
+            else 0,
         },
         "acceptance": {
             "all_episodes_ran": bool(len(summaries) == int(args.episodes)),
             "no_zone_violations": bool((violation_counts.sum() if violation_counts.size else 0) == 0),
+            "no_safety_margin_violations": bool(
+                (safety_violation_counts.sum() if safety_violation_counts.size else 0) == 0
+            ),
             "gt_est_error_zero": bool(str(args.observer) != "gt" or (est_errors.size > 0 and float(est_errors.max()) < 1e-9)),
             "finite_ranges": bool(np.isfinite(min_ranges).all() and np.isfinite(final_ranges).all()),
         },
