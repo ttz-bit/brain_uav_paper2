@@ -62,6 +62,7 @@ def main() -> None:
         "aircraft_pos_shape": list(obs0.aircraft_pos_world.shape),
         "target_pos_shape": list(obs0.target_pos_world.shape),
         "truth_crop_center_shape": list(obs0.truth_crop_center_world.shape),
+        "paper1_policy_obs_shape": list(np.asarray(bridge.env._get_obs()).shape),
         "zone_count": len(zones),
         "zone_geometries": sorted({z.geometry for z in zones}),
         "reasons": reasons,

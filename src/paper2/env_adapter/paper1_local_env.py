@@ -23,9 +23,11 @@ class ScenarioConfig:
     world_z_max: float | None = None
     goal_radius: float = 5.0
     max_steps: int = 1000
+    nearest_zone_count: int = 3
     no_fly_count_range: tuple[int, int] = (1, 3)
     no_fly_radius_range: tuple[float, float] = (200.0, 250.0)
     warning_distance: float = 80.0
+    ground_warning_height: float = 40.0
     no_fly_clearance: float = 120.0
     start_z_ratio_range: tuple[float, float] = (0.18, 0.36)
     goal_z_ratio_range: tuple[float, float] = (0.18, 0.36)
@@ -77,6 +79,7 @@ class StaticNoFlyTrajectoryEnv:
         self.goal = np.zeros(3, dtype=np.float32)
         self.zones: list[Zone] = []
         self.steps = 0
+        self.last_delta_z = 0.0
         self._prev_goal_distance = 0.0
         self._outcome = "running"
 
@@ -85,6 +88,7 @@ class StaticNoFlyTrajectoryEnv:
             self.rng = np.random.default_rng(seed)
         del options
         self.steps = 0
+        self.last_delta_z = 0.0
         self._outcome = "running"
         self.state, self.goal, self.zones = self._sample_scenario()
         self._prev_goal_distance = self._goal_distance()
@@ -182,6 +186,7 @@ class StaticNoFlyTrajectoryEnv:
         delta_psi = float(np.clip(action[1], -float(s.delta_psi_max), float(s.delta_psi_max)))
         gamma = float(np.clip(float(self.state[3]) + delta_gamma, -float(s.gamma_max), float(s.gamma_max)))
         psi = _wrap_angle(float(self.state[4]) + delta_psi)
+        prev_z = float(self.state[2])
         step = float(s.speed) * float(s.dt)
         dx = step * math.cos(gamma) * math.cos(psi)
         dy = step * math.cos(gamma) * math.sin(psi)
@@ -189,6 +194,7 @@ class StaticNoFlyTrajectoryEnv:
         self.state[:3] = (self.state[:3].astype(float) + np.array([dx, dy, dz], dtype=float)).astype(np.float32)
         self.state[3] = np.float32(gamma)
         self.state[4] = np.float32(psi)
+        self.last_delta_z = float(self.state[2]) - prev_z
 
     def _termination(self) -> tuple[bool, bool, str]:
         s = self.scenario
@@ -218,13 +224,35 @@ class StaticNoFlyTrajectoryEnv:
         return float(reward)
 
     def _get_obs(self) -> np.ndarray:
-        rel = self.goal.astype(float) - self.state[:3].astype(float)
+        rel_goal = self.goal.astype(float) - self.state[:3].astype(float)
+        extra_features = np.array(
+            [
+                float(self.state[2] - self.scenario.ground_warning_height),
+                float(self.scenario.world_z_max - self.state[2]),
+                float(self.last_delta_z),
+                1.0 if self.last_delta_z < 0.0 else 0.0,
+            ],
+            dtype=np.float32,
+        )
+        zone_features: list[float] = []
+        sorted_zones = sorted(self.zones, key=lambda zone: np.linalg.norm(zone.center_xy - self.state[:2]))
+        for zone in sorted_zones[: int(self.scenario.nearest_zone_count)]:
+            dx, dy = zone.center_xy.astype(float) - self.state[:2].astype(float)
+            r_xy = float(np.linalg.norm([dx, dy]))
+            if r_xy < float(zone.radius):
+                z_cap = math.sqrt(max(float(zone.radius) ** 2 - r_xy**2, 0.0))
+            else:
+                z_cap = 0.0
+            z_margin_to_dome = float(self.state[2] - z_cap)
+            zone_features.extend([float(dx), float(dy), float(zone.radius), z_margin_to_dome])
+        while len(zone_features) < int(self.scenario.nearest_zone_count) * 4:
+            zone_features.extend([0.0, 0.0, 0.0, 0.0])
         return np.concatenate(
             [
                 self.state.astype(float),
-                self.goal.astype(float),
-                rel,
-                np.array([self._goal_distance()], dtype=float),
+                rel_goal.astype(float),
+                extra_features.astype(float),
+                np.array(zone_features, dtype=float),
             ]
         ).astype(np.float32)
 
