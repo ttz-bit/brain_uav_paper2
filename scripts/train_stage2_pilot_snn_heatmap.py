@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from paper2.datasets.stage2_rendered_dataset import build_stage2_rendered_dataset
-from paper2.models.snn_heatmap import HeatmapSNN, heatmap_loss, peak_argmax_2d
+from paper2.models.snn_heatmap import HeatmapSNN, heatmap_loss, peak_argmax_2d, soft_argmax_2d
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--coord-weight", type=float, default=5.0)
     p.add_argument("--conf-weight", type=float, default=0.2)
     p.add_argument("--softargmax-temperature", type=float, default=20.0)
+    p.add_argument("--decode-method", type=str, default="softargmax", choices=["argmax", "softargmax"])
     p.add_argument("--train-encoding", type=str, default="direct", choices=["rate", "direct"])
     p.add_argument("--eval-encoding", type=str, default="direct", choices=["rate", "direct"])
     p.add_argument("--eval-interval", type=int, default=1)
@@ -232,7 +233,8 @@ def main() -> None:
         model.eval()
         total = 0.0
         count = 0
-        px_errors: list[float] = []
+        argmax_px_errors: list[float] = []
+        softargmax_px_errors: list[float] = []
         center_errors: list[float] = []
         pred_x_px: list[float] = []
         pred_y_px: list[float] = []
@@ -246,15 +248,23 @@ def main() -> None:
                 n = int(e - s)
                 total += float(loss.item()) * n
                 count += n
-                pred_xy = peak_argmax_2d(outputs["heatmap_logits"]).detach().cpu().numpy()
+                argmax_xy = peak_argmax_2d(outputs["heatmap_logits"]).detach().cpu().numpy()
+                soft_xy = soft_argmax_2d(
+                    outputs["heatmap_logits"],
+                    temperature=float(args.softargmax_temperature),
+                ).detach().cpu().numpy()
+                pred_xy = soft_xy if str(args.decode_method) == "softargmax" else argmax_xy
                 gt_xy = y_np[s:e, :2]
-                for pxy, gxy in zip(pred_xy, gt_xy):
-                    err = _pixel_error_norm(pxy, gxy, int(args.input_size), int(args.input_size))
+                for arg_xy, soft_pred_xy, pxy, gxy in zip(argmax_xy, soft_xy, pred_xy, gt_xy):
+                    arg_err = _pixel_error_norm(arg_xy, gxy, int(args.input_size), int(args.input_size))
+                    soft_err = _pixel_error_norm(soft_pred_xy, gxy, int(args.input_size), int(args.input_size))
                     center_err = _pixel_error_norm(np.array([0.5, 0.5], dtype=np.float32), gxy, int(args.input_size), int(args.input_size))
-                    px_errors.append(err)
+                    argmax_px_errors.append(arg_err)
+                    softargmax_px_errors.append(soft_err)
                     center_errors.append(center_err)
                     pred_x_px.append(float(np.clip(pxy[0], 0.0, 1.0) * int(args.input_size)))
                     pred_y_px.append(float(np.clip(pxy[1], 0.0, 1.0) * int(args.input_size)))
+        px_errors = softargmax_px_errors if str(args.decode_method) == "softargmax" else argmax_px_errors
         px_mean = float(np.mean(px_errors)) if px_errors else 0.0
         center_mean = float(np.mean(center_errors)) if center_errors else 0.0
         rounded_unique = {(int(round(x)), int(round(y))) for x, y in zip(pred_x_px, pred_y_px)}
@@ -262,6 +272,10 @@ def main() -> None:
             "loss": total / max(1, count),
             "pixel_error_mean": px_mean,
             "pixel_error_p90": float(np.percentile(px_errors, 90)) if px_errors else 0.0,
+            "argmax_pixel_error_mean": float(np.mean(argmax_px_errors)) if argmax_px_errors else 0.0,
+            "argmax_pixel_error_p90": float(np.percentile(argmax_px_errors, 90)) if argmax_px_errors else 0.0,
+            "softargmax_pixel_error_mean": float(np.mean(softargmax_px_errors)) if softargmax_px_errors else 0.0,
+            "softargmax_pixel_error_p90": float(np.percentile(softargmax_px_errors, 90)) if softargmax_px_errors else 0.0,
             "center_baseline_pixel_error_mean": center_mean,
             "center_baseline_improve_ratio": float((center_mean - px_mean) / max(center_mean, 1e-12)) if center_errors else 0.0,
             "pred_x_std_px": float(np.std(pred_x_px)) if pred_x_px else 0.0,
@@ -353,7 +367,7 @@ def main() -> None:
                     "beta": float(args.beta),
                     "train_encoding": str(args.train_encoding),
                     "eval_encoding": str(args.eval_encoding),
-                    "decode_method": "heatmap_argmax",
+                    "decode_method": str(args.decode_method),
                 },
                 best_path,
             )
@@ -385,7 +399,7 @@ def main() -> None:
             "beta": float(args.beta),
             "train_encoding": str(args.train_encoding),
             "eval_encoding": str(args.eval_encoding),
-            "decode_method": "heatmap_argmax",
+            "decode_method": str(args.decode_method),
         },
         last_path,
     )
@@ -405,7 +419,13 @@ def main() -> None:
                 s = ds[int(idx)]
                 x = torch.from_numpy(_to_tensor_image(s.image, input_size=int(args.input_size))).unsqueeze(0).to(device)
                 outputs = model(x, stochastic=False)
-                pred_xy = peak_argmax_2d(outputs["heatmap_logits"])[0].detach().cpu().numpy()
+                if str(args.decode_method) == "softargmax":
+                    pred_xy = soft_argmax_2d(
+                        outputs["heatmap_logits"],
+                        temperature=float(args.softargmax_temperature),
+                    )[0].detach().cpu().numpy()
+                else:
+                    pred_xy = peak_argmax_2d(outputs["heatmap_logits"])[0].detach().cpu().numpy()
                 gt = _target_from_sample(s)
                 err = _pixel_error_norm(pred_xy, gt[:2], s.image.shape[0], s.image.shape[1])
                 vis = _make_visual(s.image, pred_xy, gt, tag=tag, err=err)
@@ -426,7 +446,7 @@ def main() -> None:
         "model": {
             "type": "snn_heatmap",
             "output": "64x64 heatmap + confidence by default",
-            "decode_method": "heatmap_argmax",
+            "decode_method": str(args.decode_method),
         },
         "hyperparams": {
             "batch_size": int(args.batch_size),
@@ -445,6 +465,7 @@ def main() -> None:
             "coord_weight": float(args.coord_weight),
             "conf_weight": float(args.conf_weight),
             "softargmax_temperature": float(args.softargmax_temperature),
+            "decode_method": str(args.decode_method),
             "eval_interval": int(eval_interval),
             "eval_batch_size": int(eval_batch_size),
             "val_eval_max_samples": int(val_eval_count),
@@ -474,6 +495,10 @@ def main() -> None:
             "val_improve_ratio": float(val_improve_ratio),
             "train_final_pixel_error_mean": float(train_final["pixel_error_mean"]),
             "val_final_pixel_error_mean": float(val_final["pixel_error_mean"]),
+            "train_final_argmax_pixel_error_mean": float(train_final["argmax_pixel_error_mean"]),
+            "val_final_argmax_pixel_error_mean": float(val_final["argmax_pixel_error_mean"]),
+            "train_final_softargmax_pixel_error_mean": float(train_final["softargmax_pixel_error_mean"]),
+            "val_final_softargmax_pixel_error_mean": float(val_final["softargmax_pixel_error_mean"]),
             "train_center_baseline_improve_ratio": float(train_final["center_baseline_improve_ratio"]),
             "val_center_baseline_improve_ratio": float(val_final["center_baseline_improve_ratio"]),
             "val_rounded_unique_pred_xy": int(val_final["rounded_unique_pred_xy"]),

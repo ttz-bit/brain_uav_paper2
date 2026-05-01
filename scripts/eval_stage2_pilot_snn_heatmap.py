@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from paper2.datasets.stage2_rendered_dataset import build_stage2_rendered_dataset
-from paper2.models.snn_heatmap import HeatmapSNN, heatmap_loss, peak_argmax_2d
+from paper2.models.snn_heatmap import HeatmapSNN, heatmap_loss, peak_argmax_2d, soft_argmax_2d
 
 
 def parse_args() -> argparse.Namespace:
@@ -20,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--input-size", type=int, default=0)
     p.add_argument("--eval-encoding", type=str, default="auto", choices=["auto", "rate", "direct"])
+    p.add_argument("--decode-method", type=str, default="auto", choices=["auto", "argmax", "softargmax"])
     p.add_argument("--visual-audit-count", type=int, default=16)
     p.add_argument("--offcenter-threshold-px", type=float, default=20.0)
     p.add_argument("--min-center-improve-ratio", type=float, default=0.10)
@@ -216,6 +217,10 @@ def main() -> None:
     ckpt_train_encoding = str(ckpt.get("train_encoding", "rate"))
     ckpt_eval_encoding = str(ckpt.get("eval_encoding", "direct"))
     eval_encoding = ckpt_eval_encoding if args.eval_encoding == "auto" else str(args.eval_encoding)
+    ckpt_decode_method = str(ckpt.get("decode_method", "softargmax"))
+    if ckpt_decode_method == "heatmap_argmax":
+        ckpt_decode_method = "argmax"
+    decode_method = ckpt_decode_method if args.decode_method == "auto" else str(args.decode_method)
 
     model = HeatmapSNN(
         beta=float(ckpt.get("beta", 0.95)),
@@ -228,6 +233,8 @@ def main() -> None:
 
     losses: list[float] = []
     px_errors: list[float] = []
+    argmax_px_errors: list[float] = []
+    softargmax_px_errors: list[float] = []
     center_errors: list[float] = []
     offcenter_px_errors: list[float] = []
     offcenter_center_errors: list[float] = []
@@ -260,13 +267,22 @@ def main() -> None:
                 softargmax_temperature=softargmax_temperature,
             )
             losses.append(float(loss.item()))
-            pred_xy = peak_argmax_2d(outputs["heatmap_logits"])[0].detach().cpu().numpy()
+            argmax_xy = peak_argmax_2d(outputs["heatmap_logits"])[0].detach().cpu().numpy()
+            soft_xy = soft_argmax_2d(
+                outputs["heatmap_logits"],
+                temperature=softargmax_temperature,
+            )[0].detach().cpu().numpy()
+            pred_xy = soft_xy if decode_method == "softargmax" else argmax_xy
             pred_conf = float(torch.sigmoid(outputs["conf_logits"])[0].detach().cpu().item())
 
             h, w = s.image.shape[:2]
             err = _pixel_error_norm(pred_xy, gt[:2], h, w)
+            arg_err = _pixel_error_norm(argmax_xy, gt[:2], h, w)
+            soft_err = _pixel_error_norm(soft_xy, gt[:2], h, w)
             center_err = _pixel_error_norm(np.array([0.5, 0.5], dtype=np.float32), gt[:2], h, w)
             px_errors.append(err)
+            argmax_px_errors.append(arg_err)
+            softargmax_px_errors.append(soft_err)
             center_errors.append(center_err)
             if center_err >= float(args.offcenter_threshold_px):
                 offcenter_px_errors.append(err)
@@ -296,6 +312,8 @@ def main() -> None:
                 "stage": st,
                 "background_category": bg,
                 "pixel_error": err,
+                "argmax_pixel_error": arg_err,
+                "softargmax_pixel_error": soft_err,
                 "center_baseline_pixel_error": center_err,
                 "center_baseline_delta": center_err - err,
                 "pred_xy": [float(v) for v in pred_xy.tolist()],
@@ -383,7 +401,8 @@ def main() -> None:
             "eval_encoding": str(eval_encoding),
             "checkpoint_train_encoding": str(ckpt_train_encoding),
             "checkpoint_eval_encoding": str(ckpt_eval_encoding),
-            "decode_method": "heatmap_argmax",
+            "checkpoint_decode_method": str(ckpt_decode_method),
+            "decode_method": str(decode_method),
             "loss_kind": str(ckpt.get("loss_kind", "unknown")),
         },
         "metrics": {
@@ -391,6 +410,10 @@ def main() -> None:
             "eval_loss_p90": _p90(losses),
             "pixel_error_mean": px_mean,
             "pixel_error_p90": _p90(px_errors),
+            "argmax_pixel_error_mean": _mean(argmax_px_errors),
+            "argmax_pixel_error_p90": _p90(argmax_px_errors),
+            "softargmax_pixel_error_mean": _mean(softargmax_px_errors),
+            "softargmax_pixel_error_p90": _p90(softargmax_px_errors),
             "center_baseline_pixel_error_mean": center_mean,
             "center_baseline_pixel_error_p90": _p90(center_errors),
             "center_baseline_improve_ratio": center_improve_ratio,
