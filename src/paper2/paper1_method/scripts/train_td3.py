@@ -165,9 +165,6 @@ def export_episode_result(
 ) -> dict[str, str]:
     """Save one episode's scenario parameters, trajectory and visualization."""
 
-    import matplotlib.pyplot as plt
-    import numpy as np
-
     target_dir = ensure_dir(target_dir)
     json_path = target_dir / f'{stem}.json'
     png_path = target_dir / f'{stem}.png'
@@ -188,6 +185,12 @@ def export_episode_result(
         'config': config_payload,
     }
     save_json(json_path, payload)
+
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ModuleNotFoundError:
+        return {'json': str(json_path), 'png': 'skipped_matplotlib_unavailable'}
 
     traj = np.asarray(record['trajectory'], dtype=float)
     start = np.asarray(record['scenario']['state'][:3], dtype=float)
