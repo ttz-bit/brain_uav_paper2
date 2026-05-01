@@ -41,7 +41,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-encoding", type=str, default="direct", choices=["rate", "direct"])
     p.add_argument("--eval-interval", type=int, default=1)
     p.add_argument("--eval-batch-size", type=int, default=128)
+    p.add_argument("--train-eval-max-samples", type=int, default=2048)
     p.add_argument("--val-eval-max-samples", type=int, default=0)
+    p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--num-threads", type=int, default=0)
     p.add_argument("--num-interop-threads", type=int, default=0)
     p.add_argument("--strict-no-leak", action="store_true")
@@ -180,33 +182,30 @@ def main() -> None:
     train_ds = build_stage2_rendered_dataset(root=dataset_root, split=args.train_split, project_root=project_root, max_samples=args.max_train_samples)
     val_ds = build_stage2_rendered_dataset(root=dataset_root, split=args.val_split, project_root=project_root, max_samples=args.max_val_samples)
 
-    t_materialize_begin = time.perf_counter()
-
-    def _materialize(ds):
-        xs = []
-        ys = []
-        for i in range(len(ds)):
-            s = ds[i]
-            xs.append(_to_tensor_image(s.image, input_size=int(args.input_size)))
-            ys.append(_target_from_sample(s))
-        return np.stack(xs, axis=0).astype(np.float32), np.stack(ys, axis=0).astype(np.float32)
-
-    x_train, y_train = _materialize(train_ds)
-    x_val, y_val = _materialize(val_ds)
-    materialize_sec = float(time.perf_counter() - t_materialize_begin)
-
-    class _NumpyDataset(Dataset):
-        def __init__(self, x: np.ndarray, y: np.ndarray):
-            self.x = x
-            self.y = y
+    class _RenderedTorchDataset(Dataset):
+        def __init__(self, ds, indices: np.ndarray | None = None):
+            self.ds = ds
+            self.indices = indices
 
         def __len__(self) -> int:
-            return int(self.x.shape[0])
+            return int(len(self.ds) if self.indices is None else len(self.indices))
 
         def __getitem__(self, idx: int):
-            return torch.from_numpy(self.x[idx]), torch.from_numpy(self.y[idx])
+            src_idx = int(idx if self.indices is None else self.indices[int(idx)])
+            sample = self.ds[src_idx]
+            x = _to_tensor_image(sample.image, input_size=int(args.input_size))
+            y = _target_from_sample(sample)
+            return torch.from_numpy(x), torch.from_numpy(y)
 
-    loader = DataLoader(_NumpyDataset(x_train, y_train), batch_size=max(1, int(args.batch_size)), shuffle=True, drop_last=False)
+    num_workers = max(0, int(args.num_workers))
+    loader = DataLoader(
+        _RenderedTorchDataset(train_ds),
+        batch_size=max(1, int(args.batch_size)),
+        shuffle=True,
+        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=(device == "cuda"),
+    )
     model = HeatmapSNN(
         beta=float(args.beta),
         num_steps=int(args.num_steps),
@@ -229,7 +228,33 @@ def main() -> None:
 
     eval_batch_size = max(1, int(args.eval_batch_size))
 
-    def _eval_numpy(x_np: np.ndarray, y_np: np.ndarray) -> dict[str, float]:
+    def _sample_indices(n: int, max_samples: int) -> np.ndarray | None:
+        if int(max_samples) <= 0 or int(n) <= int(max_samples):
+            return None
+        return rng.choice(int(n), size=int(max_samples), replace=False).astype(np.int64)
+
+    train_eval_indices = _sample_indices(len(train_ds), int(args.train_eval_max_samples))
+    val_eval_indices = _sample_indices(len(val_ds), int(args.val_eval_max_samples))
+    train_eval_count = int(len(train_ds) if train_eval_indices is None else len(train_eval_indices))
+    val_eval_count = int(len(val_ds) if val_eval_indices is None else len(val_eval_indices))
+    train_eval_loader = DataLoader(
+        _RenderedTorchDataset(train_ds, train_eval_indices),
+        batch_size=max(1, int(args.eval_batch_size)),
+        shuffle=False,
+        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=(device == "cuda"),
+    )
+    val_eval_loader = DataLoader(
+        _RenderedTorchDataset(val_ds, val_eval_indices),
+        batch_size=max(1, int(args.eval_batch_size)),
+        shuffle=False,
+        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=(device == "cuda"),
+    )
+
+    def _eval_loader(eval_loader) -> dict[str, float]:
         model.eval()
         total = 0.0
         count = 0
@@ -239,13 +264,12 @@ def main() -> None:
         pred_x_px: list[float] = []
         pred_y_px: list[float] = []
         with torch.no_grad():
-            for s in range(0, int(x_np.shape[0]), eval_batch_size):
-                e = min(s + eval_batch_size, int(x_np.shape[0]))
-                xb = torch.from_numpy(x_np[s:e]).to(device)
-                yb = torch.from_numpy(y_np[s:e]).to(device)
+            for xb, yb in eval_loader:
+                xb = xb.to(device, non_blocking=(device == "cuda"))
+                yb = yb.to(device, non_blocking=(device == "cuda"))
                 outputs = model(xb, stochastic=False)
                 loss, _ = _loss(outputs, yb)
-                n = int(e - s)
+                n = int(xb.shape[0])
                 total += float(loss.item()) * n
                 count += n
                 argmax_xy = peak_argmax_2d(outputs["heatmap_logits"]).detach().cpu().numpy()
@@ -254,7 +278,7 @@ def main() -> None:
                     temperature=float(args.softargmax_temperature),
                 ).detach().cpu().numpy()
                 pred_xy = soft_xy if str(args.decode_method) == "softargmax" else argmax_xy
-                gt_xy = y_np[s:e, :2]
+                gt_xy = yb[:, :2].detach().cpu().numpy()
                 for arg_xy, soft_pred_xy, pxy, gxy in zip(argmax_xy, soft_xy, pred_xy, gt_xy):
                     arg_err = _pixel_error_norm(arg_xy, gxy, int(args.input_size), int(args.input_size))
                     soft_err = _pixel_error_norm(soft_pred_xy, gxy, int(args.input_size), int(args.input_size))
@@ -284,16 +308,8 @@ def main() -> None:
         }
 
     with torch.no_grad():
-        train_initial = _eval_numpy(x_train, y_train)
-        val_initial = _eval_numpy(x_val, y_val)
-
-    val_eval_x, val_eval_y = x_val, y_val
-    val_eval_count = int(x_val.shape[0])
-    if int(args.val_eval_max_samples) > 0 and int(x_val.shape[0]) > int(args.val_eval_max_samples):
-        idx = rng.choice(int(x_val.shape[0]), size=int(args.val_eval_max_samples), replace=False)
-        val_eval_x = x_val[idx]
-        val_eval_y = y_val[idx]
-        val_eval_count = int(args.val_eval_max_samples)
+        train_initial = _eval_loader(train_eval_loader)
+        val_initial = _eval_loader(val_eval_loader)
 
     best_val = float("inf")
     best_path = out_dir / "model_best.pth"
@@ -310,8 +326,8 @@ def main() -> None:
         batch_parts: list[dict[str, float]] = []
         t_train_loop_begin = time.perf_counter()
         for xb, yb in loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
+            xb = xb.to(device, non_blocking=(device == "cuda"))
+            yb = yb.to(device, non_blocking=(device == "cuda"))
             optimizer.zero_grad(set_to_none=True)
             outputs = model(xb, stochastic=True)
             loss, parts = _loss(outputs, yb)
@@ -326,7 +342,7 @@ def main() -> None:
         val_loss = float("nan")
         if do_eval:
             t_eval_begin = time.perf_counter()
-            val_metrics = _eval_numpy(val_eval_x, val_eval_y)
+            val_metrics = _eval_loader(val_eval_loader)
             val_loss = float(val_metrics["loss"])
             val_eval_sec_total += float(time.perf_counter() - t_eval_begin)
         else:
@@ -406,8 +422,8 @@ def main() -> None:
 
     ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt["state_dict"])
-    train_final = _eval_numpy(x_train, y_train)
-    val_final = _eval_numpy(x_val, y_val)
+    train_final = _eval_loader(train_eval_loader)
+    val_final = _eval_loader(val_eval_loader)
     train_improve_ratio = (float(train_initial["loss"]) - float(train_final["loss"])) / max(float(train_initial["loss"]), 1e-12)
     val_improve_ratio = (float(val_initial["loss"]) - float(val_final["loss"])) / max(float(val_initial["loss"]), 1e-12)
 
@@ -468,12 +484,15 @@ def main() -> None:
             "decode_method": str(args.decode_method),
             "eval_interval": int(eval_interval),
             "eval_batch_size": int(eval_batch_size),
+            "train_eval_max_samples": int(train_eval_count),
             "val_eval_max_samples": int(val_eval_count),
+            "num_workers": int(num_workers),
             "num_threads": int(torch.get_num_threads()),
             "num_interop_threads": int(torch.get_num_interop_threads()),
         },
         "timing": {
-            "materialize_sec": float(materialize_sec),
+            "materialize_sec": 0.0,
+            "streaming_dataset": True,
             "train_loop_sec_total": float(train_loop_sec_total),
             "val_eval_sec_total": float(val_eval_sec_total),
             "epoch_sec_mean": float(np.mean(epoch_time_sec)) if epoch_time_sec else 0.0,
