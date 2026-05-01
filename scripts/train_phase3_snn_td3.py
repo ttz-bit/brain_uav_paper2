@@ -28,6 +28,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bc-updates", type=int, default=0)
     p.add_argument("--bc-batch-size", type=int, default=128)
     p.add_argument("--bc-learning-rate", type=float, default=1e-3)
+    p.add_argument("--bc-eval-episodes", type=int, default=4)
+    p.add_argument("--bc-heldout-steps", type=int, default=2048)
     p.add_argument("--actor-lr", type=float, default=1e-3)
     p.add_argument("--critic-lr", type=float, default=1e-3)
     p.add_argument("--gamma", type=float, default=0.99)
@@ -130,8 +132,17 @@ def main() -> None:
     replay = ReplayBuffer(int(args.replay_size))
     bc_trace: list[dict[str, Any]] = []
     bc_reference_actor = None
+    expert_eval: dict[str, Any] = {}
+    bc_eval: dict[str, Any] = {}
+    bc_action_fit: dict[str, Any] = {}
 
     if int(args.bc_steps) > 0:
+        expert_eval = _evaluate_expert_policy(
+            seed=int(args.seed) + 3571,
+            episodes=int(args.bc_eval_episodes),
+            action_low=action_low,
+            action_high=action_high,
+        )
         bc_trace = _behavior_clone_actor(
             torch=torch,
             actor=actor,
@@ -148,6 +159,29 @@ def main() -> None:
             bc_reference_actor.eval()
             for param in bc_reference_actor.parameters():
                 param.requires_grad = False
+        bc_eval = _evaluate_policy(
+            torch,
+            actor,
+            device,
+            seed=int(args.seed) + 3571,
+            episodes=int(args.bc_eval_episodes),
+            action_low=action_low,
+            action_high=action_high,
+        )
+        bc_action_fit = _evaluate_bc_action_fit(
+            torch=torch,
+            actor=actor,
+            device=device,
+            seed=int(args.seed) + 4243,
+            steps=int(args.bc_heldout_steps),
+            action_low=action_low,
+            action_high=action_high,
+        )
+        print(
+            f"[BC-EVAL] expert_outcomes={expert_eval.get('outcomes', {})} "
+            f"actor_outcomes={bc_eval.get('outcomes', {})} "
+            f"heldout_action_rmse={bc_action_fit.get('action_rmse', 0.0):.6f}"
+        )
 
     obs, _ = env.reset(seed=int(args.seed))
     ep_return = 0.0
@@ -329,8 +363,13 @@ def main() -> None:
             "bc_updates": int(args.bc_updates),
             "bc_batch_size": int(args.bc_batch_size),
             "bc_learning_rate": float(args.bc_learning_rate),
+            "bc_eval_episodes": int(args.bc_eval_episodes),
+            "bc_heldout_steps": int(args.bc_heldout_steps),
             "final_bc_loss": float(bc_trace[-1]["bc_loss"]) if bc_trace else None,
             "bc_regularization": bool(args.bc_regularization),
+            "expert_eval": expert_eval,
+            "bc_actor_eval": bc_eval,
+            "bc_action_fit": bc_action_fit,
         },
         "warmup_strategy": str(args.warmup_strategy),
         "actor_freeze_steps": int(args.actor_freeze_steps),
@@ -587,6 +626,125 @@ def _evaluate_policy(
         "steps_total": int(steps_total),
         "avg_return": float(np.mean(returns)) if returns else 0.0,
     }
+
+
+def _evaluate_expert_policy(
+    *,
+    seed: int,
+    episodes: int,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+) -> dict[str, Any]:
+    captures = 0
+    collisions = 0
+    ground = 0
+    boundary = 0
+    timeouts = 0
+    steps_total = 0
+    returns = []
+    outcomes: dict[str, int] = {}
+    for ep in range(int(episodes)):
+        bridge = Paper1EnvBridge(seed=int(seed) + ep)
+        obs, _ = bridge.env.reset(seed=int(seed) + ep)
+        done = False
+        ep_return = 0.0
+        info: dict[str, Any] = {}
+        while not done:
+            action = _expert_action(bridge.env, action_low, action_high)
+            obs, reward, terminated, truncated, info = bridge.env.step(action)
+            ep_return += float(reward)
+            steps_total += 1
+            done = bool(terminated or truncated)
+        outcome = str(info.get("outcome", "unknown"))
+        outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        captures += int(outcome == "goal")
+        collisions += int(outcome == "collision")
+        ground += int(outcome == "ground")
+        boundary += int(outcome == "boundary")
+        timeouts += int(outcome == "timeout")
+        returns.append(ep_return)
+    return {
+        "episodes": int(episodes),
+        "outcomes": outcomes,
+        "capture_count": int(captures),
+        "capture_rate": float(captures / max(1, episodes)),
+        "collision_count": int(collisions),
+        "ground_count": int(ground),
+        "boundary_count": int(boundary),
+        "timeout_count": int(timeouts),
+        "steps_total": int(steps_total),
+        "avg_return": float(np.mean(returns)) if returns else 0.0,
+    }
+
+
+def _evaluate_bc_action_fit(
+    *,
+    torch: Any,
+    actor: Any,
+    device: str,
+    seed: int,
+    steps: int,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+) -> dict[str, Any]:
+    obs_arr, action_arr, outcomes = _collect_expert_rollout_for_fit(
+        seed=int(seed),
+        steps=int(steps),
+        action_low=action_low,
+        action_high=action_high,
+    )
+    if obs_arr.size == 0:
+        return {
+            "samples": 0,
+            "action_mse": None,
+            "action_rmse": None,
+            "action_mae": None,
+            "expert_outcomes": outcomes,
+        }
+    with torch.no_grad():
+        pred = actor(torch.tensor(obs_arr, dtype=torch.float32, device=device)).detach().cpu().numpy()
+    err = pred.astype(np.float64) - action_arr.astype(np.float64)
+    abs_err = np.abs(err)
+    return {
+        "samples": int(obs_arr.shape[0]),
+        "action_mse": float(np.mean(err**2)),
+        "action_rmse": float(np.sqrt(np.mean(err**2))),
+        "action_mae": float(np.mean(abs_err)),
+        "delta_gamma_mae": float(np.mean(abs_err[:, 0])),
+        "delta_psi_mae": float(np.mean(abs_err[:, 1])),
+        "delta_gamma_p90_abs": float(np.percentile(abs_err[:, 0], 90)),
+        "delta_psi_p90_abs": float(np.percentile(abs_err[:, 1], 90)),
+        "expert_outcomes": outcomes,
+    }
+
+
+def _collect_expert_rollout_for_fit(
+    *,
+    seed: int,
+    steps: int,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
+    bridge = Paper1EnvBridge(seed=int(seed))
+    env = bridge.env
+    obs, _ = env.reset(seed=int(seed))
+    obs_list: list[np.ndarray] = []
+    action_list: list[np.ndarray] = []
+    outcomes: dict[str, int] = {}
+    for _ in range(max(0, int(steps))):
+        action = _expert_action(env, action_low, action_high)
+        next_obs, _, terminated, truncated, info = env.step(action)
+        obs_list.append(np.asarray(obs, dtype=np.float32))
+        action_list.append(np.asarray(action, dtype=np.float32))
+        if bool(terminated or truncated):
+            outcome = str(info.get("outcome", "unknown"))
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            obs, _ = env.reset()
+        else:
+            obs = next_obs
+    if not obs_list:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32), outcomes
+    return np.stack(obs_list).astype(np.float32), np.stack(action_list).astype(np.float32), outcomes
 
 
 def _compute_actor_loss_terms(
