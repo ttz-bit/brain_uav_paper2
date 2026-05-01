@@ -38,6 +38,7 @@ class Paper1EnvBridge:
         paper1_root: str | Path | None = None,
         world_size_km: float | None = None,
         seed: int | None = None,
+        curriculum_mix: Any | None = None,
     ) -> None:
         env_source_override: str | None = None
         if env is None:
@@ -57,7 +58,15 @@ class Paper1EnvBridge:
                 from brain_uav.envs import StaticNoFlyTrajectoryEnv
 
                 env_source_override = "external_paper1"
-            env = StaticNoFlyTrajectoryEnv(ScenarioConfig(), RewardConfig(), seed=seed)
+            try:
+                env = StaticNoFlyTrajectoryEnv(
+                    ScenarioConfig(),
+                    RewardConfig(),
+                    seed=seed,
+                    curriculum_mix=curriculum_mix,
+                )
+            except TypeError:
+                env = StaticNoFlyTrajectoryEnv(ScenarioConfig(), RewardConfig(), seed=seed)
         self.env = env
         self.env_source = str(env_source_override or getattr(self.env, "source_name", "external_paper1"))
         self.world_size_km = (

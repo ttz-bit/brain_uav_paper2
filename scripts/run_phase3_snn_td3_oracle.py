@@ -17,6 +17,7 @@ from paper2.env_adapter.phase3_target_motion import (
     sample_phase3_initial_target,
 )
 from paper2.env_adapter.world_frame import paper2_xyz_to_paper1_xyz
+from paper2.paper1_method.curriculum import parse_curriculum_mix
 from paper2.planning.paper1_td3_policy import Paper1TD3Policy
 from paper2.tracking.vision_to_estimate import oracle_target_estimate
 
@@ -26,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", type=str, default="configs/env.yaml")
     p.add_argument("--observer", choices=["gt", "noisy"], default="gt")
     p.add_argument("--target-mode", choices=["paper1_static", "phase3_dynamic"], default="paper1_static")
+    p.add_argument("--paper1-curriculum-level", choices=["easy", "easy_two_zone", "medium", "hard"], default="hard")
+    p.add_argument("--paper1-curriculum-mix", type=str, default=None)
     p.add_argument("--model", choices=["snn", "ann"], default="snn")
     p.add_argument("--td3-checkpoint", type=str, default=None)
     p.add_argument("--allow-random-init", action="store_true")
@@ -129,15 +132,17 @@ def _episode_summary(rows: list[dict[str, Any]], capture_radius_km: float) -> di
     est_errors = np.asarray([float(r["target_est_error_km"]) for r in rows], dtype=float)
     violations = int(sum(1 for r in rows if bool(r["zone_violation"])))
     safety_violations = int(sum(1 for r in rows if bool(r["safety_margin_violation"])))
+    done_reason = str(rows[-1]["done_reason"])
+    captured = bool(done_reason == "captured" or float(ranges.min()) <= float(capture_radius_km))
     return {
         "steps_executed": int(len(rows)),
-        "captured": bool(float(ranges.min()) <= float(capture_radius_km)),
+        "captured": captured,
         "min_range_km": float(ranges.min()),
         "final_range_km": float(ranges[-1]),
         "mean_est_error_km": float(est_errors.mean()) if est_errors.size else 0.0,
         "zone_violation_count": violations,
         "safety_margin_violation_count": safety_violations,
-        "done_reason": str(rows[-1]["done_reason"]),
+        "done_reason": done_reason,
     }
 
 
@@ -153,11 +158,18 @@ def main() -> None:
     summaries: list[dict[str, Any]] = []
     policy: Paper1TD3Policy | None = None
     policy_diag: dict[str, Any] = {}
+    env_source = "unknown"
+    capture_radius_report: float | None = None
+    paper1_curriculum_mix = parse_curriculum_mix(
+        args.paper1_curriculum_mix,
+        fallback_level=str(args.paper1_curriculum_level),
+    )
 
     for ep in range(int(args.episodes)):
         ep_seed = int(args.seed) + ep
         ep_rng = np.random.default_rng(ep_seed)
-        bridge = Paper1EnvBridge(seed=ep_seed)
+        bridge = Paper1EnvBridge(seed=ep_seed, curriculum_mix=paper1_curriculum_mix)
+        env_source = str(bridge.env_source)
         bridge.reset(seed=ep_seed)
         if policy is None:
             policy = Paper1TD3Policy.from_env(
@@ -182,6 +194,7 @@ def main() -> None:
             if args.capture_radius_km is not None
             else float(getattr(bridge.env.scenario, "goal_radius", 5.0))
         )
+        capture_radius_report = capture_radius_km
 
         for step_idx in range(int(args.steps)):
             aircraft = bridge.get_aircraft_state()
@@ -198,14 +211,16 @@ def main() -> None:
             action = policy.act(obs_vec)
 
             target_pos = np.asarray(truth.pos_world, dtype=float)
-            aircraft_pos = np.asarray(aircraft.pos_world, dtype=float)
-            range_to_target = float(np.linalg.norm(aircraft_pos[:3] - target_pos[:3]))
             est_error = float(np.linalg.norm(np.asarray(estimate.pos_world_est, dtype=float)[:3] - target_pos[:3]))
-            violation = _zone_violation(aircraft_pos, zones, include_safety_margin=False)
-            safety_violation = _zone_violation(aircraft_pos, zones, include_safety_margin=True)
 
             step_result = bridge.step(action)
             done_reason = str(step_result.info.reason)
+            aircraft_pos = np.asarray(step_result.observation.aircraft_pos_world, dtype=float)
+            if str(args.target_mode) == "paper1_static":
+                target_pos = np.asarray(step_result.observation.target_pos_world, dtype=float)
+            range_to_target = float(np.linalg.norm(aircraft_pos[:3] - target_pos[:3]))
+            violation = _zone_violation(aircraft_pos, zones, include_safety_margin=False)
+            safety_violation = _zone_violation(aircraft_pos, zones, include_safety_margin=True)
             row = {
                 "episode": int(ep),
                 "step": int(step_idx),
@@ -276,13 +291,15 @@ def main() -> None:
         "purpose": "main_planner_closed_loop_eval",
         "config": str(args.config),
         "paper1_root": None,
-        "env_source": "paper2_local_paper1_physics",
+        "env_source": env_source,
         "planner": f"paper1_{args.model}_td3",
         "checkpoint_path": None if args.td3_checkpoint is None else str(Path(args.td3_checkpoint).expanduser()),
         "random_init": bool(policy.random_init if policy is not None else False),
         "observer": str(args.observer),
         "target_mode": str(args.target_mode),
         "target_z_policy": str(args.target_z_policy),
+        "paper1_curriculum_level": str(args.paper1_curriculum_level),
+        "paper1_curriculum_mix": paper1_curriculum_mix,
         "episodes": int(args.episodes),
         "steps_per_episode": int(args.steps),
         "seed": int(args.seed),
@@ -290,7 +307,7 @@ def main() -> None:
         "capture_radius_km": (
             float(args.capture_radius_km)
             if args.capture_radius_km is not None
-            else float(getattr(Paper1EnvBridge(seed=int(args.seed)).env.scenario, "goal_radius", 5.0))
+            else float(capture_radius_report if capture_radius_report is not None else 5.0)
         ),
         "noise_std_km": float(args.noise_std_km if args.observer == "noisy" else 0.0),
         "policy_diagnostics": policy_diag,
