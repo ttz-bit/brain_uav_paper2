@@ -47,22 +47,48 @@ class HeatmapSNN(nn.Module):
             return self._rate_encode(x)
         return x
 
-    def forward(self, x: torch.Tensor, stochastic: bool = True) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        stochastic: bool = True,
+        *,
+        return_diagnostics: bool = False,
+    ) -> dict[str, torch.Tensor]:
         mem1 = self.lif1.init_leaky()
         mem2 = self.lif2.init_leaky()
         mem3 = self.lif3.init_leaky()
         feat_acc = None
+        spike1_total = None
+        spike2_total = None
+        spike3_total = None
         for _ in range(self.num_steps):
             x_t = self._encode(x, stochastic=stochastic)
             spk1, mem1 = self.lif1(self.conv1(x_t), mem1)
             spk2, mem2 = self.lif2(self.conv2(spk1), mem2)
             spk3, mem3 = self.lif3(self.conv3(spk2), mem3)
             feat_acc = spk3 if feat_acc is None else feat_acc + spk3
+            spike1_total = spk1 if spike1_total is None else spike1_total + spk1
+            spike2_total = spk2 if spike2_total is None else spike2_total + spk2
+            spike3_total = spk3 if spike3_total is None else spike3_total + spk3
         feat = feat_acc / max(1, self.num_steps)
-        return {
-            "heatmap_logits": self.heatmap_head(feat),
+        heatmap_logits = self.heatmap_head(feat)
+        out = {
+            "heatmap_logits": heatmap_logits,
             "conf_logits": self.conf_head(feat).squeeze(1),
         }
+        if return_diagnostics:
+            out["diagnostics"] = {
+                "spike_rate_l1": spike1_total.mean().detach(),
+                "spike_rate_l2": spike2_total.mean().detach(),
+                "spike_rate_l3": spike3_total.mean().detach(),
+                "feature_mean": feat.mean().detach(),
+                "feature_std": feat.std(unbiased=False).detach(),
+                "heatmap_logit_mean": heatmap_logits.mean().detach(),
+                "heatmap_logit_std": heatmap_logits.std(unbiased=False).detach(),
+                "heatmap_logit_min": heatmap_logits.min().detach(),
+                "heatmap_logit_max": heatmap_logits.max().detach(),
+            }
+        return out
 
 
 def make_gaussian_heatmaps(
