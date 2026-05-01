@@ -103,7 +103,7 @@ def _make_actor(
         dtype=torch.float32,
     )
     if model_type == "snn":
-        from paper2.planning.models.snn import SNNPolicyActor
+        from paper2.paper1_method.models.snn import SNNPolicyActor
 
         return SNNPolicyActor(
             state_dim,
@@ -115,7 +115,7 @@ def _make_actor(
             backend=snn_backend,
         )
     if model_type == "ann":
-        from paper2.planning.models.ann import ANNPolicyActor
+        from paper2.paper1_method.models.ann import ANNPolicyActor
 
         return ANNPolicyActor(state_dim, action_dim, hidden_dim, action_limit, scenario)
     raise ValueError(f"Unsupported model_type: {model_type}")

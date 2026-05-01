@@ -29,7 +29,7 @@ def test_world_frame_round_trip():
 def test_paper1_bridge_reset_step_contract():
     bridge = Paper1EnvBridge(seed=7)
     obs = bridge.reset(seed=7)
-    assert bridge.env_source == "paper2_local_paper1_physics"
+    assert bridge.env_source == "paper2_local_paper1_method"
     assert np.isclose(bridge.world_size_km, 2625.0)
     assert obs.aircraft_pos_world.shape == (3,)
     assert obs.target_pos_world.shape == (3,)

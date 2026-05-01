@@ -39,21 +39,27 @@ class Paper1EnvBridge:
         world_size_km: float | None = None,
         seed: int | None = None,
     ) -> None:
+        env_source_override: str | None = None
         if env is None:
             if paper1_root is None:
-                from paper2.env_adapter.paper1_local_env import (
+                from paper2.paper1_method.config import (
                     RewardConfig,
                     ScenarioConfig,
+                )
+                from paper2.paper1_method.envs import (
                     StaticNoFlyTrajectoryEnv,
                 )
+
+                env_source_override = "paper2_local_paper1_method"
             else:
                 _add_paper1_src_to_path(paper1_root)
                 from brain_uav.config import RewardConfig, ScenarioConfig
                 from brain_uav.envs import StaticNoFlyTrajectoryEnv
 
+                env_source_override = "external_paper1"
             env = StaticNoFlyTrajectoryEnv(ScenarioConfig(), RewardConfig(), seed=seed)
         self.env = env
-        self.env_source = str(getattr(self.env, "source_name", "external_paper1"))
+        self.env_source = str(env_source_override or getattr(self.env, "source_name", "external_paper1"))
         self.world_size_km = (
             float(world_size_km)
             if world_size_km is not None

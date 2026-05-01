@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=str, default="configs/env.yaml")
     p.add_argument("--observer", choices=["gt", "noisy"], default="gt")
+    p.add_argument("--target-mode", choices=["paper1_static", "phase3_dynamic"], default="paper1_static")
     p.add_argument("--model", choices=["snn", "ann"], default="snn")
     p.add_argument("--td3-checkpoint", type=str, default=None)
     p.add_argument("--allow-random-init", action="store_true")
@@ -33,8 +34,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=1000)
     p.add_argument("--seed", type=int, default=20260430)
     p.add_argument("--noise-std-km", type=float, default=2.0)
-    p.add_argument("--target-z-km", type=float, default=0.0)
-    p.add_argument("--capture-radius-km", type=float, default=50.0)
+    p.add_argument("--target-z-policy", choices=["keep_current_goal_z", "fixed"], default="keep_current_goal_z")
+    p.add_argument("--target-z-km", type=float, default=None)
+    p.add_argument("--capture-radius-km", type=float, default=None)
     p.add_argument("--out-dir", type=str, default="outputs/phase3_snn_td3_oracle/gt_eval")
     return p.parse_args()
 
@@ -76,6 +78,20 @@ def _set_goal_from_estimate(bridge: Paper1EnvBridge, estimate: TargetEstimateSta
     else:
         pos3 = np.array([pos[0], pos[1], pos[2]], dtype=float)
     bridge.env.goal = paper2_xyz_to_paper1_xyz(pos3, world_size_km=float(bridge.world_size_km)).astype(np.float32)
+    if hasattr(bridge.env, "best_goal_distance_so_far"):
+        bridge.env.best_goal_distance_so_far = bridge.env._goal_distance(bridge.env.state[:3])
+    if hasattr(bridge.env, "last_segment_goal_distance"):
+        bridge.env.last_segment_goal_distance = bridge.env.best_goal_distance_so_far
+    if hasattr(bridge.env, "last_goal_reached_by_segment"):
+        bridge.env.last_goal_reached_by_segment = False
+
+
+def _target_z_for_step(bridge: Paper1EnvBridge, args: argparse.Namespace) -> float:
+    if str(args.target_z_policy) == "fixed":
+        if args.target_z_km is None:
+            raise ValueError("--target-z-km is required when --target-z-policy=fixed.")
+        return float(args.target_z_km)
+    return float(np.asarray(bridge.env.goal, dtype=float).reshape(-1)[2])
 
 
 def _zone_violation(pos_world: np.ndarray, zones: list[NoFlyZoneState], *, include_safety_margin: bool) -> bool:
@@ -154,20 +170,30 @@ def main() -> None:
             policy_diag = policy.diagnostics(bridge.env._get_obs())
 
         zones = bridge.get_no_fly_zones()
-        truth2d, internal = sample_phase3_initial_target(target_cfg, ep_rng)
+        if str(args.target_mode) == "phase3_dynamic":
+            truth2d, internal = sample_phase3_initial_target(target_cfg, ep_rng)
+        else:
+            truth2d = bridge.get_target_truth()
+            internal = None
         ep_rows: list[dict[str, Any]] = []
         done_reason = "running"
+        capture_radius_km = (
+            float(args.capture_radius_km)
+            if args.capture_radius_km is not None
+            else float(getattr(bridge.env.scenario, "goal_radius", 5.0))
+        )
 
         for step_idx in range(int(args.steps)):
             aircraft = bridge.get_aircraft_state()
-            truth = _truth_with_z(truth2d, float(args.target_z_km))
+            truth = _truth_with_z(truth2d, _target_z_for_step(bridge, args))
             estimate = _make_estimate(
                 truth,
                 observer=str(args.observer),
                 noise_std_km=float(args.noise_std_km),
                 rng=rng,
             )
-            _set_goal_from_estimate(bridge, estimate, float(args.target_z_km))
+            if str(args.target_mode) == "phase3_dynamic":
+                _set_goal_from_estimate(bridge, estimate, _target_z_for_step(bridge, args))
             obs_vec = bridge.env._get_obs()
             action = policy.act(obs_vec)
 
@@ -209,15 +235,20 @@ def main() -> None:
             all_rows.append(row)
             if step_result.done:
                 break
-            truth2d = propagate_phase3_target_truth(
-                truth2d,
-                internal,
-                target_cfg,
-                ep_rng,
-                aircraft_pos_world=aircraft_pos[:2],
-            )
+            if str(args.target_mode) == "phase3_dynamic":
+                if internal is None:
+                    raise RuntimeError("phase3_dynamic target mode requires an internal target state.")
+                truth2d = propagate_phase3_target_truth(
+                    truth2d,
+                    internal,
+                    target_cfg,
+                    ep_rng,
+                    aircraft_pos_world=aircraft_pos[:2],
+                )
+            else:
+                truth2d = bridge.get_target_truth()
 
-        summary = _episode_summary(ep_rows, float(args.capture_radius_km))
+        summary = _episode_summary(ep_rows, capture_radius_km)
         summary.update({"episode": int(ep), "seed": int(ep_seed), "observer": str(args.observer)})
         summaries.append(summary)
 
@@ -250,11 +281,17 @@ def main() -> None:
         "checkpoint_path": None if args.td3_checkpoint is None else str(Path(args.td3_checkpoint).expanduser()),
         "random_init": bool(policy.random_init if policy is not None else False),
         "observer": str(args.observer),
+        "target_mode": str(args.target_mode),
+        "target_z_policy": str(args.target_z_policy),
         "episodes": int(args.episodes),
         "steps_per_episode": int(args.steps),
         "seed": int(args.seed),
         "unit": "km",
-        "capture_radius_km": float(args.capture_radius_km),
+        "capture_radius_km": (
+            float(args.capture_radius_km)
+            if args.capture_radius_km is not None
+            else float(getattr(Paper1EnvBridge(seed=int(args.seed)).env.scenario, "goal_radius", 5.0))
+        ),
         "noise_std_km": float(args.noise_std_km if args.observer == "noisy" else 0.0),
         "policy_diagnostics": policy_diag,
         "metrics": {
