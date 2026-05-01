@@ -27,6 +27,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", type=str, default="configs/env.yaml")
     p.add_argument("--observer", choices=["gt", "noisy"], default="gt")
     p.add_argument("--target-mode", choices=["paper1_static", "phase3_dynamic"], default="paper1_static")
+    p.add_argument(
+        "--phase3-target-init",
+        choices=["paper1_goal", "random_water"],
+        default="paper1_goal",
+        help=(
+            "For phase3_dynamic, initialize the moving target from the Paper1 goal by default. "
+            "random_water is useful for stress tests but is outside the Paper1 planner training distribution."
+        ),
+    )
     p.add_argument("--paper1-curriculum-level", choices=["easy", "easy_two_zone", "medium", "hard"], default="hard")
     p.add_argument("--paper1-curriculum-mix", type=str, default=None)
     p.add_argument("--model", choices=["snn", "ann"], default="snn")
@@ -95,6 +104,32 @@ def _target_z_for_step(bridge: Paper1EnvBridge, args: argparse.Namespace) -> flo
             raise ValueError("--target-z-km is required when --target-z-policy=fixed.")
         return float(args.target_z_km)
     return float(np.asarray(bridge.env.goal, dtype=float).reshape(-1)[2])
+
+
+def _init_phase3_dynamic_target(
+    bridge: Paper1EnvBridge,
+    target_cfg: dict[str, Any],
+    rng: np.random.Generator,
+    init_mode: str,
+) -> tuple[TargetTruthState, Any]:
+    sampled_truth, internal = sample_phase3_initial_target(target_cfg, rng)
+    if init_mode == "random_water":
+        return sampled_truth, internal
+    if init_mode != "paper1_goal":
+        raise ValueError(f"Unsupported phase3 target init mode: {init_mode}")
+
+    paper1_goal = bridge.get_target_truth()
+    pos_xy = np.asarray(paper1_goal.pos_world, dtype=float).reshape(-1)[:2]
+    return (
+        TargetTruthState(
+            t=0.0,
+            pos_world=pos_xy.astype(float),
+            vel_world=np.asarray(sampled_truth.vel_world, dtype=float).reshape(-1)[:2],
+            heading=float(sampled_truth.heading),
+            motion_mode=str(sampled_truth.motion_mode),
+        ),
+        internal,
+    )
 
 
 def _zone_violation(pos_world: np.ndarray, zones: list[NoFlyZoneState], *, include_safety_margin: bool) -> bool:
@@ -183,7 +218,12 @@ def main() -> None:
 
         zones = bridge.get_no_fly_zones()
         if str(args.target_mode) == "phase3_dynamic":
-            truth2d, internal = sample_phase3_initial_target(target_cfg, ep_rng)
+            truth2d, internal = _init_phase3_dynamic_target(
+                bridge,
+                target_cfg,
+                ep_rng,
+                str(args.phase3_target_init),
+            )
         else:
             truth2d = bridge.get_target_truth()
             internal = None
@@ -297,6 +337,7 @@ def main() -> None:
         "random_init": bool(policy.random_init if policy is not None else False),
         "observer": str(args.observer),
         "target_mode": str(args.target_mode),
+        "phase3_target_init": str(args.phase3_target_init),
         "target_z_policy": str(args.target_z_policy),
         "paper1_curriculum_level": str(args.paper1_curriculum_level),
         "paper1_curriculum_mix": paper1_curriculum_mix,
