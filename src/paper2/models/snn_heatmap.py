@@ -77,10 +77,11 @@ class HeatmapSNN(nn.Module):
             "conf_logits": self.conf_head(feat).squeeze(1),
         }
         if return_diagnostics:
+            steps = max(1, self.num_steps)
             out["diagnostics"] = {
-                "spike_rate_l1": spike1_total.mean().detach(),
-                "spike_rate_l2": spike2_total.mean().detach(),
-                "spike_rate_l3": spike3_total.mean().detach(),
+                "spike_rate_l1": (spike1_total / steps).mean().detach(),
+                "spike_rate_l2": (spike2_total / steps).mean().detach(),
+                "spike_rate_l3": (spike3_total / steps).mean().detach(),
                 "feature_mean": feat.mean().detach(),
                 "feature_std": feat.std(unbiased=False).detach(),
                 "heatmap_logit_mean": heatmap_logits.mean().detach(),

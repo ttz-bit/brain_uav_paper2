@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--coord-weight", type=float, default=5.0)
     p.add_argument("--conf-weight", type=float, default=0.2)
     p.add_argument("--softargmax-temperature", type=float, default=20.0)
+    p.add_argument("--decode-method", choices=["argmax", "softargmax"], default="argmax")
     p.add_argument("--train-encoding", choices=["rate", "direct"], default="direct")
     p.add_argument("--eval-encoding", choices=["rate", "direct"], default="direct")
     p.add_argument("--eval-interval", type=int, default=10)
@@ -121,7 +122,7 @@ def _tensor_diag_to_float(diag: dict[str, Any]) -> dict[str, float]:
 def main() -> None:
     args = parse_args()
     torch, DataLoader, Dataset = _import_torch()
-    from paper2.models.snn_heatmap import HeatmapSNN, heatmap_loss, peak_argmax_2d
+    from paper2.models.snn_heatmap import HeatmapSNN, heatmap_loss, peak_argmax_2d, soft_argmax_2d
 
     if int(args.num_threads) > 0:
         torch.set_num_threads(int(args.num_threads))
@@ -152,6 +153,7 @@ def main() -> None:
         max_samples=max(1, int(args.samples)),
     )
     x_np, y_np = _materialize(ds, input_size=int(args.input_size))
+    stages = [str(ds[i].meta.get("perception_stage", "unknown")) for i in range(len(ds))]
 
     class _NumpyDataset(Dataset):
         def __init__(self, x: np.ndarray, y: np.ndarray):
@@ -197,9 +199,12 @@ def main() -> None:
     def _eval() -> dict[str, Any]:
         model.eval()
         losses: list[float] = []
-        px_errors: list[float] = []
+        argmax_px_errors: list[float] = []
+        softargmax_px_errors: list[float] = []
         pred_x_px: list[float] = []
         pred_y_px: list[float] = []
+        per_stage_argmax: dict[str, list[float]] = {}
+        per_stage_softargmax: dict[str, list[float]] = {}
         diag_acc: dict[str, list[float]] = {}
         with torch.no_grad():
             for s in range(0, int(x_np.shape[0]), max(1, int(args.batch_size))):
@@ -209,19 +214,43 @@ def main() -> None:
                 outputs = model(xb, stochastic=False, return_diagnostics=True)
                 loss, _ = _loss(outputs, yb)
                 losses.append(float(loss.detach().cpu().item()) * int(e - s))
-                pred_xy = peak_argmax_2d(outputs["heatmap_logits"]).detach().cpu().numpy()
-                for pxy, gxy in zip(pred_xy, y_np[s:e, :2]):
-                    px_errors.append(_pixel_error_norm(pxy, gxy, int(args.input_size), int(args.input_size)))
-                    pred_x_px.append(float(np.clip(pxy[0], 0.0, 1.0) * int(args.input_size)))
-                    pred_y_px.append(float(np.clip(pxy[1], 0.0, 1.0) * int(args.input_size)))
+                argmax_xy = peak_argmax_2d(outputs["heatmap_logits"]).detach().cpu().numpy()
+                soft_xy = soft_argmax_2d(
+                    outputs["heatmap_logits"],
+                    temperature=float(args.softargmax_temperature),
+                ).detach().cpu().numpy()
+                pred_xy = soft_xy if str(args.decode_method) == "softargmax" else argmax_xy
+                for offset, (arg_xy, soft_pred_xy, chosen_xy, gxy) in enumerate(
+                    zip(argmax_xy, soft_xy, pred_xy, y_np[s:e, :2])
+                ):
+                    stage = stages[s + offset]
+                    arg_err = _pixel_error_norm(arg_xy, gxy, int(args.input_size), int(args.input_size))
+                    soft_err = _pixel_error_norm(soft_pred_xy, gxy, int(args.input_size), int(args.input_size))
+                    argmax_px_errors.append(arg_err)
+                    softargmax_px_errors.append(soft_err)
+                    per_stage_argmax.setdefault(stage, []).append(arg_err)
+                    per_stage_softargmax.setdefault(stage, []).append(soft_err)
+                    pred_x_px.append(float(np.clip(chosen_xy[0], 0.0, 1.0) * int(args.input_size)))
+                    pred_y_px.append(float(np.clip(chosen_xy[1], 0.0, 1.0) * int(args.input_size)))
                 for key, value in _tensor_diag_to_float(outputs["diagnostics"]).items():
                     diag_acc.setdefault(key, []).append(value)
         rounded_unique = {(int(round(x)), int(round(y))) for x, y in zip(pred_x_px, pred_y_px)}
         diag = {k: float(np.mean(v)) for k, v in diag_acc.items()}
+        chosen_errors = softargmax_px_errors if str(args.decode_method) == "softargmax" else argmax_px_errors
         return {
             "loss": float(sum(losses) / max(1, int(x_np.shape[0]))),
-            "pixel_error_mean": float(np.mean(px_errors)) if px_errors else 0.0,
-            "pixel_error_p90": float(np.percentile(px_errors, 90)) if px_errors else 0.0,
+            "pixel_error_mean": float(np.mean(chosen_errors)) if chosen_errors else 0.0,
+            "pixel_error_p90": float(np.percentile(chosen_errors, 90)) if chosen_errors else 0.0,
+            "argmax_pixel_error_mean": float(np.mean(argmax_px_errors)) if argmax_px_errors else 0.0,
+            "argmax_pixel_error_p90": float(np.percentile(argmax_px_errors, 90)) if argmax_px_errors else 0.0,
+            "softargmax_pixel_error_mean": float(np.mean(softargmax_px_errors)) if softargmax_px_errors else 0.0,
+            "softargmax_pixel_error_p90": float(np.percentile(softargmax_px_errors, 90)) if softargmax_px_errors else 0.0,
+            "stage_argmax_pixel_error_mean": {
+                k: float(np.mean(v)) if v else 0.0 for k, v in per_stage_argmax.items()
+            },
+            "stage_softargmax_pixel_error_mean": {
+                k: float(np.mean(v)) if v else 0.0 for k, v in per_stage_softargmax.items()
+            },
             "rounded_unique_pred_xy": int(len(rounded_unique)),
             "pred_x_std_px": float(np.std(pred_x_px)) if pred_x_px else 0.0,
             "pred_y_std_px": float(np.std(pred_y_px)) if pred_y_px else 0.0,
@@ -232,6 +261,24 @@ def main() -> None:
     best = dict(initial)
     best_epoch = 0
     best_path = out_dir / "model_best.pth"
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "model_type": "snn_heatmap",
+            "purpose": "small_sample_overfit_debug",
+            "dataset_root": str(dataset_root),
+            "split": str(args.split),
+            "samples": int(len(ds)),
+            "input_size": int(args.input_size),
+            "num_steps": int(args.num_steps),
+            "beta": float(args.beta),
+            "train_encoding": str(args.train_encoding),
+            "eval_encoding": str(args.eval_encoding),
+            "decode_method": str(args.decode_method),
+            "softargmax_temperature": float(args.softargmax_temperature),
+        },
+        best_path,
+    )
     trace: list[dict[str, Any]] = [{"epoch": 0, "metrics": initial}]
     epochs = max(1, int(args.epochs))
     eval_interval = max(1, int(args.eval_interval))
@@ -269,6 +316,8 @@ def main() -> None:
                         "beta": float(args.beta),
                         "train_encoding": str(args.train_encoding),
                         "eval_encoding": str(args.eval_encoding),
+                        "decode_method": str(args.decode_method),
+                        "softargmax_temperature": float(args.softargmax_temperature),
                     },
                     best_path,
                 )
@@ -277,6 +326,8 @@ def main() -> None:
                 f"epoch={epoch:03d}/{epochs} "
                 f"loss={metrics['loss']:.6f} "
                 f"px={metrics['pixel_error_mean']:.2f} "
+                f"arg={metrics['argmax_pixel_error_mean']:.2f} "
+                f"soft={metrics['softargmax_pixel_error_mean']:.2f} "
                 f"unique={metrics['rounded_unique_pred_xy']} "
                 f"logit_std={metrics['diagnostics'].get('heatmap_logit_std', 0.0):.4f} "
                 f"spk3={metrics['diagnostics'].get('spike_rate_l3', 0.0):.4f}"
@@ -291,7 +342,13 @@ def main() -> None:
             sample = ds[int(idx)]
             x = torch.from_numpy(_to_tensor_image(sample.image, int(args.input_size))).unsqueeze(0).to(device)
             outputs = model(x, stochastic=False)
-            pred_xy = peak_argmax_2d(outputs["heatmap_logits"])[0].detach().cpu().numpy()
+            if str(args.decode_method) == "softargmax":
+                pred_xy = soft_argmax_2d(
+                    outputs["heatmap_logits"],
+                    temperature=float(args.softargmax_temperature),
+                )[0].detach().cpu().numpy()
+            else:
+                pred_xy = peak_argmax_2d(outputs["heatmap_logits"])[0].detach().cpu().numpy()
             gt = _target_from_sample(sample)
             err = _pixel_error_norm(pred_xy, gt[:2], sample.image.shape[0], sample.image.shape[1])
             cv2.imwrite(str(vis_dir / f"sample_{rank:02d}.jpg"), _make_visual(sample.image, pred_xy, gt, err))
@@ -319,6 +376,8 @@ def main() -> None:
             "coord_weight": float(args.coord_weight),
             "heatmap_weight": float(args.heatmap_weight),
             "conf_weight": float(args.conf_weight),
+            "decode_method": str(args.decode_method),
+            "softargmax_temperature": float(args.softargmax_temperature),
         },
         "metrics": {
             "initial": initial,
