@@ -18,6 +18,7 @@ STAGE_SCALE_PX = {
     "mid": 18.0,
     "terminal": 32.0,
 }
+DISTRACTOR_SCALE_RANGE = (0.45, 0.85)
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 DEFAULT_TARGET_ALLOW_KEYWORDS = ("top", "overhead", "aerial", "bird", "vertical")
@@ -111,7 +112,7 @@ def _target_name_tokens(path: Path) -> set[str]:
     return {x for x in re.split(r"[^a-z0-9]+", path.stem.lower()) if x}
 
 
-def _target_template_allowed(
+def _template_allowed(
     path: Path,
     *,
     allow_keywords: tuple[str, ...],
@@ -124,6 +125,15 @@ def _target_template_allowed(
     if not allow_keywords:
         return True
     return any(k and (k in tokens or k in text) for k in allow_keywords)
+
+
+def _target_template_allowed(
+    path: Path,
+    *,
+    allow_keywords: tuple[str, ...],
+    reject_keywords: tuple[str, ...],
+) -> bool:
+    return _template_allowed(path, allow_keywords=allow_keywords, reject_keywords=reject_keywords)
 
 
 def _collect_targets(
@@ -146,6 +156,35 @@ def _collect_targets(
             if split is None:
                 continue
             if not _target_template_allowed(path, allow_keywords=allow_keywords, reject_keywords=reject_keywords):
+                continue
+            rp = path.resolve()
+            if rp in seen:
+                continue
+            seen.add(rp)
+            out[split].append(path)
+    return out
+
+
+def _collect_distractors(
+    assets_root: Path,
+    *,
+    allow_keywords: tuple[str, ...] = DEFAULT_TARGET_ALLOW_KEYWORDS,
+    reject_keywords: tuple[str, ...] = DEFAULT_TARGET_REJECT_KEYWORDS,
+) -> dict[str, list[Path]]:
+    roots = [
+        assets_root / "distractor_templates" / "alpha_png",
+        assets_root / "distractor_templates",
+    ]
+    out: dict[str, list[Path]] = {"train": [], "val": [], "test": []}
+    seen: set[Path] = set()
+    for root in roots:
+        for path in _iter_images(root):
+            if path.suffix.lower() != ".png":
+                continue
+            split = _infer_split(path)
+            if split is None:
+                continue
+            if not _template_allowed(path, allow_keywords=allow_keywords, reject_keywords=reject_keywords):
                 continue
             rp = path.resolve()
             if rp in seen:
@@ -212,12 +251,15 @@ def _render_real_asset_frame(
     split: str,
     backgrounds_by_split: dict[str, list[dict]],
     targets_by_split: dict[str, list[Path]],
+    distractors_by_split: dict[str, list[Path]],
     image_size: int,
     rng: np.random.Generator,
     min_target_water_ratio: float,
     min_target_visibility: float,
     placement_attempts: int,
     points_per_background: int,
+    distractor_count_min: int = 0,
+    distractor_count_max: int = 0,
     fixed_background: dict | None = None,
     fixed_target: Path | None = None,
     allow_relaxed_water_ratio: bool = False,
@@ -228,6 +270,9 @@ def _render_real_asset_frame(
         raise RuntimeError(f"No usable real backgrounds for split={split}.")
     if not target_pool:
         raise RuntimeError(f"No target templates for split={split}.")
+    distractor_pool = distractors_by_split.get(split, [])
+    if int(distractor_count_max) > 0 and not distractor_pool:
+        raise RuntimeError(f"No distractor templates for split={split}.")
 
     cx = float(frame.center_px[0])
     cy = float(frame.center_px[1])
@@ -290,6 +335,21 @@ def _render_real_asset_frame(
                 continue
             ratio = _alpha_water_ratio(patch_mask, target, cx, cy)
             canvas = _extract_patch_inside(bg, x1, y1, image_size)
+            distractor_meta, distractor_ok = _place_distractors(
+                canvas,
+                patch_mask,
+                distractor_pool,
+                target_center=(cx, cy),
+                target_overlay=target,
+                stage=frame.stage,
+                rng=rng,
+                count_min=int(distractor_count_min),
+                count_max=int(distractor_count_max),
+                min_water_ratio=float(min_target_water_ratio),
+                min_visibility=float(min_target_visibility),
+            )
+            if not distractor_ok:
+                continue
             bbox_tuple, visibility = alpha_blend_center(canvas, target, cx, cy)
             if visibility < min_target_visibility:
                 continue
@@ -301,6 +361,12 @@ def _render_real_asset_frame(
                 "background_category": _infer_background_category_from_path(bg_path),
                 "target_asset_path": str(target_path),
                 "target_water_ratio": float(ratio),
+                "distractor_asset_paths": [d["asset_path"] for d in distractor_meta],
+                "distractor_bboxes_xywh": [d["bbox_xywh"] for d in distractor_meta],
+                "distractor_water_ratios": [d["water_ratio"] for d in distractor_meta],
+                "distractor_visibilities": [d["visibility"] for d in distractor_meta],
+                "distractor_count_requested": int(distractor_meta[0]["count_requested"]) if distractor_meta else int(0),
+                "distractor_count": int(len(distractor_meta)),
             }
             if ratio >= min_target_water_ratio:
                 return canvas, bbox, float(visibility), asset_meta
@@ -314,6 +380,90 @@ def _render_real_asset_frame(
         asset_meta["placement_fallback"] = "relaxed_water_ratio"
         return canvas, bbox, visibility, asset_meta
     raise RuntimeError(f"Could not place target on water for split={split}, stage={frame.stage}.")
+
+
+def _place_distractors(
+    canvas: np.ndarray,
+    mask_u8: np.ndarray,
+    distractor_pool: list[Path],
+    *,
+    target_center: tuple[float, float],
+    target_overlay: np.ndarray,
+    stage: str,
+    rng: np.random.Generator,
+    count_min: int,
+    count_max: int,
+    min_water_ratio: float,
+    min_visibility: float,
+) -> tuple[list[dict], bool]:
+    count_min = max(0, int(count_min))
+    count_max = max(count_min, int(count_max))
+    if count_max <= 0:
+        return [], True
+    if not distractor_pool:
+        return [], False
+
+    desired = int(rng.integers(count_min, count_max + 1))
+    image_h, image_w = canvas.shape[:2]
+    target_long = float(max(target_overlay.shape[:2]))
+    target_cx, target_cy = float(target_center[0]), float(target_center[1])
+    placed: list[dict] = []
+
+    water = mask_u8 > 0
+    yy_all, xx_all = np.where(water)
+    if len(xx_all) <= 0:
+        return [], False
+
+    for _ in range(desired):
+        accepted = False
+        for _attempt in range(96):
+            path = distractor_pool[int(rng.integers(0, len(distractor_pool)))]
+            distractor = read_bgra(path)
+            distractor = trim_bgra_to_alpha_bbox(distractor)
+            scale = float(STAGE_SCALE_PX.get(stage, 18.0)) * float(
+                rng.uniform(DISTRACTOR_SCALE_RANGE[0], DISTRACTOR_SCALE_RANGE[1])
+            )
+            distractor = _resize_bgra_to_long_side(distractor, scale, image_w)
+            distractor = rotate_bgra(distractor, float(rng.uniform(0.0, 360.0)))
+            distractor = trim_bgra_to_alpha_bbox(distractor)
+            dh, dw = distractor.shape[:2]
+            radius = max(2.0, 0.5 * float(max(dh, dw)))
+
+            idx = int(rng.integers(0, len(xx_all)))
+            dx = float(xx_all[idx])
+            dy = float(yy_all[idx])
+            if dx - radius < 0 or dy - radius < 0 or dx + radius >= image_w or dy + radius >= image_h:
+                continue
+            target_clearance = max(18.0, 0.55 * target_long + radius + 6.0)
+            if float(np.hypot(dx - target_cx, dy - target_cy)) < target_clearance:
+                continue
+            if any(float(np.hypot(dx - d["center_px"][0], dy - d["center_px"][1])) < radius + d["radius_px"] + 4.0 for d in placed):
+                continue
+            water_ratio = _alpha_water_ratio(mask_u8, distractor, dx, dy)
+            if water_ratio < min_water_ratio:
+                continue
+
+            scratch = canvas.copy()
+            bbox_tuple, visibility = alpha_blend_center(scratch, distractor, dx, dy)
+            if visibility < min_visibility:
+                continue
+            canvas[:, :, :] = scratch
+            placed.append(
+                {
+                    "asset_path": str(path),
+                    "bbox_xywh": [float(v) for v in bbox_tuple],
+                    "center_px": [float(dx), float(dy)],
+                    "radius_px": float(radius),
+                    "water_ratio": float(water_ratio),
+                    "visibility": float(visibility),
+                    "count_requested": int(desired),
+                }
+            )
+            accepted = True
+            break
+        if not accepted:
+            return placed, False
+    return placed, True
 
 
 def _draw_target(canvas: np.ndarray, frame: Phase3TaskFrame, rng: np.random.Generator) -> tuple[list[float], float]:
@@ -382,7 +532,9 @@ def _label_row(
         "background_asset_id": Path(str((asset_meta or {}).get("background_path", f"phase3_ocean_{split}_{seq_idx:06d}"))).stem,
         "background_category": str((asset_meta or {}).get("background_category", "unknown")),
         "target_asset_id": Path(str((asset_meta or {}).get("target_asset_path", f"phase3_target_{split}"))).stem,
-        "distractor_asset_ids": [],
+        "distractor_asset_ids": [
+            Path(str(p)).stem for p in (asset_meta or {}).get("distractor_asset_paths", [])
+        ],
         "motion_mode": frame.motion_mode,
         "land_overlap_ratio": 0.0,
         "shore_buffer_overlap_ratio": 0.0,
@@ -429,6 +581,12 @@ def _label_row(
             "water_mask_path": (asset_meta or {}).get("water_mask_path"),
             "target_asset_path": (asset_meta or {}).get("target_asset_path"),
             "target_water_ratio": float((asset_meta or {}).get("target_water_ratio", 1.0)),
+            "distractor_asset_paths": (asset_meta or {}).get("distractor_asset_paths", []),
+            "distractor_bboxes_xywh": (asset_meta or {}).get("distractor_bboxes_xywh", []),
+            "distractor_water_ratios": (asset_meta or {}).get("distractor_water_ratios", []),
+            "distractor_visibilities": (asset_meta or {}).get("distractor_visibilities", []),
+            "distractor_count_requested": int((asset_meta or {}).get("distractor_count_requested", 0)),
+            "distractor_count": int((asset_meta or {}).get("distractor_count", 0)),
         },
     }
     return row
@@ -450,6 +608,8 @@ def main() -> None:
     parser.add_argument("--allow-relaxed-water-ratio", action="store_true")
     parser.add_argument("--placement-attempts", type=int, default=160)
     parser.add_argument("--points-per-background", type=int, default=64)
+    parser.add_argument("--distractor-count-min", type=int, default=0)
+    parser.add_argument("--distractor-count-max", type=int, default=0)
     parser.add_argument(
         "--target-allow-keywords",
         type=str,
@@ -462,7 +622,23 @@ def main() -> None:
         default=",".join(DEFAULT_TARGET_REJECT_KEYWORDS),
         help="Comma-separated keywords rejected for real target templates.",
     )
+    parser.add_argument(
+        "--distractor-allow-keywords",
+        type=str,
+        default=",".join(DEFAULT_TARGET_ALLOW_KEYWORDS),
+        help="Comma-separated keywords required for real distractor templates. Empty string allows all non-rejected distractors.",
+    )
+    parser.add_argument(
+        "--distractor-reject-keywords",
+        type=str,
+        default=",".join(DEFAULT_TARGET_REJECT_KEYWORDS),
+        help="Comma-separated keywords rejected for real distractor templates.",
+    )
     args = parser.parse_args()
+    if int(args.distractor_count_min) < 0 or int(args.distractor_count_max) < 0:
+        raise ValueError("Distractor counts must be non-negative.")
+    if int(args.distractor_count_min) > int(args.distractor_count_max):
+        raise ValueError("--distractor-count-min cannot exceed --distractor-count-max.")
 
     project_root = Path.cwd().resolve()
     cfg = load_yaml(Path(args.config))
@@ -478,6 +654,7 @@ def main() -> None:
     )
     backgrounds_by_split: dict[str, list[dict]] = {"train": [], "val": [], "test": []}
     targets_by_split: dict[str, list[Path]] = {"train": [], "val": [], "test": []}
+    distractors_by_split: dict[str, list[Path]] = {"train": [], "val": [], "test": []}
     if args.asset_mode == "real":
         backgrounds_by_split = _collect_backgrounds(
             assets_root,
@@ -489,12 +666,21 @@ def main() -> None:
             allow_keywords=_split_keywords(args.target_allow_keywords),
             reject_keywords=_split_keywords(args.target_reject_keywords),
         )
+        if int(args.distractor_count_max) > 0:
+            distractors_by_split = _collect_distractors(
+                assets_root,
+                allow_keywords=_split_keywords(args.distractor_allow_keywords),
+                reject_keywords=_split_keywords(args.distractor_reject_keywords),
+            )
         missing_bg = [s for s in ("train", "val", "test") if not backgrounds_by_split.get(s)]
         missing_target = [s for s in ("train", "val", "test") if not targets_by_split.get(s)]
-        if missing_bg or missing_target:
+        missing_distractor = [
+            s for s in ("train", "val", "test") if int(args.distractor_count_max) > 0 and not distractors_by_split.get(s)
+        ]
+        if missing_bg or missing_target or missing_distractor:
             raise RuntimeError(
                 f"Missing real assets. missing_background_splits={missing_bg}, missing_target_splits={missing_target}, "
-                f"assets_root={assets_root}, water_mask_root={water_mask_root}"
+                f"missing_distractor_splits={missing_distractor}, assets_root={assets_root}, water_mask_root={water_mask_root}"
             )
 
     out_root = Path(args.out_root)
@@ -540,12 +726,15 @@ def main() -> None:
                             split=split,
                             backgrounds_by_split=backgrounds_by_split,
                             targets_by_split=targets_by_split,
+                            distractors_by_split=distractors_by_split,
                             image_size=image_size,
                             rng=rng,
                             min_target_water_ratio=float(args.min_target_water_ratio),
                             min_target_visibility=float(args.min_target_visibility),
                             placement_attempts=int(args.placement_attempts),
                             points_per_background=int(args.points_per_background),
+                            distractor_count_min=int(args.distractor_count_min),
+                            distractor_count_max=int(args.distractor_count_max),
                             fixed_background=seq_background,
                             fixed_target=seq_target,
                             allow_relaxed_water_ratio=bool(args.allow_relaxed_water_ratio),
@@ -593,9 +782,16 @@ def main() -> None:
         "water_mask_root": str(water_mask_root) if args.asset_mode == "real" else None,
         "background_counts": {k: len(v) for k, v in backgrounds_by_split.items()} if args.asset_mode == "real" else None,
         "target_counts": {k: len(v) for k, v in targets_by_split.items()} if args.asset_mode == "real" else None,
+        "distractor_counts": {k: len(v) for k, v in distractors_by_split.items()} if args.asset_mode == "real" else None,
         "target_template_filter": {
             "allow_keywords": list(_split_keywords(args.target_allow_keywords)),
             "reject_keywords": list(_split_keywords(args.target_reject_keywords)),
+        }
+        if args.asset_mode == "real"
+        else None,
+        "distractor_template_filter": {
+            "allow_keywords": list(_split_keywords(args.distractor_allow_keywords)),
+            "reject_keywords": list(_split_keywords(args.distractor_reject_keywords)),
         }
         if args.asset_mode == "real"
         else None,
@@ -604,6 +800,8 @@ def main() -> None:
             "fixed_target_template_per_sequence": bool(args.asset_mode == "real"),
             "allow_relaxed_water_ratio": bool(args.allow_relaxed_water_ratio),
             "min_target_water_ratio": float(args.min_target_water_ratio),
+            "distractor_count_min": int(args.distractor_count_min),
+            "distractor_count_max": int(args.distractor_count_max),
         },
         "stage_counts": stage_counts,
         "split_counts": split_counts,

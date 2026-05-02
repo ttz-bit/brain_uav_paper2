@@ -38,12 +38,16 @@ def main() -> None:
     invalid_stage = 0
     center_bbox_delta_violations = 0
     target_water_ratio_violations = 0
+    distractor_count_shortfalls = 0
+    distractor_water_ratio_violations = 0
     sequence_background_violations = 0
     sequence_target_violations = 0
     ranges = []
     offcenter = []
     center_bbox_deltas = []
     target_water_ratios = []
+    distractor_counts = []
+    distractor_water_ratios = []
     sequence_backgrounds: dict[str, str] = {}
     sequence_targets: dict[str, str] = {}
 
@@ -93,6 +97,17 @@ def main() -> None:
             target_water_ratios.append(target_water_ratio)
             if target_water_ratio < 0.98:
                 target_water_ratio_violations += 1
+            distractor_ids = list(row.get("distractor_asset_ids", []))
+            distractor_count = int(meta.get("distractor_count", len(distractor_ids)))
+            distractor_count_requested = int(meta.get("distractor_count_requested", 0))
+            distractor_counts.append(distractor_count)
+            if distractor_count < distractor_count_requested:
+                distractor_count_shortfalls += 1
+            for ratio_raw in list(meta.get("distractor_water_ratios", [])):
+                ratio = float(ratio_raw)
+                distractor_water_ratios.append(ratio)
+                if ratio < 0.98:
+                    distractor_water_ratio_violations += 1
             if not bool(meta.get("target_on_water", False)):
                 not_water += 1
             r = float(meta.get("range_xy_km", -1.0))
@@ -109,6 +124,8 @@ def main() -> None:
     off_arr = np.asarray(offcenter, dtype=float)
     center_bbox_delta_arr = np.asarray(center_bbox_deltas, dtype=float)
     target_water_ratio_arr = np.asarray(target_water_ratios, dtype=float)
+    distractor_count_arr = np.asarray(distractor_counts, dtype=float)
+    distractor_water_ratio_arr = np.asarray(distractor_water_ratios, dtype=float)
     report = {
         "dataset_root": str(root),
         "total_frames": int(total),
@@ -123,10 +140,17 @@ def main() -> None:
         "center_bbox_delta_px_max": float(center_bbox_delta_arr.max()) if center_bbox_delta_arr.size else 0.0,
         "target_water_ratio_min": float(target_water_ratio_arr.min()) if target_water_ratio_arr.size else 0.0,
         "target_water_ratio_mean": float(target_water_ratio_arr.mean()) if target_water_ratio_arr.size else 0.0,
+        "distractor_count_mean": float(distractor_count_arr.mean()) if distractor_count_arr.size else 0.0,
+        "distractor_count_min": int(distractor_count_arr.min()) if distractor_count_arr.size else 0,
+        "distractor_count_max": int(distractor_count_arr.max()) if distractor_count_arr.size else 0,
+        "distractor_water_ratio_min": float(distractor_water_ratio_arr.min()) if distractor_water_ratio_arr.size else 0.0,
+        "distractor_water_ratio_mean": float(distractor_water_ratio_arr.mean()) if distractor_water_ratio_arr.size else 0.0,
         "center_px_out_of_image": int(center_out),
         "bbox_bad": int(bbox_bad),
         "center_bbox_delta_violations": int(center_bbox_delta_violations),
         "target_water_ratio_violations": int(target_water_ratio_violations),
+        "distractor_count_shortfalls": int(distractor_count_shortfalls),
+        "distractor_water_ratio_violations": int(distractor_water_ratio_violations),
         "sequence_background_violations": int(sequence_background_violations),
         "sequence_target_violations": int(sequence_target_violations),
         "target_not_water": int(not_water),
@@ -141,6 +165,8 @@ def main() -> None:
             and bbox_bad == 0
             and center_bbox_delta_violations == 0
             and target_water_ratio_violations == 0
+            and distractor_count_shortfalls == 0
+            and distractor_water_ratio_violations == 0
             and sequence_background_violations == 0
             and sequence_target_violations == 0
             and not_water == 0
