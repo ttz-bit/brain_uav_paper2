@@ -155,6 +155,19 @@ def _collect_targets(
     return out
 
 
+def _infer_background_category_from_path(path: Path) -> str:
+    low = str(path).lower().replace("\\", "/")
+    if "/open_sea" in low:
+        return "open_sea"
+    if "/coastal" in low:
+        return "coastal"
+    if "/island_complex" in low:
+        return "island_complex"
+    if "/port" in low:
+        return "port"
+    return "unknown"
+
+
 def _extract_patch_inside(background_bgr: np.ndarray, x1: int, y1: int, image_size: int) -> np.ndarray:
     return background_bgr[y1 : y1 + image_size, x1 : x1 + image_size].copy()
 
@@ -205,6 +218,9 @@ def _render_real_asset_frame(
     min_target_visibility: float,
     placement_attempts: int,
     points_per_background: int,
+    fixed_background: dict | None = None,
+    fixed_target: Path | None = None,
+    allow_relaxed_water_ratio: bool = False,
 ) -> tuple[np.ndarray, list[float], float, dict]:
     bg_pool = backgrounds_by_split.get(split, [])
     target_pool = targets_by_split.get(split, [])
@@ -217,7 +233,7 @@ def _render_real_asset_frame(
     cy = float(frame.center_px[1])
     best_candidate: tuple[float, np.ndarray, list[float], float, dict] | None = None
     for _ in range(max(1, int(placement_attempts))):
-        bg_rec = bg_pool[int(rng.integers(0, len(bg_pool)))]
+        bg_rec = fixed_background if fixed_background is not None else bg_pool[int(rng.integers(0, len(bg_pool)))]
         bg_path = Path(bg_rec["image_path"])
         mask_path = Path(bg_rec["mask_path"])
         bg = cv2.imread(str(bg_path), cv2.IMREAD_COLOR)
@@ -230,7 +246,7 @@ def _render_real_asset_frame(
         if mask.shape[:2] != bg.shape[:2]:
             mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
-        target_path = target_pool[int(rng.integers(0, len(target_pool)))]
+        target_path = Path(fixed_target) if fixed_target is not None else target_pool[int(rng.integers(0, len(target_pool)))]
         target = read_bgra(target_path)
         target = trim_bgra_to_alpha_bbox(target)
         target = _resize_bgra_to_long_side(target, STAGE_SCALE_PX.get(frame.stage, 18.0), image_size)
@@ -282,13 +298,14 @@ def _render_real_asset_frame(
                 "asset_mode": "real",
                 "background_path": str(bg_path),
                 "water_mask_path": str(mask_path),
+                "background_category": _infer_background_category_from_path(bg_path),
                 "target_asset_path": str(target_path),
                 "target_water_ratio": float(ratio),
             }
             if ratio >= min_target_water_ratio:
                 return canvas, bbox, float(visibility), asset_meta
             score = float(ratio) + 0.05 * float(visibility)
-            if ratio >= 0.85 and (best_candidate is None or score > best_candidate[0]):
+            if allow_relaxed_water_ratio and ratio >= 0.85 and (best_candidate is None or score > best_candidate[0]):
                 best_candidate = (score, canvas, bbox, float(visibility), asset_meta)
 
     if best_candidate is not None:
@@ -363,6 +380,7 @@ def _label_row(
         "bbox_xywh": bbox,
         "visibility": float(visibility),
         "background_asset_id": Path(str((asset_meta or {}).get("background_path", f"phase3_ocean_{split}_{seq_idx:06d}"))).stem,
+        "background_category": str((asset_meta or {}).get("background_category", "unknown")),
         "target_asset_id": Path(str((asset_meta or {}).get("target_asset_path", f"phase3_target_{split}"))).stem,
         "distractor_asset_ids": [],
         "motion_mode": frame.motion_mode,
@@ -406,6 +424,7 @@ def _label_row(
             "scale_px": float(STAGE_SCALE_PX.get(frame.stage, 18.0)),
             "obs_valid": bool(visibility > 0.0),
             "asset_mode": str((asset_meta or {}).get("asset_mode", "procedural")),
+            "background_category": str((asset_meta or {}).get("background_category", "unknown")),
             "background_path": (asset_meta or {}).get("background_path"),
             "water_mask_path": (asset_meta or {}).get("water_mask_path"),
             "target_asset_path": (asset_meta or {}).get("target_asset_path"),
@@ -428,6 +447,7 @@ def main() -> None:
     parser.add_argument("--include-review-backgrounds", action="store_true")
     parser.add_argument("--min-target-water-ratio", type=float, default=0.98)
     parser.add_argument("--min-target-visibility", type=float, default=0.35)
+    parser.add_argument("--allow-relaxed-water-ratio", action="store_true")
     parser.add_argument("--placement-attempts", type=int, default=160)
     parser.add_argument("--points-per-background", type=int, default=64)
     parser.add_argument(
@@ -494,6 +514,16 @@ def main() -> None:
         with manifest_path.open("w", encoding="utf-8") as manifest_f:
             for seq_idx in range(int(args.sequences)):
                 split = _split_for_sequence(seq_idx, int(args.sequences))
+                seq_rng = np.random.default_rng(base_seed + seq_idx * 1000003)
+                seq_background: dict | None = None
+                seq_target: Path | None = None
+                if args.asset_mode == "real":
+                    bg_pool = backgrounds_by_split.get(split, [])
+                    target_pool = targets_by_split.get(split, [])
+                    if not bg_pool or not target_pool:
+                        raise RuntimeError(f"Missing real assets for split={split}.")
+                    seq_background = bg_pool[int(seq_rng.integers(0, len(bg_pool)))]
+                    seq_target = target_pool[int(seq_rng.integers(0, len(target_pool)))]
                 rows = sample_phase3_task_sequence(
                     sequence_idx=seq_idx,
                     target_cfg=target_cfg,
@@ -516,6 +546,9 @@ def main() -> None:
                             min_target_visibility=float(args.min_target_visibility),
                             placement_attempts=int(args.placement_attempts),
                             points_per_background=int(args.points_per_background),
+                            fixed_background=seq_background,
+                            fixed_target=seq_target,
+                            allow_relaxed_water_ratio=bool(args.allow_relaxed_water_ratio),
                         )
                     else:
                         canvas = _make_ocean_background(image_size, rng)
@@ -566,6 +599,12 @@ def main() -> None:
         }
         if args.asset_mode == "real"
         else None,
+        "sequence_policy": {
+            "fixed_background_per_sequence": bool(args.asset_mode == "real"),
+            "fixed_target_template_per_sequence": bool(args.asset_mode == "real"),
+            "allow_relaxed_water_ratio": bool(args.allow_relaxed_water_ratio),
+            "min_target_water_ratio": float(args.min_target_water_ratio),
+        },
         "stage_counts": stage_counts,
         "split_counts": split_counts,
         "total_frames": total_rows,
