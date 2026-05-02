@@ -58,6 +58,13 @@ def _iter_images(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
 
 
+def _iter_split_pngs(root: Path, split: str) -> list[Path]:
+    split_root = root / split
+    if not split_root.exists():
+        return []
+    return sorted(p for p in split_root.iterdir() if p.is_file() and p.suffix.lower() == ".png")
+
+
 def _infer_split(path: Path) -> str | None:
     parts = {p.lower() for p in path.parts}
     for split in ("train", "val", "test"):
@@ -142,19 +149,11 @@ def _collect_targets(
     allow_keywords: tuple[str, ...] = DEFAULT_TARGET_ALLOW_KEYWORDS,
     reject_keywords: tuple[str, ...] = DEFAULT_TARGET_REJECT_KEYWORDS,
 ) -> dict[str, list[Path]]:
-    roots = [
-        assets_root / "target_templates" / "alpha_png",
-        assets_root / "target_templates",
-    ]
+    root = assets_root / "target_templates" / "alpha_png"
     out: dict[str, list[Path]] = {"train": [], "val": [], "test": []}
     seen: set[Path] = set()
-    for root in roots:
-        for path in _iter_images(root):
-            if path.suffix.lower() != ".png":
-                continue
-            split = _infer_split(path)
-            if split is None:
-                continue
+    for split in ("train", "val", "test"):
+        for path in _iter_split_pngs(root, split):
             if not _target_template_allowed(path, allow_keywords=allow_keywords, reject_keywords=reject_keywords):
                 continue
             rp = path.resolve()
@@ -171,19 +170,11 @@ def _collect_distractors(
     allow_keywords: tuple[str, ...] = DEFAULT_TARGET_ALLOW_KEYWORDS,
     reject_keywords: tuple[str, ...] = DEFAULT_TARGET_REJECT_KEYWORDS,
 ) -> dict[str, list[Path]]:
-    roots = [
-        assets_root / "distractor_templates" / "alpha_png",
-        assets_root / "distractor_templates",
-    ]
+    root = assets_root / "distractor_templates" / "alpha_png"
     out: dict[str, list[Path]] = {"train": [], "val": [], "test": []}
     seen: set[Path] = set()
-    for root in roots:
-        for path in _iter_images(root):
-            if path.suffix.lower() != ".png":
-                continue
-            split = _infer_split(path)
-            if split is None:
-                continue
+    for split in ("train", "val", "test"):
+        for path in _iter_split_pngs(root, split):
             if not _template_allowed(path, allow_keywords=allow_keywords, reject_keywords=reject_keywords):
                 continue
             rp = path.resolve()
