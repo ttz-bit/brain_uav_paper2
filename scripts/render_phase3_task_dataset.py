@@ -602,6 +602,7 @@ def main() -> None:
     parser.add_argument("--allow-relaxed-water-ratio", action="store_true")
     parser.add_argument("--placement-attempts", type=int, default=160)
     parser.add_argument("--points-per-background", type=int, default=64)
+    parser.add_argument("--sequence-placement-attempts", type=int, default=24)
     parser.add_argument("--distractor-count-min", type=int, default=0)
     parser.add_argument("--distractor-count-max", type=int, default=0)
     parser.add_argument("--min-distractor-target-distance-px", type=float, default=48.0)
@@ -695,16 +696,6 @@ def main() -> None:
         with manifest_path.open("w", encoding="utf-8") as manifest_f:
             for seq_idx in range(int(args.sequences)):
                 split = _split_for_sequence(seq_idx, int(args.sequences))
-                seq_rng = np.random.default_rng(base_seed + seq_idx * 1000003)
-                seq_background: dict | None = None
-                seq_target: Path | None = None
-                if args.asset_mode == "real":
-                    bg_pool = backgrounds_by_split.get(split, [])
-                    target_pool = targets_by_split.get(split, [])
-                    if not bg_pool or not target_pool:
-                        raise RuntimeError(f"Missing real assets for split={split}.")
-                    seq_background = bg_pool[int(seq_rng.integers(0, len(bg_pool)))]
-                    seq_target = target_pool[int(seq_rng.integers(0, len(target_pool)))]
                 rows = sample_phase3_task_sequence(
                     sequence_idx=seq_idx,
                     target_cfg=target_cfg,
@@ -712,33 +703,63 @@ def main() -> None:
                     seed=base_seed + seq_idx,
                     frames=int(args.frames),
                 )
-                for frame in rows:
-                    rng = np.random.default_rng(base_seed + seq_idx * 100000 + int(frame.frame_id))
-                    asset_meta: dict | None = None
+                rendered_sequence: list[tuple[Phase3TaskFrame, np.ndarray, list[float], float, dict]] = []
+                last_error: Exception | None = None
+                sequence_attempts = max(1, int(args.sequence_placement_attempts))
+                for seq_attempt in range(sequence_attempts):
+                    rendered_sequence = []
+                    seq_background: dict | None = None
+                    seq_target: Path | None = None
                     if args.asset_mode == "real":
-                        canvas, bbox, visibility, asset_meta = _render_real_asset_frame(
-                            frame,
-                            split=split,
-                            backgrounds_by_split=backgrounds_by_split,
-                            targets_by_split=targets_by_split,
-                            distractors_by_split=distractors_by_split,
-                            image_size=image_size,
-                            rng=rng,
-                            min_target_water_ratio=float(args.min_target_water_ratio),
-                            min_target_visibility=float(args.min_target_visibility),
-                            placement_attempts=int(args.placement_attempts),
-                            points_per_background=int(args.points_per_background),
-                            distractor_count_min=int(args.distractor_count_min),
-                            distractor_count_max=int(args.distractor_count_max),
-                            min_distractor_target_distance_px=float(args.min_distractor_target_distance_px),
-                            fixed_background=seq_background,
-                            fixed_target=seq_target,
-                            allow_relaxed_water_ratio=bool(args.allow_relaxed_water_ratio),
-                        )
-                    else:
-                        canvas = _make_ocean_background(image_size, rng)
-                        bbox, visibility = _draw_target(canvas, frame, rng)
-                        asset_meta = {"asset_mode": "procedural"}
+                        seq_rng = np.random.default_rng(base_seed + seq_idx * 1000003 + seq_attempt * 10007)
+                        bg_pool = backgrounds_by_split.get(split, [])
+                        target_pool = targets_by_split.get(split, [])
+                        if not bg_pool or not target_pool:
+                            raise RuntimeError(f"Missing real assets for split={split}.")
+                        seq_background = bg_pool[int(seq_rng.integers(0, len(bg_pool)))]
+                        seq_target = target_pool[int(seq_rng.integers(0, len(target_pool)))]
+                    try:
+                        for frame in rows:
+                            rng = np.random.default_rng(
+                                base_seed + seq_idx * 100000 + int(frame.frame_id) + seq_attempt * 10000019
+                            )
+                            asset_meta: dict | None = None
+                            if args.asset_mode == "real":
+                                canvas, bbox, visibility, asset_meta = _render_real_asset_frame(
+                                    frame,
+                                    split=split,
+                                    backgrounds_by_split=backgrounds_by_split,
+                                    targets_by_split=targets_by_split,
+                                    distractors_by_split=distractors_by_split,
+                                    image_size=image_size,
+                                    rng=rng,
+                                    min_target_water_ratio=float(args.min_target_water_ratio),
+                                    min_target_visibility=float(args.min_target_visibility),
+                                    placement_attempts=int(args.placement_attempts),
+                                    points_per_background=int(args.points_per_background),
+                                    distractor_count_min=int(args.distractor_count_min),
+                                    distractor_count_max=int(args.distractor_count_max),
+                                    min_distractor_target_distance_px=float(args.min_distractor_target_distance_px),
+                                    fixed_background=seq_background,
+                                    fixed_target=seq_target,
+                                    allow_relaxed_water_ratio=bool(args.allow_relaxed_water_ratio),
+                                )
+                            else:
+                                canvas = _make_ocean_background(image_size, rng)
+                                bbox, visibility = _draw_target(canvas, frame, rng)
+                                asset_meta = {"asset_mode": "procedural"}
+                            rendered_sequence.append((frame, canvas, bbox, float(visibility), dict(asset_meta or {})))
+                    except RuntimeError as exc:
+                        last_error = exc
+                        continue
+                    break
+                if not rendered_sequence or len(rendered_sequence) != len(rows):
+                    raise RuntimeError(
+                        f"Could not render full sequence seq_idx={seq_idx}, split={split}, "
+                        f"attempts={sequence_attempts}. last_error={last_error}"
+                    )
+
+                for frame, canvas, bbox, visibility, asset_meta in rendered_sequence:
                     image_path = images_dir / split / frame.sequence_id / f"{int(frame.frame_id):04d}.png"
                     image_path.parent.mkdir(parents=True, exist_ok=True)
                     cv2.imwrite(str(image_path), canvas)
