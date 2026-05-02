@@ -42,14 +42,21 @@ def main() -> None:
     distractor_water_ratio_violations = 0
     sequence_background_violations = 0
     sequence_target_violations = 0
+    sequence_stage_order_violations = 0
+    sequence_range_monotonic_violations = 0
+    sequence_motion_mode_violations = 0
+    target_motion_step_violations = 0
     ranges = []
     offcenter = []
     center_bbox_deltas = []
     target_water_ratios = []
     distractor_counts = []
     distractor_water_ratios = []
+    target_motion_steps = []
     sequence_backgrounds: dict[str, str] = {}
     sequence_targets: dict[str, str] = {}
+    rows_by_sequence: dict[str, list[dict]] = {}
+    motion_mode_sequence_counts: dict[str, int] = {}
 
     for split in ("train", "val", "test"):
         label_path = labels_dir / f"{split}.jsonl"
@@ -81,6 +88,7 @@ def main() -> None:
             center_bbox_deltas.append(center_bbox_delta)
             meta = dict(row.get("meta", {}))
             seq_id = str(row["sequence_id"])
+            rows_by_sequence.setdefault(seq_id, []).append(row)
             bg_path = str(meta.get("background_path", row.get("background_asset_id", "")))
             target_path = str(meta.get("target_asset_path", row.get("target_asset_id", "")))
             prev_bg = sequence_backgrounds.setdefault(seq_id, bg_path)
@@ -120,20 +128,60 @@ def main() -> None:
                 invalid_stage += 1
             offcenter.append(float(np.hypot(cx - 0.5 * w, cy - 0.5 * h)))
 
+    stage_order = {"far": 0, "mid": 1, "terminal": 2}
+    for seq_id, seq_rows in rows_by_sequence.items():
+        seq_rows = sorted(seq_rows, key=lambda row: int(row["frame_id"]))
+        seq_stages = [str(row["stage"]) for row in seq_rows]
+        seq_stage_indices = [stage_order.get(stage, -1) for stage in seq_stages]
+        if any(idx < 0 for idx in seq_stage_indices) or any(
+            seq_stage_indices[i] > seq_stage_indices[i + 1] for i in range(len(seq_stage_indices) - 1)
+        ):
+            sequence_stage_order_violations += 1
+
+        seq_ranges = [float(dict(row.get("meta", {})).get("range_xy_km", -1.0)) for row in seq_rows]
+        if any(seq_ranges[i] + 1e-6 < seq_ranges[i + 1] for i in range(len(seq_ranges) - 1)):
+            sequence_range_monotonic_violations += 1
+
+        seq_modes = {str(row.get("motion_mode", "")) for row in seq_rows}
+        if len(seq_modes) != 1:
+            sequence_motion_mode_violations += 1
+        else:
+            mode = next(iter(seq_modes))
+            motion_mode_sequence_counts[mode] = motion_mode_sequence_counts.get(mode, 0) + 1
+
+        prev_xy = None
+        for row in seq_rows:
+            target_state = dict(dict(row.get("meta", {})).get("target_state_world", {}))
+            xy = np.array([float(target_state.get("x", 0.0)), float(target_state.get("y", 0.0))], dtype=float)
+            if prev_xy is not None:
+                step = float(np.linalg.norm(xy - prev_xy))
+                target_motion_steps.append(step)
+                if step > 0.1:
+                    target_motion_step_violations += 1
+            prev_xy = xy
+
     range_arr = np.asarray(ranges, dtype=float)
     off_arr = np.asarray(offcenter, dtype=float)
     center_bbox_delta_arr = np.asarray(center_bbox_deltas, dtype=float)
     target_water_ratio_arr = np.asarray(target_water_ratios, dtype=float)
     distractor_count_arr = np.asarray(distractor_counts, dtype=float)
     distractor_water_ratio_arr = np.asarray(distractor_water_ratios, dtype=float)
+    target_motion_step_arr = np.asarray(target_motion_steps, dtype=float)
+    expected_motion_modes = {"cv", "turn", "piecewise", "evasive"}
+    motion_mode_coverage_ok = expected_motion_modes.issubset(set(motion_mode_sequence_counts))
     report = {
         "dataset_root": str(root),
         "total_frames": int(total),
         "split_counts": split_counts,
         "stage_counts": stage_counts,
+        "sequence_count": int(len(rows_by_sequence)),
+        "motion_mode_sequence_counts": motion_mode_sequence_counts,
+        "motion_mode_coverage_ok": bool(motion_mode_coverage_ok),
         "range_xy_min_km": float(range_arr.min()) if range_arr.size else 0.0,
         "range_xy_mean_km": float(range_arr.mean()) if range_arr.size else 0.0,
         "range_xy_max_km": float(range_arr.max()) if range_arr.size else 0.0,
+        "target_motion_step_km_mean": float(target_motion_step_arr.mean()) if target_motion_step_arr.size else 0.0,
+        "target_motion_step_km_max": float(target_motion_step_arr.max()) if target_motion_step_arr.size else 0.0,
         "offcenter_px_mean": float(off_arr.mean()) if off_arr.size else 0.0,
         "offcenter_px_max": float(off_arr.max()) if off_arr.size else 0.0,
         "center_bbox_delta_px_mean": float(center_bbox_delta_arr.mean()) if center_bbox_delta_arr.size else 0.0,
@@ -153,6 +201,10 @@ def main() -> None:
         "distractor_water_ratio_violations": int(distractor_water_ratio_violations),
         "sequence_background_violations": int(sequence_background_violations),
         "sequence_target_violations": int(sequence_target_violations),
+        "sequence_stage_order_violations": int(sequence_stage_order_violations),
+        "sequence_range_monotonic_violations": int(sequence_range_monotonic_violations),
+        "sequence_motion_mode_violations": int(sequence_motion_mode_violations),
+        "target_motion_step_violations": int(target_motion_step_violations),
         "target_not_water": int(not_water),
         "invalid_stage_ranges": int(invalid_stage),
         "errors": errors[:100],
@@ -169,6 +221,11 @@ def main() -> None:
             and distractor_water_ratio_violations == 0
             and sequence_background_violations == 0
             and sequence_target_violations == 0
+            and sequence_stage_order_violations == 0
+            and sequence_range_monotonic_violations == 0
+            and sequence_motion_mode_violations == 0
+            and target_motion_step_violations == 0
+            and motion_mode_coverage_ok
             and not_water == 0
             and invalid_stage == 0
         ),
