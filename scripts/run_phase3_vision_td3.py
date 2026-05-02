@@ -38,6 +38,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-z-policy", choices=["keep_current_goal_z"], default="keep_current_goal_z")
     p.add_argument("--capture-radius-km", type=float, default=None)
     p.add_argument("--max-vision-samples", type=int, default=None)
+    p.add_argument("--disable-estimate-gating", action="store_true")
+    p.add_argument("--gate-far-km", type=float, default=300.0)
+    p.add_argument("--gate-mid-km", type=float, default=120.0)
+    p.add_argument("--gate-terminal-km", type=float, default=25.0)
+    p.add_argument("--gain-far", type=float, default=0.25)
+    p.add_argument("--gain-mid", type=float, default=0.50)
+    p.add_argument("--gain-terminal", type=float, default=0.80)
     p.add_argument("--out-dir", type=str, default="outputs/phase3_vision_td3/cnn_td3_snn_hard")
     return p.parse_args()
 
@@ -231,6 +238,115 @@ def _vision_estimate_from_row(
     return est, error_km
 
 
+def _stage_gate_threshold(stage: str, args: argparse.Namespace) -> float:
+    if stage == "terminal":
+        return float(args.gate_terminal_km)
+    if stage == "mid":
+        return float(args.gate_mid_km)
+    return float(args.gate_far_km)
+
+
+def _stage_update_gain(stage: str, args: argparse.Namespace) -> float:
+    if stage == "terminal":
+        return float(np.clip(args.gain_terminal, 0.0, 1.0))
+    if stage == "mid":
+        return float(np.clip(args.gain_mid, 0.0, 1.0))
+    return float(np.clip(args.gain_far, 0.0, 1.0))
+
+
+def _gate_and_smooth_estimate(
+    candidate: TargetEstimateState,
+    previous: TargetEstimateState | None,
+    *,
+    stage: str,
+    args: argparse.Namespace,
+) -> tuple[TargetEstimateState, bool, float, float]:
+    if previous is None or bool(args.disable_estimate_gating):
+        meta = dict(candidate.meta or {})
+        meta.update(
+            {
+                "gate_enabled": not bool(args.disable_estimate_gating),
+                "gate_accepted": True,
+                "gate_innovation_km": 0.0,
+                "gate_threshold_km": _stage_gate_threshold(stage, args),
+                "update_gain": 1.0,
+            }
+        )
+        candidate.meta = meta
+        return candidate, True, 0.0, 1.0
+
+    cand_pos = np.asarray(candidate.pos_world_est, dtype=float).reshape(-1)
+    prev_pos = np.asarray(previous.pos_world_est, dtype=float).reshape(-1)
+    prev_vel = np.asarray(previous.vel_world_est, dtype=float).reshape(-1)
+    dim = min(cand_pos.size, prev_pos.size)
+    dt = max(float(candidate.t) - float(previous.t), 1.0)
+    predicted = prev_pos.copy()
+    if prev_vel.size >= dim:
+        predicted[:dim] = prev_pos[:dim] + prev_vel[:dim] * dt
+    innovation = float(np.linalg.norm(cand_pos[:2] - predicted[:2]))
+    threshold = _stage_gate_threshold(stage, args)
+    gain = _stage_update_gain(stage, args)
+
+    if innovation > threshold:
+        meta = dict(previous.meta or {})
+        meta.update(
+            {
+                "source": "vision_observation_gated",
+                "valid": True,
+                "gate_enabled": True,
+                "gate_accepted": False,
+                "gate_innovation_km": float(innovation),
+                "gate_threshold_km": float(threshold),
+                "update_gain": 0.0,
+                "rejected_measurement_pos_world": cand_pos.tolist(),
+            }
+        )
+        cov = np.asarray(previous.cov, dtype=float).copy() * 1.5
+        gated = TargetEstimateState(
+            t=float(candidate.t),
+            pos_world_est=predicted,
+            vel_world_est=prev_vel.copy(),
+            cov=cov,
+            obs_conf=min(float(previous.obs_conf), float(candidate.obs_conf)) * 0.5,
+            obs_age=float(previous.obs_age) + dt,
+            meta=meta,
+        )
+        return gated, False, innovation, 0.0
+
+    fused_pos = predicted.copy()
+    fused_pos[:dim] = (1.0 - gain) * predicted[:dim] + gain * cand_pos[:dim]
+    fused_vel = prev_vel.copy()
+    if fused_vel.size >= dim:
+        fused_vel[:dim] = (fused_pos[:dim] - prev_pos[:dim]) / dt
+    else:
+        fused_vel = np.zeros_like(fused_pos)
+        fused_vel[:dim] = (fused_pos[:dim] - prev_pos[:dim]) / dt
+    meta = dict(candidate.meta or {})
+    meta.update(
+        {
+            "source": "vision_observation_gated",
+            "valid": True,
+            "gate_enabled": True,
+            "gate_accepted": True,
+            "gate_innovation_km": float(innovation),
+            "gate_threshold_km": float(threshold),
+            "update_gain": float(gain),
+            "raw_measurement_pos_world": cand_pos.tolist(),
+        }
+    )
+    fused_cov = (1.0 - gain) * np.asarray(previous.cov, dtype=float) + gain * np.asarray(candidate.cov, dtype=float)
+    fused = TargetEstimateState(
+        t=float(candidate.t),
+        pos_world_est=fused_pos,
+        vel_world_est=fused_vel,
+        cov=fused_cov,
+        obs_conf=float(candidate.obs_conf),
+        obs_age=0.0,
+        meta=meta,
+    )
+    return fused, True, innovation, gain
+
+
 def _set_goal_from_estimate(bridge: Paper1EnvBridge, estimate: TargetEstimateState, target_z_km: float) -> None:
     pos = np.asarray(estimate.pos_world_est, dtype=float).reshape(-1)
     pos3 = np.array([pos[0], pos[1], float(target_z_km)], dtype=float)
@@ -351,6 +467,7 @@ def main() -> None:
             if args.capture_radius_km is not None
             else float(getattr(bridge.env.scenario, "goal_radius", 5.0))
         )
+        prev_estimate: TargetEstimateState | None = None
 
         for step_idx in range(int(args.steps)):
             aircraft = bridge.get_aircraft_state()
@@ -365,7 +482,7 @@ def main() -> None:
             if image is None:
                 raise FileNotFoundError(f"Could not read vision sample image: {image_path}")
             pred_x, pred_y, pred_conf = _predict_cnn(cnn_model, image, device)
-            estimate, vision_error_km = _vision_estimate_from_row(
+            raw_estimate, vision_error_km = _vision_estimate_from_row(
                 row=sample_row,
                 pred_center_px=(pred_x, pred_y),
                 pred_conf=pred_conf,
@@ -373,6 +490,13 @@ def main() -> None:
                 current_target_z=target_z,
                 t=float(aircraft.t),
             )
+            estimate, gate_accepted, gate_innovation_km, gate_gain = _gate_and_smooth_estimate(
+                raw_estimate,
+                prev_estimate,
+                stage=stage,
+                args=args,
+            )
+            prev_estimate = estimate
             _set_goal_from_estimate(bridge, estimate, target_z)
             action = policy.act(bridge.env._get_obs())
             step_result = bridge.step(action)
@@ -394,6 +518,10 @@ def main() -> None:
                 "vision_pred_x": float(pred_x),
                 "vision_pred_y": float(pred_y),
                 "vision_conf": float(pred_conf),
+                "vision_gate_accepted": bool(gate_accepted),
+                "vision_gate_innovation_km": float(gate_innovation_km),
+                "vision_gate_gain": float(gate_gain),
+                "vision_gate_threshold_km": float(_stage_gate_threshold(stage, args)),
                 "aircraft_x": float(aircraft_pos[0]),
                 "aircraft_y": float(aircraft_pos[1]),
                 "aircraft_z": float(aircraft_pos[2]),
@@ -446,6 +574,7 @@ def main() -> None:
     final_ranges = np.asarray([float(s["final_range_km"]) for s in summaries], dtype=float)
     est_errors = np.asarray([float(s["mean_est_error_km"]) for s in summaries], dtype=float)
     vision_errors = np.asarray([float(s["mean_vision_error_km"]) for s in summaries], dtype=float)
+    gate_rejections = int(sum(1 for r in all_rows if not bool(r.get("vision_gate_accepted", True))))
     violation_counts = np.asarray([int(s["zone_violation_count"]) for s in summaries], dtype=int)
     safety_violation_counts = np.asarray([int(s["safety_margin_violation_count"]) for s in summaries], dtype=int)
     capture_count = int(sum(1 for s in summaries if bool(s["captured"])))
@@ -472,6 +601,15 @@ def main() -> None:
         "unit": "km",
         "capture_radius_km": float(args.capture_radius_km if args.capture_radius_km is not None else 5.0),
         "vision_sample_counts": {k: int(len(v)) for k, v in grouped.items()},
+        "estimate_gating": {
+            "enabled": not bool(args.disable_estimate_gating),
+            "gate_far_km": float(args.gate_far_km),
+            "gate_mid_km": float(args.gate_mid_km),
+            "gate_terminal_km": float(args.gate_terminal_km),
+            "gain_far": float(args.gain_far),
+            "gain_mid": float(args.gain_mid),
+            "gain_terminal": float(args.gain_terminal),
+        },
         "policy_diagnostics": policy_diag,
         "metrics": {
             "episodes_completed": int(len(summaries)),
@@ -482,6 +620,8 @@ def main() -> None:
             "final_range_mean_km": float(final_ranges.mean()) if final_ranges.size else 0.0,
             "target_est_error_mean_km": float(est_errors.mean()) if est_errors.size else 0.0,
             "vision_error_mean_km": float(vision_errors.mean()) if vision_errors.size else 0.0,
+            "vision_gate_rejection_count": int(gate_rejections),
+            "vision_gate_rejection_rate": float(gate_rejections / max(1, len(all_rows))),
             "zone_violation_total": int(violation_counts.sum()) if violation_counts.size else 0,
             "zone_violation_episode_count": int((violation_counts > 0).sum()) if violation_counts.size else 0,
             "safety_margin_violation_total": int(safety_violation_counts.sum()) if safety_violation_counts.size else 0,

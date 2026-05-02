@@ -260,6 +260,7 @@ def _render_real_asset_frame(
     points_per_background: int,
     distractor_count_min: int = 0,
     distractor_count_max: int = 0,
+    min_distractor_target_distance_px: float = 48.0,
     fixed_background: dict | None = None,
     fixed_target: Path | None = None,
     allow_relaxed_water_ratio: bool = False,
@@ -345,6 +346,7 @@ def _render_real_asset_frame(
                 rng=rng,
                 count_min=int(distractor_count_min),
                 count_max=int(distractor_count_max),
+                min_target_distance_px=float(min_distractor_target_distance_px),
                 min_water_ratio=float(min_target_water_ratio),
                 min_visibility=float(min_target_visibility),
             )
@@ -393,6 +395,7 @@ def _place_distractors(
     rng: np.random.Generator,
     count_min: int,
     count_max: int,
+    min_target_distance_px: float,
     min_water_ratio: float,
     min_visibility: float,
 ) -> tuple[list[dict], bool]:
@@ -434,7 +437,7 @@ def _place_distractors(
             dy = float(yy_all[idx])
             if dx - radius < 0 or dy - radius < 0 or dx + radius >= image_w or dy + radius >= image_h:
                 continue
-            target_clearance = max(18.0, 0.55 * target_long + radius + 6.0)
+            target_clearance = max(float(min_target_distance_px), 0.55 * target_long + radius + 6.0)
             if float(np.hypot(dx - target_cx, dy - target_cy)) < target_clearance:
                 continue
             if any(float(np.hypot(dx - d["center_px"][0], dy - d["center_px"][1])) < radius + d["radius_px"] + 4.0 for d in placed):
@@ -610,6 +613,7 @@ def main() -> None:
     parser.add_argument("--points-per-background", type=int, default=64)
     parser.add_argument("--distractor-count-min", type=int, default=0)
     parser.add_argument("--distractor-count-max", type=int, default=0)
+    parser.add_argument("--min-distractor-target-distance-px", type=float, default=48.0)
     parser.add_argument(
         "--target-allow-keywords",
         type=str,
@@ -735,6 +739,7 @@ def main() -> None:
                             points_per_background=int(args.points_per_background),
                             distractor_count_min=int(args.distractor_count_min),
                             distractor_count_max=int(args.distractor_count_max),
+                            min_distractor_target_distance_px=float(args.min_distractor_target_distance_px),
                             fixed_background=seq_background,
                             fixed_target=seq_target,
                             allow_relaxed_water_ratio=bool(args.allow_relaxed_water_ratio),
@@ -802,6 +807,7 @@ def main() -> None:
             "min_target_water_ratio": float(args.min_target_water_ratio),
             "distractor_count_min": int(args.distractor_count_min),
             "distractor_count_max": int(args.distractor_count_max),
+            "min_distractor_target_distance_px": float(args.min_distractor_target_distance_px),
         },
         "stage_counts": stage_counts,
         "split_counts": split_counts,
