@@ -44,6 +44,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--train-eval-max-samples", type=int, default=2048)
     p.add_argument("--val-eval-max-samples", type=int, default=0)
     p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--prefetch-factor", type=int, default=2)
+    p.add_argument("--persistent-workers", action="store_true")
+    p.add_argument("--save-last-each-epoch", action="store_true")
     p.add_argument("--num-threads", type=int, default=0)
     p.add_argument("--num-interop-threads", type=int, default=0)
     p.add_argument("--strict-no-leak", action="store_true")
@@ -154,6 +157,10 @@ def main() -> None:
         torch.set_num_threads(int(args.num_threads))
     if int(args.num_interop_threads) > 0:
         torch.set_num_interop_threads(int(args.num_interop_threads))
+    if int(args.num_workers) > 0:
+        cv2.setNumThreads(0)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
     rng = np.random.default_rng(int(args.seed))
     torch.manual_seed(int(args.seed))
     if torch.cuda.is_available():
@@ -198,14 +205,20 @@ def main() -> None:
             return torch.from_numpy(x), torch.from_numpy(y)
 
     num_workers = max(0, int(args.num_workers))
-    loader = DataLoader(
-        _RenderedTorchDataset(train_ds),
-        batch_size=max(1, int(args.batch_size)),
-        shuffle=True,
-        drop_last=False,
-        num_workers=num_workers,
-        pin_memory=(device == "cuda"),
-    )
+    def _loader(ds, *, batch_size: int, shuffle: bool):
+        kwargs = {
+            "batch_size": max(1, int(batch_size)),
+            "shuffle": bool(shuffle),
+            "drop_last": False,
+            "num_workers": num_workers,
+            "pin_memory": (device == "cuda"),
+        }
+        if num_workers > 0:
+            kwargs["prefetch_factor"] = max(1, int(args.prefetch_factor))
+            kwargs["persistent_workers"] = bool(args.persistent_workers)
+        return DataLoader(ds, **kwargs)
+
+    loader = _loader(_RenderedTorchDataset(train_ds), batch_size=int(args.batch_size), shuffle=True)
     model = HeatmapSNN(
         beta=float(args.beta),
         num_steps=int(args.num_steps),
@@ -237,22 +250,8 @@ def main() -> None:
     val_eval_indices = _sample_indices(len(val_ds), int(args.val_eval_max_samples))
     train_eval_count = int(len(train_ds) if train_eval_indices is None else len(train_eval_indices))
     val_eval_count = int(len(val_ds) if val_eval_indices is None else len(val_eval_indices))
-    train_eval_loader = DataLoader(
-        _RenderedTorchDataset(train_ds, train_eval_indices),
-        batch_size=max(1, int(args.eval_batch_size)),
-        shuffle=False,
-        drop_last=False,
-        num_workers=num_workers,
-        pin_memory=(device == "cuda"),
-    )
-    val_eval_loader = DataLoader(
-        _RenderedTorchDataset(val_ds, val_eval_indices),
-        batch_size=max(1, int(args.eval_batch_size)),
-        shuffle=False,
-        drop_last=False,
-        num_workers=num_workers,
-        pin_memory=(device == "cuda"),
-    )
+    train_eval_loader = _loader(_RenderedTorchDataset(train_ds, train_eval_indices), batch_size=int(args.eval_batch_size), shuffle=False)
+    val_eval_loader = _loader(_RenderedTorchDataset(val_ds, val_eval_indices), batch_size=int(args.eval_batch_size), shuffle=False)
 
     def _eval_loader(eval_loader) -> dict[str, float]:
         model.eval()
@@ -313,6 +312,7 @@ def main() -> None:
 
     best_val = float("inf")
     best_path = out_dir / "model_best.pth"
+    last_path = out_dir / "model_last.pth"
     loss_trace: list[dict] = []
     epochs = max(1, int(args.epochs))
     eval_interval = max(1, int(args.eval_interval))
@@ -384,15 +384,52 @@ def main() -> None:
                     "train_encoding": str(args.train_encoding),
                     "eval_encoding": str(args.eval_encoding),
                     "decode_method": str(args.decode_method),
+                    "epoch": int(ep + 1),
+                    "best_val_loss": float(best_val),
+                    "optimizer_state": optimizer.state_dict(),
                 },
                 best_path,
             )
+        if bool(args.save_last_each_epoch):
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "model_type": "snn_heatmap",
+                    "seed": int(args.seed),
+                    "dataset_root": str(dataset_root),
+                    "train_split": str(args.train_split),
+                    "val_split": str(args.val_split),
+                    "num_train": int(len(train_ds)),
+                    "num_val": int(len(val_ds)),
+                    "input_size": int(args.input_size),
+                    "heatmap_size": int(args.heatmap_size),
+                    "heatmap_sigma": float(args.heatmap_sigma),
+                    "heatmap_weight": float(args.heatmap_weight),
+                    "coord_weight": float(args.coord_weight),
+                    "conf_weight": float(args.conf_weight),
+                    "softargmax_temperature": float(args.softargmax_temperature),
+                    "loss_kind": "spatial_cross_entropy_plus_coordinate",
+                    "num_steps": int(args.num_steps),
+                    "beta": float(args.beta),
+                    "train_encoding": str(args.train_encoding),
+                    "eval_encoding": str(args.eval_encoding),
+                    "decode_method": str(args.decode_method),
+                    "epoch": int(ep + 1),
+                    "best_val_loss": float(best_val),
+                    "optimizer_state": optimizer.state_dict(),
+                },
+                last_path,
+            )
+        (out_dir / "loss_trace.json").write_text(json.dumps(loss_trace, ensure_ascii=False, indent=2), encoding="utf-8")
         epoch_sec = float(time.perf_counter() - t_epoch_begin)
         epoch_time_sec.append(epoch_sec)
         val_msg = f"{val_loss:.6f}" if do_eval else "skip"
-        print(f"[SNN-HEATMAP-FIT] epoch={ep+1:03d}/{epochs} train_loss={train_loss:.6f} val_loss={val_msg}")
+        print(
+            f"[SNN-HEATMAP-FIT] epoch={ep+1:03d}/{epochs} "
+            f"train_loss={train_loss:.6f} val_loss={val_msg} epoch_sec={epoch_sec:.1f}",
+            flush=True,
+        )
 
-    last_path = out_dir / "model_last.pth"
     torch.save(
         {
             "state_dict": model.state_dict(),
@@ -416,6 +453,9 @@ def main() -> None:
             "train_encoding": str(args.train_encoding),
             "eval_encoding": str(args.eval_encoding),
             "decode_method": str(args.decode_method),
+            "epoch": int(epochs),
+            "best_val_loss": float(best_val),
+            "optimizer_state": optimizer.state_dict(),
         },
         last_path,
     )
@@ -487,6 +527,9 @@ def main() -> None:
             "train_eval_max_samples": int(train_eval_count),
             "val_eval_max_samples": int(val_eval_count),
             "num_workers": int(num_workers),
+            "prefetch_factor": int(args.prefetch_factor),
+            "persistent_workers": bool(args.persistent_workers),
+            "save_last_each_epoch": bool(args.save_last_each_epoch),
             "num_threads": int(torch.get_num_threads()),
             "num_interop_threads": int(torch.get_num_interop_threads()),
         },

@@ -36,8 +36,10 @@ def main() -> None:
     bbox_bad = 0
     not_water = 0
     invalid_stage = 0
+    center_bbox_delta_violations = 0
     ranges = []
     offcenter = []
+    center_bbox_deltas = []
 
     for split in ("train", "val", "test"):
         label_path = labels_dir / f"{split}.jsonl"
@@ -63,7 +65,15 @@ def main() -> None:
             bx, by, bw, bh = [float(v) for v in row["bbox_xywh"]]
             if bw <= 0.0 or bh <= 0.0 or bx >= w or by >= h or bx + bw <= 0.0 or by + bh <= 0.0:
                 bbox_bad += 1
+            bbox_cx = bx + 0.5 * bw
+            bbox_cy = by + 0.5 * bh
+            center_bbox_delta = float(np.hypot(cx - bbox_cx, cy - bbox_cy))
+            center_bbox_deltas.append(center_bbox_delta)
             meta = dict(row.get("meta", {}))
+            scale_px = float(meta.get("scale_px", row.get("scale_px", 0.0)))
+            max_center_bbox_delta = max(8.0, 1.5 * scale_px)
+            if center_bbox_delta > max_center_bbox_delta:
+                center_bbox_delta_violations += 1
             if not bool(meta.get("target_on_water", False)):
                 not_water += 1
             r = float(meta.get("range_xy_km", -1.0))
@@ -78,6 +88,7 @@ def main() -> None:
 
     range_arr = np.asarray(ranges, dtype=float)
     off_arr = np.asarray(offcenter, dtype=float)
+    center_bbox_delta_arr = np.asarray(center_bbox_deltas, dtype=float)
     report = {
         "dataset_root": str(root),
         "total_frames": int(total),
@@ -88,8 +99,11 @@ def main() -> None:
         "range_xy_max_km": float(range_arr.max()) if range_arr.size else 0.0,
         "offcenter_px_mean": float(off_arr.mean()) if off_arr.size else 0.0,
         "offcenter_px_max": float(off_arr.max()) if off_arr.size else 0.0,
+        "center_bbox_delta_px_mean": float(center_bbox_delta_arr.mean()) if center_bbox_delta_arr.size else 0.0,
+        "center_bbox_delta_px_max": float(center_bbox_delta_arr.max()) if center_bbox_delta_arr.size else 0.0,
         "center_px_out_of_image": int(center_out),
         "bbox_bad": int(bbox_bad),
+        "center_bbox_delta_violations": int(center_bbox_delta_violations),
         "target_not_water": int(not_water),
         "invalid_stage_ranges": int(invalid_stage),
         "errors": errors[:100],
@@ -100,6 +114,7 @@ def main() -> None:
             and all(stage_counts.get(stage, 0) > 0 for stage in ("far", "mid", "terminal"))
             and center_out == 0
             and bbox_bad == 0
+            and center_bbox_delta_violations == 0
             and not_water == 0
             and invalid_stage == 0
         ),

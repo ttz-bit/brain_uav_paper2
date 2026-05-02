@@ -9,7 +9,7 @@ import numpy as np
 
 from paper2.common.config import load_yaml
 from paper2.render.phase3_task_sampler import Phase3TaskFrame, sample_phase3_task_sequence
-from paper2.render.compositor import alpha_blend_center, read_bgra, rotate_bgra
+from paper2.render.compositor import alpha_blend_center, read_bgra, rotate_bgra, trim_bgra_to_alpha_bbox
 
 
 STAGE_SCALE_PX = {
@@ -199,9 +199,11 @@ def _render_real_asset_frame(
 
         target_path = target_pool[int(rng.integers(0, len(target_pool)))]
         target = read_bgra(target_path)
+        target = trim_bgra_to_alpha_bbox(target)
         target = _resize_bgra_to_long_side(target, STAGE_SCALE_PX.get(frame.stage, 18.0), image_size)
         angle_deg = -float(np.degrees(frame.target_state_world["heading"]))
         target = rotate_bgra(target, angle_deg)
+        target = trim_bgra_to_alpha_bbox(target)
 
         x_min = int(np.ceil(cx))
         y_min = int(np.ceil(cy))

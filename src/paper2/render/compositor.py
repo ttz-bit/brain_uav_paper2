@@ -48,6 +48,20 @@ def rotate_bgra(img_bgra: np.ndarray, angle_deg: float) -> np.ndarray:
     )
 
 
+def trim_bgra_to_alpha_bbox(img_bgra: np.ndarray, *, alpha_threshold: int = 10) -> np.ndarray:
+    if img_bgra.ndim != 3 or img_bgra.shape[2] != 4:
+        raise ValueError(f"Expected BGRA image, got shape={img_bgra.shape}")
+    alpha = img_bgra[:, :, 3] > int(alpha_threshold)
+    ys, xs = np.where(alpha)
+    if len(xs) <= 0:
+        return img_bgra
+    x1 = int(xs.min())
+    x2 = int(xs.max()) + 1
+    y1 = int(ys.min())
+    y2 = int(ys.max()) + 1
+    return img_bgra[y1:y2, x1:x2].copy()
+
+
 def alpha_blend_center(
     canvas_bgr: np.ndarray,
     overlay_bgra: np.ndarray,
@@ -82,10 +96,19 @@ def alpha_blend_center(
     out = alpha * fg + (1.0 - alpha) * bg
     canvas_bgr[iy1:iy2, ix1:ix2] = out.astype(np.uint8)
 
-    bbox = (ix1, iy1, ix2 - ix1, iy2 - iy1)
-    visible_alpha_pixels = int((patch[:, :, 3] > 10).sum())
+    visible_alpha = patch[:, :, 3] > 10
+    visible_alpha_pixels = int(visible_alpha.sum())
     if total_alpha_pixels <= 0:
         visibility = 0.0
     else:
         visibility = float(visible_alpha_pixels / float(total_alpha_pixels))
+    if visible_alpha_pixels <= 0:
+        bbox = (ix1, iy1, ix2 - ix1, iy2 - iy1)
+    else:
+        vy, vx = np.where(visible_alpha)
+        bx1 = ix1 + int(vx.min())
+        by1 = iy1 + int(vy.min())
+        bx2 = ix1 + int(vx.max()) + 1
+        by2 = iy1 + int(vy.max()) + 1
+        bbox = (bx1, by1, bx2 - bx1, by2 - by1)
     return bbox, visibility

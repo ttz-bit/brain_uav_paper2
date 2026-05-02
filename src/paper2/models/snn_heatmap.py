@@ -5,6 +5,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+_HEATMAP_GRID_CACHE: dict[tuple[str, torch.dtype, int], tuple[torch.Tensor, torch.Tensor]] = {}
+_SOFTARGMAX_GRID_CACHE: dict[tuple[str, torch.dtype, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _device_key(device: torch.device) -> str:
+    if device.index is None:
+        return str(device.type)
+    return f"{device.type}:{device.index}"
+
+
 class HeatmapSNN(nn.Module):
     def __init__(
         self,
@@ -67,9 +77,10 @@ class HeatmapSNN(nn.Module):
             spk2, mem2 = self.lif2(self.conv2(spk1), mem2)
             spk3, mem3 = self.lif3(self.conv3(spk2), mem3)
             feat_acc = spk3 if feat_acc is None else feat_acc + spk3
-            spike1_total = spk1 if spike1_total is None else spike1_total + spk1
-            spike2_total = spk2 if spike2_total is None else spike2_total + spk2
-            spike3_total = spk3 if spike3_total is None else spike3_total + spk3
+            if return_diagnostics:
+                spike1_total = spk1 if spike1_total is None else spike1_total + spk1
+                spike2_total = spk2 if spike2_total is None else spike2_total + spk2
+                spike3_total = spk3 if spike3_total is None else spike3_total + spk3
         feat = feat_acc / max(1, self.num_steps)
         heatmap_logits = self.heatmap_head(feat)
         out = {
@@ -78,6 +89,7 @@ class HeatmapSNN(nn.Module):
         }
         if return_diagnostics:
             steps = max(1, self.num_steps)
+            assert spike1_total is not None and spike2_total is not None and spike3_total is not None
             out["diagnostics"] = {
                 "spike_rate_l1": (spike1_total / steps).mean().detach(),
                 "spike_rate_l2": (spike2_total / steps).mean().detach(),
@@ -102,8 +114,14 @@ def make_gaussian_heatmaps(
     size = int(heatmap_size)
     device = targets.device
     dtype = targets.dtype
-    ys = torch.arange(size, device=device, dtype=dtype).view(1, size, 1)
-    xs = torch.arange(size, device=device, dtype=dtype).view(1, 1, size)
+    key = (_device_key(device), dtype, size)
+    cached = _HEATMAP_GRID_CACHE.get(key)
+    if cached is None:
+        ys = torch.arange(size, device=device, dtype=dtype).view(1, size, 1)
+        xs = torch.arange(size, device=device, dtype=dtype).view(1, 1, size)
+        cached = (ys, xs)
+        _HEATMAP_GRID_CACHE[key] = cached
+    ys, xs = cached
     cx = targets[:, 0].clamp(0.0, 1.0).view(b, 1, 1) * float(size - 1)
     cy = targets[:, 1].clamp(0.0, 1.0).view(b, 1, 1) * float(size - 1)
     valid = targets[:, 2].clamp(0.0, 1.0).view(b, 1, 1)
@@ -115,13 +133,19 @@ def make_gaussian_heatmaps(
 def soft_argmax_2d(logits: torch.Tensor, *, temperature: float = 10.0) -> torch.Tensor:
     b, _, h, w = logits.shape
     flat = (logits.view(b, -1) * float(temperature)).softmax(dim=1)
-    ys, xs = torch.meshgrid(
-        torch.linspace(0.0, 1.0, h, device=logits.device, dtype=logits.dtype),
-        torch.linspace(0.0, 1.0, w, device=logits.device, dtype=logits.dtype),
-        indexing="ij",
-    )
-    x = (flat * xs.reshape(1, -1)).sum(dim=1)
-    y = (flat * ys.reshape(1, -1)).sum(dim=1)
+    key = (_device_key(logits.device), logits.dtype, int(h), int(w))
+    cached = _SOFTARGMAX_GRID_CACHE.get(key)
+    if cached is None:
+        ys, xs = torch.meshgrid(
+            torch.linspace(0.0, 1.0, h, device=logits.device, dtype=logits.dtype),
+            torch.linspace(0.0, 1.0, w, device=logits.device, dtype=logits.dtype),
+            indexing="ij",
+        )
+        cached = (ys.reshape(1, -1), xs.reshape(1, -1))
+        _SOFTARGMAX_GRID_CACHE[key] = cached
+    ys_flat, xs_flat = cached
+    x = (flat * xs_flat).sum(dim=1)
+    y = (flat * ys_flat).sum(dim=1)
     return torch.stack([x, y], dim=1)
 
 
