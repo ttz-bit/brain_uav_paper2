@@ -46,6 +46,28 @@ def test_phase3_task_sampler_outputs_valid_frames():
         assert np.isclose(np.linalg.norm(aircraft[:2] - target[:2]), row.range_xy_km)
 
 
+def test_phase3_task_sampler_sequence_is_far_to_terminal_approach():
+    cfg = _cfg()
+    rows = sample_phase3_task_sequence(
+        sequence_idx=0,
+        target_cfg=cfg["phase3_target_motion"],
+        stage_cfg=cfg["phase3_task_stages"],
+        seed=123,
+        frames=40,
+    )
+    stages = [row.stage for row in rows]
+    assert stages == sorted(stages, key=lambda stage: STAGES.index(stage))
+    assert stages[0] == "far"
+    assert stages[-1] == "terminal"
+
+    ranges = np.asarray([row.range_xy_km for row in rows], dtype=float)
+    assert np.all(np.diff(ranges) <= 0.0)
+
+    centers = np.asarray([row.center_px for row in rows], dtype=float)
+    jumps = np.linalg.norm(np.diff(centers, axis=0), axis=1)
+    assert float(jumps.max()) <= 32.0
+
+
 def test_phase3_task_sampler_summary_accepts_balanced_smoke():
     cfg = _cfg()
     rows = []

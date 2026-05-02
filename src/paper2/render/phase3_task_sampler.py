@@ -70,12 +70,19 @@ def sample_phase3_task_sequence(
 
     sequence_id = f"phase3_seq_{sequence_idx:06d}"
     frames_out: list[Phase3TaskFrame] = []
-    stage_cycle = [STAGES[(sequence_idx + idx) % len(STAGES)] for idx in range(frame_count)]
+    stage_plan = _approach_stage_plan(frame_count, sequence_idx)
+    stage_offsets = _smooth_center_offsets_px(stage_plan, stage_cfg, rng)
+    bearing = float(rng.uniform(-math.pi, math.pi))
+    bearing_rate = float(rng.uniform(-0.035, 0.035))
+    stage_seen = {stage: 0 for stage in STAGES}
+    stage_total = {stage: int(stage_plan.count(stage)) for stage in STAGES}
     for frame_id, target_truth in enumerate(target_rows):
-        stage = stage_cycle[frame_id]
+        stage = stage_plan[frame_id]
         stage_params = stage_cfg[stage]
-        range_xy = float(rng.uniform(float(stage_params["range_min_km"]), float(stage_params["range_max_km"])))
-        bearing = float(rng.uniform(-math.pi, math.pi))
+        local_idx = stage_seen[stage]
+        stage_seen[stage] += 1
+        range_xy = _approach_range_km(stage, local_idx, stage_total[stage], stage_cfg, rng)
+        bearing = _wrap_angle(bearing + bearing_rate + float(rng.normal(0.0, 0.01)))
         aircraft_xy = np.asarray(target_truth.pos_world, dtype=float)[:2] - range_xy * np.array(
             [math.cos(bearing), math.sin(bearing)],
             dtype=float,
@@ -87,8 +94,7 @@ def sample_phase3_task_sequence(
 
         gsd = float(stage_params["gsd_km_per_px"])
         image_size = int(stage_cfg.get("image_size", 256))
-        jitter_px = float(stage_cfg.get("crop_jitter_px", {}).get(stage, 0.0))
-        offset_px = rng.normal(0.0, jitter_px, size=2)
+        offset_px = stage_offsets[frame_id]
         crop_center = np.asarray(target_truth.pos_world, dtype=float)[:2] - offset_px * gsd
         center_px = _world_to_image_px(
             target_xy=np.asarray(target_truth.pos_world, dtype=float)[:2],
@@ -123,6 +129,58 @@ def sample_phase3_task_sequence(
             )
         )
     return frames_out
+
+
+def _approach_stage_plan(frame_count: int, sequence_idx: int) -> list[str]:
+    """Return contiguous far->mid->terminal stages while keeping corpus counts balanced."""
+    if frame_count <= 0:
+        raise ValueError("frame_count must be positive.")
+    base = int(frame_count) // len(STAGES)
+    remainder = int(frame_count) % len(STAGES)
+    counts = {stage: base for stage in STAGES}
+    for extra_idx in range(remainder):
+        counts[STAGES[(int(sequence_idx) + extra_idx) % len(STAGES)]] += 1
+    plan: list[str] = []
+    for stage in STAGES:
+        plan.extend([stage] * counts[stage])
+    return plan
+
+
+def _approach_range_km(
+    stage: str,
+    local_idx: int,
+    stage_count: int,
+    stage_cfg: dict[str, Any],
+    rng: np.random.Generator,
+) -> float:
+    params = stage_cfg[stage]
+    r_min = float(params["range_min_km"])
+    r_max = float(params["range_max_km"])
+    if stage_count <= 1:
+        return float(0.5 * (r_min + r_max))
+    # Jitter inside each monotonic slot. The 0.2..0.8 margin prevents adjacent
+    # slots from crossing while avoiding a perfectly uniform synthetic pattern.
+    frac = (float(local_idx) + float(rng.uniform(0.2, 0.8))) / float(stage_count)
+    return float(r_max - frac * (r_max - r_min))
+
+
+def _smooth_center_offsets_px(
+    stage_plan: list[str],
+    stage_cfg: dict[str, Any],
+    rng: np.random.Generator,
+) -> list[np.ndarray]:
+    jitter_cfg = stage_cfg.get("crop_jitter_px", {})
+    offsets: list[np.ndarray] = []
+    offset = np.zeros(2, dtype=float)
+    for stage in stage_plan:
+        limit = float(jitter_cfg.get(stage, 0.0))
+        step_sigma = max(0.25, limit * 0.12)
+        offset = offset + rng.normal(0.0, step_sigma, size=2)
+        norm = float(np.linalg.norm(offset))
+        if limit > 0.0 and norm > limit:
+            offset = offset / max(norm, 1e-9) * limit
+        offsets.append(offset.astype(float).copy())
+    return offsets
 
 
 def summarize_phase3_task_frames(frames: list[Phase3TaskFrame], stage_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -186,6 +244,10 @@ def _world_to_image_px(
     u = half + (float(target_xy[0]) - float(crop_center_xy[0])) / gsd
     v = half - (float(target_xy[1]) - float(crop_center_xy[1])) / gsd
     return np.array([u, v], dtype=float)
+
+
+def _wrap_angle(value: float) -> float:
+    return float((value + math.pi) % (2.0 * math.pi) - math.pi)
 
 
 def _target_truth_to_dict(truth: TargetTruthState) -> dict[str, Any]:
