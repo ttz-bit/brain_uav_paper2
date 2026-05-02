@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 
 import cv2
 import numpy as np
@@ -19,6 +20,8 @@ STAGE_SCALE_PX = {
 }
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
+DEFAULT_TARGET_ALLOW_KEYWORDS = ("top", "overhead", "aerial", "bird", "vertical")
+DEFAULT_TARGET_REJECT_KEYWORDS = ("side", "oblique", "profile", "tilt", "perspective", "front", "rear")
 
 
 def _split_for_sequence(seq_idx: int, total: int) -> str:
@@ -100,7 +103,35 @@ def _load_review_backgrounds(water_mask_root: Path) -> set[str]:
     return out
 
 
-def _collect_targets(assets_root: Path) -> dict[str, list[Path]]:
+def _split_keywords(text: str) -> tuple[str, ...]:
+    return tuple(x.strip().lower() for x in str(text).split(",") if x.strip())
+
+
+def _target_name_tokens(path: Path) -> set[str]:
+    return {x for x in re.split(r"[^a-z0-9]+", path.stem.lower()) if x}
+
+
+def _target_template_allowed(
+    path: Path,
+    *,
+    allow_keywords: tuple[str, ...],
+    reject_keywords: tuple[str, ...],
+) -> bool:
+    text = str(path).lower().replace("\\", "/")
+    tokens = _target_name_tokens(path)
+    if any(k and (k in tokens or k in text) for k in reject_keywords):
+        return False
+    if not allow_keywords:
+        return True
+    return any(k and (k in tokens or k in text) for k in allow_keywords)
+
+
+def _collect_targets(
+    assets_root: Path,
+    *,
+    allow_keywords: tuple[str, ...] = DEFAULT_TARGET_ALLOW_KEYWORDS,
+    reject_keywords: tuple[str, ...] = DEFAULT_TARGET_REJECT_KEYWORDS,
+) -> dict[str, list[Path]]:
     roots = [
         assets_root / "target_templates" / "alpha_png",
         assets_root / "target_templates",
@@ -113,6 +144,8 @@ def _collect_targets(assets_root: Path) -> dict[str, list[Path]]:
                 continue
             split = _infer_split(path)
             if split is None:
+                continue
+            if not _target_template_allowed(path, allow_keywords=allow_keywords, reject_keywords=reject_keywords):
                 continue
             rp = path.resolve()
             if rp in seen:
@@ -397,6 +430,18 @@ def main() -> None:
     parser.add_argument("--min-target-visibility", type=float, default=0.35)
     parser.add_argument("--placement-attempts", type=int, default=160)
     parser.add_argument("--points-per-background", type=int, default=64)
+    parser.add_argument(
+        "--target-allow-keywords",
+        type=str,
+        default=",".join(DEFAULT_TARGET_ALLOW_KEYWORDS),
+        help="Comma-separated keywords required for real target templates. Empty string allows all non-rejected targets.",
+    )
+    parser.add_argument(
+        "--target-reject-keywords",
+        type=str,
+        default=",".join(DEFAULT_TARGET_REJECT_KEYWORDS),
+        help="Comma-separated keywords rejected for real target templates.",
+    )
     args = parser.parse_args()
 
     project_root = Path.cwd().resolve()
@@ -419,7 +464,11 @@ def main() -> None:
             water_mask_root,
             skip_review=not bool(args.include_review_backgrounds),
         )
-        targets_by_split = _collect_targets(assets_root)
+        targets_by_split = _collect_targets(
+            assets_root,
+            allow_keywords=_split_keywords(args.target_allow_keywords),
+            reject_keywords=_split_keywords(args.target_reject_keywords),
+        )
         missing_bg = [s for s in ("train", "val", "test") if not backgrounds_by_split.get(s)]
         missing_target = [s for s in ("train", "val", "test") if not targets_by_split.get(s)]
         if missing_bg or missing_target:
@@ -511,6 +560,12 @@ def main() -> None:
         "water_mask_root": str(water_mask_root) if args.asset_mode == "real" else None,
         "background_counts": {k: len(v) for k, v in backgrounds_by_split.items()} if args.asset_mode == "real" else None,
         "target_counts": {k: len(v) for k, v in targets_by_split.items()} if args.asset_mode == "real" else None,
+        "target_template_filter": {
+            "allow_keywords": list(_split_keywords(args.target_allow_keywords)),
+            "reject_keywords": list(_split_keywords(args.target_reject_keywords)),
+        }
+        if args.asset_mode == "real"
+        else None,
         "stage_counts": stage_counts,
         "split_counts": split_counts,
         "total_frames": total_rows,

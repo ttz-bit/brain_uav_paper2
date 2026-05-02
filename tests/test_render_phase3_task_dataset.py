@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+from scripts.render_phase3_task_dataset import _target_template_allowed
+
 
 def test_render_phase3_task_dataset_smoke(tmp_path):
     root = Path(__file__).resolve().parents[1]
@@ -33,3 +35,21 @@ def test_render_phase3_task_dataset_smoke(tmp_path):
     report = json.loads((out_root / "reports" / "phase3_task_dataset_qc.json").read_text(encoding="utf-8"))
     assert report["pass"] is True
     assert report["total_frames"] == 12
+
+
+def test_target_template_filter_rejects_non_topdown_views():
+    assert _target_template_allowed(
+        Path("target_boat_top_001.png"),
+        allow_keywords=("top",),
+        reject_keywords=("side", "oblique"),
+    )
+    assert not _target_template_allowed(
+        Path("target_boat_side_001.png"),
+        allow_keywords=("top",),
+        reject_keywords=("side", "oblique"),
+    )
+    assert not _target_template_allowed(
+        Path("target_boat_oblique_001.png"),
+        allow_keywords=("top",),
+        reject_keywords=("side", "oblique"),
+    )
