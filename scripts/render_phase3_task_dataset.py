@@ -260,6 +260,24 @@ def _wrap_angle(value: float) -> float:
     return float((float(value) + float(np.pi)) % (2.0 * float(np.pi)) - float(np.pi))
 
 
+def _prepare_distractor_overlay(track: "_DistractorTrack", image_size: int) -> np.ndarray:
+    distractor = trim_bgra_to_alpha_bbox(read_bgra(track.asset_path))
+    distractor = _resize_bgra_to_long_side(distractor, track.scale_px, image_size)
+    distractor = rotate_bgra(distractor, float(np.degrees(track.heading)))
+    return trim_bgra_to_alpha_bbox(distractor)
+
+
+def _distractor_water_ratio_at(
+    mask_u8: np.ndarray,
+    track: "_DistractorTrack",
+    center_x: float,
+    center_y: float,
+    image_size: int,
+) -> float:
+    overlay = _prepare_distractor_overlay(track, image_size)
+    return _alpha_water_ratio(mask_u8, overlay, center_x, center_y)
+
+
 @dataclass
 class _DistractorTrack:
     asset_path: str
@@ -354,6 +372,7 @@ def _advance_distractor_track(
     mask_u8: np.ndarray | None = None,
     target_center: tuple[float, float] | None = None,
     target_clearance_px: float = 0.0,
+    min_water_ratio: float = 0.0,
     other_tracks: list[_DistractorTrack] | None = None,
 ) -> None:
     def _is_safe(candidate_xy: np.ndarray) -> tuple[bool, _DistractorTrack | None]:
@@ -367,6 +386,10 @@ def _advance_distractor_track(
             iy = int(round(float(candidate_xy[1])))
             if ix < 0 or iy < 0 or ix >= w or iy >= h or mask_u8[iy, ix] <= 0:
                 return False, None
+            if min_water_ratio > 0.0:
+                water_ratio = _distractor_water_ratio_at(mask_u8, track, float(candidate_xy[0]), float(candidate_xy[1]), w)
+                if water_ratio < float(min_water_ratio):
+                    return False, None
         if other_tracks:
             nearest: _DistractorTrack | None = None
             nearest_dist = float("inf")
@@ -441,10 +464,7 @@ def _render_distractor_track(
         return None
     if float(np.hypot(cx - float(target_center[0]), cy - float(target_center[1]))) < float(min_target_distance_px):
         return None
-    distractor = trim_bgra_to_alpha_bbox(read_bgra(track.asset_path))
-    distractor = _resize_bgra_to_long_side(distractor, track.scale_px, image_size)
-    distractor = rotate_bgra(distractor, float(np.degrees(track.heading)))
-    distractor = trim_bgra_to_alpha_bbox(distractor)
+    distractor = _prepare_distractor_overlay(track, image_size)
     water_ratio = _alpha_water_ratio(mask_u8, distractor, cx, cy)
     if water_ratio < float(min_water_ratio):
         return None
@@ -576,7 +596,8 @@ def _render_real_asset_frame(
                             tracks.append(track)
                     if sequence_state is not None:
                         sequence_state["distractor_tracks"] = tracks
-                        sequence_state["distractor_count_requested"] = int(desired)
+                        sequence_state["distractor_count_requested"] = int(len(tracks))
+                        sequence_state["distractor_count_desired"] = int(desired)
                 for track in tracks:
                     other_tracks = [other for other in tracks if other is not track]
                     _advance_distractor_track(
@@ -585,6 +606,7 @@ def _render_real_asset_frame(
                         patch_mask,
                         target_center=(cx, cy),
                         target_clearance_px=float(target_clearance_px),
+                        min_water_ratio=float(min_target_water_ratio),
                         other_tracks=other_tracks,
                     )
                     rendered = _render_distractor_track(
@@ -594,7 +616,7 @@ def _render_real_asset_frame(
                         target_center=(cx, cy),
                         min_target_distance_px=float(min_distractor_target_distance_px),
                         min_water_ratio=float(min_target_water_ratio),
-                    )
+                        )
                     if rendered is not None:
                         bbox_tuple, visibility_d, water_ratio_d = rendered
                         distractor_meta.append(
@@ -606,7 +628,13 @@ def _render_real_asset_frame(
                                 "water_ratio": float(water_ratio_d),
                                 "visibility": float(visibility_d),
                                 "count_requested": int(sequence_state.get("distractor_count_requested", len(tracks)) if sequence_state is not None else len(tracks)),
+                                "count_desired": int(sequence_state.get("distractor_count_desired", len(tracks)) if sequence_state is not None else len(tracks)),
                             }
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"Failed to render distractor track asset={track.asset_path} split={split} "
+                            f"sequence={frame.sequence_id} frame={frame.frame_id}"
                         )
             bbox_tuple, visibility = alpha_blend_center(canvas, target, cx, cy)
             if visibility < min_target_visibility:
@@ -631,8 +659,9 @@ def _render_real_asset_frame(
                 "distractor_water_ratios": [d["water_ratio"] for d in distractor_meta],
                 "distractor_visibilities": [d["visibility"] for d in distractor_meta],
                 "distractor_count_requested": int(requested_distractors),
-                "distractor_count": int(len(distractor_meta)),
+                "distractor_count": int(len(active_distractor_tracks)),
                 "distractor_count_active": int(len(active_distractor_tracks)),
+                "distractor_count_rendered": int(len(distractor_meta)),
             }
             if ratio >= min_target_water_ratio:
                 return canvas, bbox, float(visibility), asset_meta
