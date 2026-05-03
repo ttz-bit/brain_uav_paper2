@@ -21,10 +21,19 @@ STAGE_SCALE_PX = {
 }
 DISTRACTOR_SCALE_RANGE = (0.45, 0.85)
 DISTRACTOR_MOTION_MODES = ("cv", "turn", "piecewise")
+DISTRACTOR_COUNT_MAX_LIMIT = 3
+DISTRACTOR_CENTER_BUFFER_PX = 6.0
+DISTRACTOR_SPEED_RANGE = {
+    "far": (0.22, 0.85),
+    "mid": (0.18, 0.72),
+    "terminal": (0.12, 0.52),
+}
+DEFAULT_DISTRACTOR_ALLOW_KEYWORDS = ("ship_like", "small", "boat", "canoe", "kayak")
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 DEFAULT_TARGET_ALLOW_KEYWORDS = ("top", "overhead", "aerial", "bird", "vertical")
 DEFAULT_TARGET_REJECT_KEYWORDS = ("side", "oblique", "profile", "tilt", "perspective", "front", "rear")
+DEFAULT_DISTRACTOR_REJECT_KEYWORDS = DEFAULT_TARGET_REJECT_KEYWORDS
 
 
 def _split_for_sequence(seq_idx: int, total: int) -> str:
@@ -238,6 +247,19 @@ def _alpha_water_ratio(mask_u8: np.ndarray, overlay_bgra: np.ndarray, center_x: 
     return float((alpha & water).sum() / float(denom))
 
 
+def _point_on_water(mask_u8: np.ndarray, x: float, y: float) -> bool:
+    h, w = mask_u8.shape[:2]
+    ix = int(round(float(x)))
+    iy = int(round(float(y)))
+    if ix < 0 or iy < 0 or ix >= w or iy >= h:
+        return False
+    return bool(mask_u8[iy, ix] > 0)
+
+
+def _wrap_angle(value: float) -> float:
+    return float((float(value) + float(np.pi)) % (2.0 * float(np.pi)) - float(np.pi))
+
+
 @dataclass
 class _DistractorTrack:
     asset_path: str
@@ -257,6 +279,7 @@ def _sample_distractor_track(
     distractor_pool: list[Path],
     mask_u8: np.ndarray,
     target_center: tuple[float, float],
+    target_clearance_px: float,
     rng: np.random.Generator,
     stage: str,
     image_size: int,
@@ -264,6 +287,7 @@ def _sample_distractor_track(
     scale_range: tuple[float, float],
     min_target_distance_px: float,
     min_water_ratio: float,
+    existing_tracks: list[_DistractorTrack] | None = None,
 ) -> _DistractorTrack | None:
     if not distractor_pool:
         return None
@@ -274,6 +298,7 @@ def _sample_distractor_track(
     target_cx, target_cy = float(target_center[0]), float(target_center[1])
     scale_min = max(0.05, float(min(scale_range[0], scale_range[1])))
     scale_max = max(scale_min, float(max(scale_range[0], scale_range[1])))
+    existing_tracks = list(existing_tracks or [])
     for _ in range(96):
         path = distractor_pool[int(rng.integers(0, len(distractor_pool)))]
         distractor = trim_bgra_to_alpha_bbox(read_bgra(path))
@@ -289,16 +314,25 @@ def _sample_distractor_track(
         dy = float(yy_all[idx])
         if dx - radius < 0 or dy - radius < 0 or dx + radius >= image_size or dy + radius >= image_size:
             continue
-        if float(np.hypot(dx - target_cx, dy - target_cy)) < float(min_target_distance_px):
+        if float(np.hypot(dx - target_cx, dy - target_cy)) < float(max(min_target_distance_px, target_clearance_px)):
+            continue
+        if any(
+            float(np.hypot(dx - other.center_px[0], dy - other.center_px[1]))
+            < float(radius + other.radius_px + DISTRACTOR_CENTER_BUFFER_PX)
+            for other in existing_tracks
+        ):
             continue
         water_ratio = _alpha_water_ratio(mask_u8, distractor, dx, dy)
         if water_ratio < float(min_water_ratio):
             continue
         motion_mode = str(rng.choice(DISTRACTOR_MOTION_MODES, p=[0.55, 0.3, 0.15]))
         heading = float(rng.uniform(-np.pi, np.pi))
-        speed_px = float(rng.uniform(0.25, 1.2))
-        turn_rate = float(rng.uniform(-0.04, 0.04))
-        steps_to_switch = int(rng.integers(8, 24))
+        speed_low, speed_high = DISTRACTOR_SPEED_RANGE.get(stage, (0.18, 0.72))
+        if int(count_requested) >= 3:
+            speed_high = min(speed_high, 0.62)
+        speed_px = float(rng.uniform(float(speed_low), float(speed_high)))
+        turn_rate = float(rng.uniform(-0.03, 0.03))
+        steps_to_switch = int(rng.integers(10, 28))
         return _DistractorTrack(
             asset_path=str(path),
             center_px=np.array([dx, dy], dtype=float),
@@ -319,8 +353,39 @@ def _advance_distractor_track(
     rng: np.random.Generator,
     mask_u8: np.ndarray | None = None,
     target_center: tuple[float, float] | None = None,
-    min_target_distance_px: float = 0.0,
+    target_clearance_px: float = 0.0,
+    other_tracks: list[_DistractorTrack] | None = None,
 ) -> None:
+    def _is_safe(candidate_xy: np.ndarray) -> tuple[bool, _DistractorTrack | None]:
+        if target_center is not None:
+            target_dist = float(np.hypot(candidate_xy[0] - float(target_center[0]), candidate_xy[1] - float(target_center[1])))
+            if target_dist < float(target_clearance_px):
+                return False, None
+        if mask_u8 is not None:
+            h, w = mask_u8.shape[:2]
+            ix = int(round(float(candidate_xy[0])))
+            iy = int(round(float(candidate_xy[1])))
+            if ix < 0 or iy < 0 or ix >= w or iy >= h or mask_u8[iy, ix] <= 0:
+                return False, None
+        if other_tracks:
+            nearest: _DistractorTrack | None = None
+            nearest_dist = float("inf")
+            for other in other_tracks:
+                if other is track:
+                    continue
+                sep = float(np.hypot(candidate_xy[0] - other.center_px[0], candidate_xy[1] - other.center_px[1]))
+                required = float(track.radius_px + other.radius_px + DISTRACTOR_CENTER_BUFFER_PX)
+                if sep < required:
+                    if sep < nearest_dist:
+                        nearest = other
+                        nearest_dist = sep
+                    return False, nearest
+        return True, None
+
+    def _proposal(step_scale: float) -> np.ndarray:
+        delta = np.array([np.cos(track.heading), -np.sin(track.heading)], dtype=float) * float(track.speed_px) * float(step_scale)
+        return track.center_px + delta
+
     if track.motion_mode == "turn":
         track.heading = _wrap_angle(track.heading + track.turn_rate)
     elif track.motion_mode == "piecewise":
@@ -330,21 +395,35 @@ def _advance_distractor_track(
             track.speed_px = float(np.clip(track.speed_px * float(rng.uniform(0.85, 1.15)), 0.18, 1.8))
             track.steps_to_switch = int(rng.integers(8, 24))
     prev = track.center_px.copy()
-    delta = np.array([np.cos(track.heading), -np.sin(track.heading)], dtype=float) * float(track.speed_px)
-    candidate = prev + delta
-    if target_center is not None:
-        if float(np.hypot(candidate[0] - float(target_center[0]), candidate[1] - float(target_center[1]))) < float(min_target_distance_px):
-            track.heading = _wrap_angle(track.heading + float(rng.uniform(1.2, 2.4)))
-            candidate = prev
-    if mask_u8 is not None and candidate.size >= 2:
-        h, w = mask_u8.shape[:2]
-        candidate[0] = float(np.clip(candidate[0], 0.0, max(0.0, float(w - 1))))
-        candidate[1] = float(np.clip(candidate[1], 0.0, max(0.0, float(h - 1))))
-        if mask_u8[int(round(candidate[1])) % h, int(round(candidate[0])) % w] <= 0:
-            track.heading = _wrap_angle(track.heading + float(rng.uniform(1.1, 2.2)))
-            candidate = prev
-    track.center_px = candidate
-    track.heading = _wrap_angle(track.heading)
+    step_scales = (1.0, 0.78, 0.58, 0.42)
+    for attempt, step_scale in enumerate(step_scales):
+        candidate = _proposal(step_scale)
+        safe, nearest_other = _is_safe(candidate)
+        if safe:
+            track.center_px = candidate
+            track.heading = _wrap_angle(track.heading)
+            return
+
+        if nearest_other is not None:
+            target_vec = candidate - nearest_other.center_px
+            if float(np.linalg.norm(target_vec)) > 1e-9:
+                away = float(np.arctan2(target_vec[1], target_vec[0]))
+                track.heading = _wrap_angle(away + float(rng.uniform(-0.45, 0.45)))
+        elif target_center is not None:
+            target_vec = candidate - np.array([float(target_center[0]), float(target_center[1])], dtype=float)
+            if float(np.linalg.norm(target_vec)) > 1e-9:
+                away = float(np.arctan2(target_vec[1], target_vec[0]))
+                track.heading = _wrap_angle(away + float(rng.uniform(-0.4, 0.4)))
+        elif mask_u8 is not None:
+            track.heading = _wrap_angle(track.heading + float(np.pi) + float(rng.uniform(-0.35, 0.35)))
+        else:
+            track.heading = _wrap_angle(track.heading + float(rng.uniform(-0.55, 0.55)))
+        track.speed_px = float(np.clip(track.speed_px * float(rng.uniform(0.85, 0.98)), 0.12, 1.8))
+        if attempt == len(step_scales) - 1:
+            break
+
+    track.center_px = prev
+    track.heading = _wrap_angle(track.heading + float(rng.uniform(-0.25, 0.25)))
 
 
 def _render_distractor_track(
@@ -434,6 +513,7 @@ def _render_real_asset_frame(
         angle_deg = -float(np.degrees(frame.target_state_world["heading"]))
         target = rotate_bgra(target, angle_deg)
         target = trim_bgra_to_alpha_bbox(target)
+        target_clearance_px = max(float(min_distractor_target_distance_px), 0.55 * float(max(target.shape[:2])) + 6.0)
 
         x_min = int(np.ceil(cx))
         y_min = int(np.ceil(cy))
@@ -482,6 +562,7 @@ def _render_real_asset_frame(
                             distractor_pool=distractor_pool,
                             mask_u8=patch_mask,
                             target_center=(cx, cy),
+                            target_clearance_px=float(target_clearance_px),
                             rng=rng,
                             stage=frame.stage,
                             image_size=image_size,
@@ -489,13 +570,23 @@ def _render_real_asset_frame(
                             scale_range=(float(distractor_scale_min), float(distractor_scale_max)),
                             min_target_distance_px=float(min_distractor_target_distance_px),
                             min_water_ratio=float(min_target_water_ratio),
+                            existing_tracks=tracks,
                         )
                         if track is not None:
                             tracks.append(track)
                     if sequence_state is not None:
                         sequence_state["distractor_tracks"] = tracks
-                        sequence_state["distractor_count_requested"] = int(len(tracks))
+                        sequence_state["distractor_count_requested"] = int(desired)
                 for track in tracks:
+                    other_tracks = [other for other in tracks if other is not track]
+                    _advance_distractor_track(
+                        track,
+                        rng,
+                        patch_mask,
+                        target_center=(cx, cy),
+                        target_clearance_px=float(target_clearance_px),
+                        other_tracks=other_tracks,
+                    )
                     rendered = _render_distractor_track(
                         canvas,
                         patch_mask,
@@ -517,13 +608,6 @@ def _render_real_asset_frame(
                                 "count_requested": int(sequence_state.get("distractor_count_requested", len(tracks)) if sequence_state is not None else len(tracks)),
                             }
                         )
-                    _advance_distractor_track(
-                        track,
-                        rng,
-                        patch_mask,
-                        target_center=(cx, cy),
-                        min_target_distance_px=float(min_distractor_target_distance_px),
-                    )
             bbox_tuple, visibility = alpha_blend_center(canvas, target, cx, cy)
             if visibility < min_target_visibility:
                 continue
@@ -547,7 +631,8 @@ def _render_real_asset_frame(
                 "distractor_water_ratios": [d["water_ratio"] for d in distractor_meta],
                 "distractor_visibilities": [d["visibility"] for d in distractor_meta],
                 "distractor_count_requested": int(requested_distractors),
-                "distractor_count": int(len(active_distractor_tracks)),
+                "distractor_count": int(len(distractor_meta)),
+                "distractor_count_active": int(len(active_distractor_tracks)),
             }
             if ratio >= min_target_water_ratio:
                 return canvas, bbox, float(visibility), asset_meta
@@ -766,6 +851,9 @@ def _label_row(
             "water_mask_path": (asset_meta or {}).get("water_mask_path"),
             "background_size_px": (asset_meta or {}).get("background_size_px"),
             "crop_origin_bg_px": (asset_meta or {}).get("crop_origin_bg_px"),
+            "crop_origin_xy": (asset_meta or {}).get("crop_origin_bg_px"),
+            "crop_bg_xy": (asset_meta or {}).get("crop_origin_bg_px"),
+            "crop_top_left": (asset_meta or {}).get("crop_origin_bg_px"),
             "target_bg_center_px": (asset_meta or {}).get("target_bg_center_px"),
             "target_asset_path": (asset_meta or {}).get("target_asset_path"),
             "target_water_ratio": float((asset_meta or {}).get("target_water_ratio", 1.0)),
@@ -788,7 +876,9 @@ def main() -> None:
     parser.add_argument("--frames", type=int, default=40)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--asset-mode", choices=["procedural", "real"], default="procedural")
-    parser.add_argument("--assets-root", type=str, default="data/assets/source_stage2_v2")
+    parser.add_argument("--assets-root", type=str, default="data/assets/source_stage2")
+    parser.add_argument("--target-assets-root", type=str, default="data/assets/source_stage2_v2")
+    parser.add_argument("--distractor-assets-root", type=str, default=None)
     parser.add_argument("--water-mask-root", type=str, default=None)
     parser.add_argument("--include-review-backgrounds", action="store_true")
     parser.add_argument("--min-target-water-ratio", type=float, default=0.98)
@@ -798,7 +888,7 @@ def main() -> None:
     parser.add_argument("--points-per-background", type=int, default=64)
     parser.add_argument("--sequence-placement-attempts", type=int, default=24)
     parser.add_argument("--distractor-count-min", type=int, default=0)
-    parser.add_argument("--distractor-count-max", type=int, default=0)
+    parser.add_argument("--distractor-count-max", type=int, default=DISTRACTOR_COUNT_MAX_LIMIT)
     parser.add_argument("--min-distractor-target-distance-px", type=float, default=48.0)
     parser.add_argument("--distractor-scale-min", type=float, default=DISTRACTOR_SCALE_RANGE[0])
     parser.add_argument("--distractor-scale-max", type=float, default=DISTRACTOR_SCALE_RANGE[1])
@@ -817,13 +907,13 @@ def main() -> None:
     parser.add_argument(
         "--distractor-allow-keywords",
         type=str,
-        default=",".join(DEFAULT_TARGET_ALLOW_KEYWORDS),
+        default=",".join(DEFAULT_DISTRACTOR_ALLOW_KEYWORDS),
         help="Comma-separated keywords required for real distractor templates. Empty string allows all non-rejected distractors.",
     )
     parser.add_argument(
         "--distractor-reject-keywords",
         type=str,
-        default=",".join(DEFAULT_TARGET_REJECT_KEYWORDS),
+        default=",".join(DEFAULT_DISTRACTOR_REJECT_KEYWORDS),
         help="Comma-separated keywords rejected for real distractor templates.",
     )
     args = parser.parse_args()
@@ -831,6 +921,8 @@ def main() -> None:
         raise ValueError("Distractor counts must be non-negative.")
     if int(args.distractor_count_min) > int(args.distractor_count_max):
         raise ValueError("--distractor-count-min cannot exceed --distractor-count-max.")
+    if int(args.distractor_count_max) > DISTRACTOR_COUNT_MAX_LIMIT:
+        raise ValueError(f"--distractor-count-max cannot exceed {DISTRACTOR_COUNT_MAX_LIMIT}.")
     if float(args.distractor_scale_min) <= 0.0 or float(args.distractor_scale_max) <= 0.0:
         raise ValueError("Distractor scale factors must be positive.")
 
@@ -841,6 +933,16 @@ def main() -> None:
     image_size = int(stage_cfg.get("image_size", 256))
     base_seed = int(args.seed if args.seed is not None else target_cfg["seed"])
     assets_root = Path(args.assets_root).resolve()
+    target_assets_root = (
+        Path(args.target_assets_root).resolve()
+        if args.target_assets_root is not None
+        else assets_root
+    )
+    distractor_assets_root = (
+        Path(args.distractor_assets_root).resolve()
+        if args.distractor_assets_root is not None
+        else assets_root
+    )
     water_mask_root = (
         Path(args.water_mask_root).resolve()
         if args.water_mask_root is not None
@@ -856,16 +958,31 @@ def main() -> None:
             skip_review=not bool(args.include_review_backgrounds),
         )
         targets_by_split = _collect_targets(
-            assets_root,
+            target_assets_root,
             allow_keywords=_split_keywords(args.target_allow_keywords),
             reject_keywords=_split_keywords(args.target_reject_keywords),
         )
+        if not any(targets_by_split.values()) and target_assets_root != assets_root:
+            targets_by_split = _collect_targets(
+                assets_root,
+                allow_keywords=_split_keywords(args.target_allow_keywords),
+                reject_keywords=_split_keywords(args.target_reject_keywords),
+            )
         if int(args.distractor_count_max) > 0:
             distractors_by_split = _collect_distractors(
-                assets_root,
+                distractor_assets_root,
                 allow_keywords=_split_keywords(args.distractor_allow_keywords),
                 reject_keywords=_split_keywords(args.distractor_reject_keywords),
             )
+            if not any(distractors_by_split.values()) and distractor_assets_root == assets_root:
+                fallback_root = (assets_root.parent / "source_stage2").resolve()
+                if fallback_root.exists() and fallback_root != distractor_assets_root:
+                    distractor_assets_root = fallback_root
+                    distractors_by_split = _collect_distractors(
+                        distractor_assets_root,
+                        allow_keywords=_split_keywords(args.distractor_allow_keywords),
+                        reject_keywords=_split_keywords(args.distractor_reject_keywords),
+                    )
         missing_bg = [s for s in ("train", "val", "test") if not backgrounds_by_split.get(s)]
         missing_target = [s for s in ("train", "val", "test") if not targets_by_split.get(s)]
         missing_distractor = [
@@ -874,7 +991,9 @@ def main() -> None:
         if missing_bg or missing_target or missing_distractor:
             raise RuntimeError(
                 f"Missing real assets. missing_background_splits={missing_bg}, missing_target_splits={missing_target}, "
-                f"missing_distractor_splits={missing_distractor}, assets_root={assets_root}, water_mask_root={water_mask_root}"
+                f"missing_distractor_splits={missing_distractor}, assets_root={assets_root}, "
+                f"target_assets_root={target_assets_root}, distractor_assets_root={distractor_assets_root}, "
+                f"water_mask_root={water_mask_root}"
             )
 
     out_root = Path(args.out_root)
@@ -998,6 +1117,8 @@ def main() -> None:
         "unit": "km",
         "asset_mode": str(args.asset_mode),
         "assets_root": str(assets_root) if args.asset_mode == "real" else None,
+        "target_assets_root": str(target_assets_root) if args.asset_mode == "real" else None,
+        "distractor_assets_root": str(distractor_assets_root) if args.asset_mode == "real" else None,
         "water_mask_root": str(water_mask_root) if args.asset_mode == "real" else None,
         "background_counts": {k: len(v) for k, v in backgrounds_by_split.items()} if args.asset_mode == "real" else None,
         "target_counts": {k: len(v) for k, v in targets_by_split.items()} if args.asset_mode == "real" else None,

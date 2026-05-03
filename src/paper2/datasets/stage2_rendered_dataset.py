@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 
 from paper2.datasets.public_tracking_dataset import (
@@ -74,7 +75,12 @@ class Stage2RenderedDataset:
         meta = dict(row.get("meta", {}))
         if not self.load_water_mask:
             return None
-        crop_origin = meta.get("crop_origin_bg_px", meta.get("crop_origin_xy"))
+        crop_origin = (
+            meta.get("crop_origin_bg_px")
+            or meta.get("crop_origin_xy")
+            or meta.get("crop_bg_xy")
+            or meta.get("crop_top_left")
+        )
         mask_path = self._resolve_meta_path(meta.get("water_mask_path"))
         if crop_origin is None or mask_path is None or not mask_path.exists():
             return None

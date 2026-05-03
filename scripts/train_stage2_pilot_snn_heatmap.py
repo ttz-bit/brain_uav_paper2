@@ -112,6 +112,55 @@ def _distractors_from_sample(sample, *, max_distractors: int) -> tuple[np.ndarra
     return centers, mask
 
 
+def _crop_origin_from_meta(meta: dict) -> list[float] | None:
+    for key in ("crop_origin_bg_px", "crop_origin_xy", "crop_bg_xy", "crop_top_left"):
+        value = meta.get(key)
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            return [float(value[0]), float(value[1])]
+    return None
+
+
+def _resolve_optional_path(path_raw: object, project_root: Path) -> Path | None:
+    if path_raw is None:
+        return None
+    path = Path(str(path_raw))
+    if path.exists():
+        return path
+    if not path.is_absolute():
+        candidate = (project_root / path).resolve()
+        if candidate.exists():
+            return candidate
+    return path if path.exists() else None
+
+
+def _metadata_coverage(ds, *, project_root: Path) -> dict[str, float | int]:
+    rows = list(getattr(ds, "_rows", []))
+    total = len(rows)
+    crop_ready = 0
+    water_ready = 0
+    distractor_rows = 0
+    for row in rows:
+        meta = dict(row.get("meta", {}))
+        if _crop_origin_from_meta(meta) is not None:
+            crop_ready += 1
+        mask_path = _resolve_optional_path(meta.get("water_mask_path"), project_root)
+        if mask_path is not None and mask_path.exists():
+            water_ready += 1
+        if len(list(meta.get("distractor_bboxes_xywh", []))) > 0:
+            distractor_rows += 1
+    return {
+        "total_rows": int(total),
+        "crop_origin_rows": int(crop_ready),
+        "crop_origin_missing": int(total - crop_ready),
+        "water_mask_rows": int(water_ready),
+        "water_mask_missing": int(total - water_ready),
+        "distractor_rows": int(distractor_rows),
+        "crop_origin_coverage": float(crop_ready / max(1, total)),
+        "water_mask_coverage": float(water_ready / max(1, total)),
+        "distractor_row_ratio": float(distractor_rows / max(1, total)),
+    }
+
+
 def _land_mask_from_sample(sample, *, input_size: int, dilate_px: int) -> np.ndarray:
     sz = int(input_size)
     h, w = sample.image.shape[:2]
@@ -274,6 +323,15 @@ def main() -> None:
         max_samples=args.max_val_samples,
         load_water_mask=load_water_mask,
     )
+
+    train_meta = _metadata_coverage(train_ds, project_root=project_root)
+    val_meta = _metadata_coverage(val_ds, project_root=project_root)
+    if load_water_mask and (train_meta["water_mask_missing"] > 0 or val_meta["water_mask_missing"] > 0):
+        raise RuntimeError(
+            "Water-mask supervision requested but crop/mask metadata is incomplete. "
+            f"train_missing={train_meta['water_mask_missing']}, val_missing={val_meta['water_mask_missing']}. "
+            "Re-render the dataset with crop_origin_bg_px / water_mask_path populated."
+        )
 
     class _RenderedTorchDataset(Dataset):
         def __init__(self, ds, indices: np.ndarray | None = None):
@@ -656,6 +714,11 @@ def main() -> None:
             "num_train": int(len(train_ds)),
             "num_val": int(len(val_ds)),
         },
+        "data_quality": {
+            "train": train_meta,
+            "val": val_meta,
+            "water_mask_supervision_enabled": bool(load_water_mask),
+        },
         "device": str(device),
         "model": {
             "type": "snn_heatmap",
@@ -738,6 +801,10 @@ def main() -> None:
             "val_improve_ratio_gt_0": bool(val_improve_ratio > 0.0),
             "val_beats_center_baseline": bool(val_final["center_baseline_improve_ratio"] > 0.0),
             "val_prediction_not_constant": bool(val_final["rounded_unique_pred_xy"] > 5),
+            "water_mask_metadata_complete": bool(
+                (not load_water_mask)
+                or (train_meta["water_mask_missing"] == 0 and val_meta["water_mask_missing"] == 0)
+            ),
         },
         "artifacts": {
             "report_path": str(out_dir / "report.json"),

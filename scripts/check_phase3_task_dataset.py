@@ -18,6 +18,14 @@ def _read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def _crop_origin_from_meta(meta: dict) -> list[float] | None:
+    for key in ("crop_origin_bg_px", "crop_origin_xy", "crop_bg_xy", "crop_top_left"):
+        value = meta.get(key)
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            return [float(value[0]), float(value[1])]
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-root", type=str, default="data/rendered/paper2_task_v1.0.0_smoke")
@@ -39,14 +47,17 @@ def main() -> None:
     center_bbox_delta_violations = 0
     target_water_ratio_violations = 0
     distractor_count_shortfalls = 0
+    distractor_count_over_max = 0
     distractor_water_ratio_violations = 0
     sequence_background_violations = 0
     sequence_target_violations = 0
     sequence_stage_order_violations = 0
     sequence_range_monotonic_violations = 0
     sequence_motion_mode_violations = 0
+    sequence_distractor_count_violations = 0
     target_motion_step_violations = 0
     crop_origin_missing = 0
+    water_mask_missing = 0
     water_mask_crop_violations = 0
     water_mask_target_center_violations = 0
     ranges = []
@@ -91,8 +102,14 @@ def main() -> None:
             center_bbox_delta = float(np.hypot(cx - bbox_cx, cy - bbox_cy))
             center_bbox_deltas.append(center_bbox_delta)
             meta = dict(row.get("meta", {}))
+            asset_mode = str(meta.get("asset_mode", "")).lower()
             water_mask_path_raw = meta.get("water_mask_path")
-            crop_origin = meta.get("crop_origin_bg_px", meta.get("crop_origin_xy"))
+            crop_origin = _crop_origin_from_meta(meta)
+            if asset_mode == "real":
+                if not water_mask_path_raw:
+                    water_mask_missing += 1
+                if crop_origin is None:
+                    crop_origin_missing += 1
             if water_mask_path_raw:
                 if not isinstance(crop_origin, (list, tuple)) or len(crop_origin) < 2:
                     crop_origin_missing += 1
@@ -140,6 +157,8 @@ def main() -> None:
             distractor_counts.append(distractor_count)
             if distractor_count < distractor_count_requested:
                 distractor_count_shortfalls += 1
+            if distractor_count > 3 or distractor_count_requested > 3:
+                distractor_count_over_max += 1
             for ratio_raw in list(meta.get("distractor_water_ratios", [])):
                 ratio = float(ratio_raw)
                 distractor_water_ratios.append(ratio)
@@ -177,6 +196,10 @@ def main() -> None:
         else:
             mode = next(iter(seq_modes))
             motion_mode_sequence_counts[mode] = motion_mode_sequence_counts.get(mode, 0) + 1
+
+        seq_distractor_counts = [int(dict(row.get("meta", {})).get("distractor_count", 0)) for row in seq_rows]
+        if len(set(seq_distractor_counts)) > 1:
+            sequence_distractor_count_violations += 1
 
         prev_xy = None
         for row in seq_rows:
@@ -227,14 +250,17 @@ def main() -> None:
         "center_bbox_delta_violations": int(center_bbox_delta_violations),
         "target_water_ratio_violations": int(target_water_ratio_violations),
         "distractor_count_shortfalls": int(distractor_count_shortfalls),
+        "distractor_count_over_max": int(distractor_count_over_max),
         "distractor_water_ratio_violations": int(distractor_water_ratio_violations),
         "sequence_background_violations": int(sequence_background_violations),
         "sequence_target_violations": int(sequence_target_violations),
         "sequence_stage_order_violations": int(sequence_stage_order_violations),
         "sequence_range_monotonic_violations": int(sequence_range_monotonic_violations),
         "sequence_motion_mode_violations": int(sequence_motion_mode_violations),
+        "sequence_distractor_count_violations": int(sequence_distractor_count_violations),
         "target_motion_step_violations": int(target_motion_step_violations),
         "crop_origin_missing": int(crop_origin_missing),
+        "water_mask_missing": int(water_mask_missing),
         "water_mask_crop_violations": int(water_mask_crop_violations),
         "water_mask_target_center_violations": int(water_mask_target_center_violations),
         "target_not_water": int(not_water),
@@ -250,14 +276,17 @@ def main() -> None:
             and center_bbox_delta_violations == 0
             and target_water_ratio_violations == 0
             and distractor_count_shortfalls == 0
+            and distractor_count_over_max == 0
             and distractor_water_ratio_violations == 0
             and sequence_background_violations == 0
             and sequence_target_violations == 0
             and sequence_stage_order_violations == 0
             and sequence_range_monotonic_violations == 0
             and sequence_motion_mode_violations == 0
+            and sequence_distractor_count_violations == 0
             and target_motion_step_violations == 0
             and crop_origin_missing == 0
+            and water_mask_missing == 0
             and water_mask_crop_violations == 0
             and water_mask_target_center_violations == 0
             and motion_mode_coverage_ok

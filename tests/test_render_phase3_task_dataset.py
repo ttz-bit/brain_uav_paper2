@@ -6,7 +6,17 @@ from pathlib import Path
 import subprocess
 import sys
 
-from scripts.render_phase3_task_dataset import _collect_targets, _target_template_allowed
+import cv2
+import numpy as np
+
+from paper2.datasets.stage2_rendered_dataset import build_stage2_rendered_dataset
+from scripts.render_phase3_task_dataset import (
+    _DistractorTrack,
+    _advance_distractor_track,
+    _collect_targets,
+    _point_on_water,
+    _target_template_allowed,
+)
 
 
 def test_render_phase3_task_dataset_smoke(tmp_path):
@@ -20,7 +30,7 @@ def test_render_phase3_task_dataset_smoke(tmp_path):
         "--out-root",
         str(out_root),
         "--sequences",
-        "3",
+        "4",
         "--frames",
         "4",
     ]
@@ -34,7 +44,7 @@ def test_render_phase3_task_dataset_smoke(tmp_path):
     subprocess.run(check_cmd, cwd=root, env=env, check=True)
     report = json.loads((out_root / "reports" / "phase3_task_dataset_qc.json").read_text(encoding="utf-8"))
     assert report["pass"] is True
-    assert report["total_frames"] == 12
+    assert report["total_frames"] == 16
 
 
 def test_target_template_filter_rejects_non_topdown_views():
@@ -88,7 +98,7 @@ def test_render_phase3_task_dataset_qc_reports_sequence_consistency(tmp_path):
             "--out-root",
             str(out_root),
             "--sequences",
-            "3",
+            "4",
             "--frames",
             "4",
         ],
@@ -111,3 +121,106 @@ def test_render_phase3_task_dataset_qc_reports_sequence_consistency(tmp_path):
     assert report["sequence_background_violations"] == 0
     assert report["sequence_target_violations"] == 0
     assert report["target_water_ratio_violations"] == 0
+
+
+def test_stage2_rendered_dataset_accepts_crop_origin_aliases(tmp_path):
+    root = tmp_path / "dataset"
+    image_dir = root / "images" / "train"
+    label_dir = root / "labels"
+    mask_dir = tmp_path / "masks"
+    image_dir.mkdir(parents=True)
+    label_dir.mkdir(parents=True)
+    mask_dir.mkdir(parents=True)
+
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+    image[:, :] = (10, 20, 30)
+    cv2.imwrite(str(image_dir / "sample.png"), image)
+
+    mask = np.zeros((6, 6), dtype=np.uint8)
+    mask[1:5, 1:5] = 255
+    mask_path = mask_dir / "water_mask.png"
+    cv2.imwrite(str(mask_path), mask)
+
+    row = {
+        "image_path": "images/train/sample.png",
+        "split": "train",
+        "sequence_id": "train_0000",
+        "frame_id": "0000",
+        "stage": "far",
+        "target_center_px": [2.0, 2.0],
+        "bbox_xywh": [1.0, 1.0, 2.0, 2.0],
+        "visibility": 1.0,
+        "background_asset_id": "bg_1",
+        "target_asset_id": "target_1",
+        "distractor_asset_ids": [],
+        "motion_mode": "cv",
+        "land_overlap_ratio": 0.0,
+        "shore_buffer_overlap_ratio": 0.0,
+        "scale_px": 2.0,
+        "angle_deg": 0.0,
+        "obs_valid": True,
+        "meta": {
+            "asset_mode": "real",
+            "water_mask_path": str(mask_path),
+            "crop_top_left": [1, 1],
+            "target_state_world": {"x": 0.0, "y": 0.0},
+        },
+    }
+    (label_dir / "train.jsonl").write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    ds = build_stage2_rendered_dataset(
+        root=root,
+        split="train",
+        project_root=root,
+        load_water_mask=True,
+    )
+    sample = ds[0]
+    assert sample.water_mask is not None
+    assert sample.water_mask.shape == (4, 4)
+    assert int(sample.water_mask[0, 0]) == 255
+    assert int(sample.water_mask[-1, -1]) == 255
+
+
+def test_distractor_track_advances_without_collision_or_land(tmp_path):
+    mask = np.ones((24, 24), dtype=np.uint8) * 255
+    mask[:2, :] = 0
+    rng = np.random.default_rng(7)
+    track = _DistractorTrack(
+        asset_path="track_a.png",
+        center_px=np.array([10.0, 12.0], dtype=float),
+        heading=0.0,
+        speed_px=5.0,
+        motion_mode="cv",
+        turn_rate=0.0,
+        steps_to_switch=8,
+        scale_px=4.0,
+        radius_px=2.5,
+        count_requested=1,
+    )
+    peer = _DistractorTrack(
+        asset_path="track_b.png",
+        center_px=np.array([22.0, 12.0], dtype=float),
+        heading=0.0,
+        speed_px=1.0,
+        motion_mode="cv",
+        turn_rate=0.0,
+        steps_to_switch=8,
+        scale_px=4.0,
+        radius_px=2.5,
+        count_requested=1,
+    )
+
+    _advance_distractor_track(
+        track,
+        rng,
+        mask_u8=mask,
+        target_center=(16.0, 18.0),
+        target_clearance_px=6.0,
+        other_tracks=[track, peer],
+    )
+
+    assert _point_on_water(mask, float(track.center_px[0]), float(track.center_px[1]))
+    assert float(np.hypot(track.center_px[0] - peer.center_px[0], track.center_px[1] - peer.center_px[1])) >= (
+        track.radius_px + peer.radius_px + 6.0
+    )
+    assert float(np.hypot(track.center_px[0] - 16.0, track.center_px[1] - 18.0)) >= 6.0
