@@ -170,12 +170,26 @@ def _smooth_center_offsets_px(
     rng: np.random.Generator,
 ) -> list[np.ndarray]:
     jitter_cfg = stage_cfg.get("crop_jitter_px", {})
+    stage_limits = [float(jitter_cfg.get(stage, 0.0)) for stage in STAGES]
+    max_limit = max(stage_limits) if stage_limits else 0.0
+    if max_limit > 0.0:
+        anchor_radius = float(rng.uniform(0.35, 0.85)) * max_limit
+        anchor_theta = float(rng.uniform(-math.pi, math.pi))
+        anchor = np.array(
+            [
+                anchor_radius * math.cos(anchor_theta),
+                anchor_radius * math.sin(anchor_theta),
+            ],
+            dtype=float,
+        )
+    else:
+        anchor = np.zeros(2, dtype=float)
     offsets: list[np.ndarray] = []
-    offset = np.zeros(2, dtype=float)
+    offset = anchor.copy()
     for stage in stage_plan:
         limit = float(jitter_cfg.get(stage, 0.0))
-        step_sigma = max(0.25, limit * 0.12)
-        offset = offset + rng.normal(0.0, step_sigma, size=2)
+        step_sigma = max(0.35, limit * 0.10)
+        offset = 0.88 * offset + 0.12 * anchor + rng.normal(0.0, step_sigma, size=2)
         norm = float(np.linalg.norm(offset))
         if limit > 0.0 and norm > limit:
             offset = offset / max(norm, 1e-9) * limit
