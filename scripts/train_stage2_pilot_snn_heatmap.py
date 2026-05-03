@@ -46,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--prefetch-factor", type=int, default=2)
     p.add_argument("--persistent-workers", action="store_true")
+    p.add_argument("--amp", type=str, default="none", choices=["none", "fp16", "bf16"])
+    p.add_argument("--channels-last", action="store_true")
     p.add_argument("--save-last-each-epoch", action="store_true")
     p.add_argument("--num-threads", type=int, default=0)
     p.add_argument("--num-interop-threads", type=int, default=0)
@@ -225,7 +227,12 @@ def main() -> None:
         train_encoding=str(args.train_encoding),
         eval_encoding=str(args.eval_encoding),
     ).to(device)
+    if bool(args.channels_last) and device == "cuda":
+        model = model.to(memory_format=torch.channels_last)
     optimizer = torch.optim.Adam(model.parameters(), lr=float(args.learning_rate), weight_decay=float(args.weight_decay))
+    amp_enabled = device == "cuda" and str(args.amp) != "none"
+    amp_dtype = torch.float16 if str(args.amp) == "fp16" else torch.bfloat16
+    scaler = torch.cuda.amp.GradScaler(enabled=bool(amp_enabled and str(args.amp) == "fp16"))
 
     def _loss(outputs, targets):
         return heatmap_loss(
@@ -266,8 +273,11 @@ def main() -> None:
             for xb, yb in eval_loader:
                 xb = xb.to(device, non_blocking=(device == "cuda"))
                 yb = yb.to(device, non_blocking=(device == "cuda"))
-                outputs = model(xb, stochastic=False)
-                loss, _ = _loss(outputs, yb)
+                if bool(args.channels_last) and device == "cuda":
+                    xb = xb.contiguous(memory_format=torch.channels_last)
+                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=bool(amp_enabled)):
+                    outputs = model(xb, stochastic=False)
+                    loss, _ = _loss(outputs, yb)
                 n = int(xb.shape[0])
                 total += float(loss.item()) * n
                 count += n
@@ -328,11 +338,15 @@ def main() -> None:
         for xb, yb in loader:
             xb = xb.to(device, non_blocking=(device == "cuda"))
             yb = yb.to(device, non_blocking=(device == "cuda"))
+            if bool(args.channels_last) and device == "cuda":
+                xb = xb.contiguous(memory_format=torch.channels_last)
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(xb, stochastic=True)
-            loss, parts = _loss(outputs, yb)
-            loss.backward()
-            optimizer.step()
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=bool(amp_enabled)):
+                outputs = model(xb, stochastic=True)
+                loss, parts = _loss(outputs, yb)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             batch_losses.append(float(loss.detach().item()))
             batch_parts.append(parts)
         train_loop_sec_total += float(time.perf_counter() - t_train_loop_begin)
@@ -474,7 +488,10 @@ def main() -> None:
             for rank, idx in enumerate(idxs):
                 s = ds[int(idx)]
                 x = torch.from_numpy(_to_tensor_image(s.image, input_size=int(args.input_size))).unsqueeze(0).to(device)
-                outputs = model(x, stochastic=False)
+                if bool(args.channels_last) and device == "cuda":
+                    x = x.contiguous(memory_format=torch.channels_last)
+                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=bool(amp_enabled)):
+                    outputs = model(x, stochastic=False)
                 if str(args.decode_method) == "softargmax":
                     pred_xy = soft_argmax_2d(
                         outputs["heatmap_logits"],
@@ -529,6 +546,8 @@ def main() -> None:
             "num_workers": int(num_workers),
             "prefetch_factor": int(args.prefetch_factor),
             "persistent_workers": bool(args.persistent_workers),
+            "amp": str(args.amp),
+            "channels_last": bool(args.channels_last),
             "save_last_each_epoch": bool(args.save_last_each_epoch),
             "num_threads": int(torch.get_num_threads()),
             "num_interop_threads": int(torch.get_num_interop_threads()),

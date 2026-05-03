@@ -174,16 +174,12 @@ def heatmap_loss(
     target_probs = target_flat / target_flat.sum(dim=1, keepdim=True).clamp_min(1e-12)
     log_probs = F.log_softmax(outputs["heatmap_logits"].flatten(1), dim=1)
     hm_per_sample = -(target_probs * log_probs).sum(dim=1)
-    has_valid = bool(valid.any().detach().cpu().item())
-    if has_valid:
-        hm_loss = hm_per_sample[valid].mean()
-    else:
-        hm_loss = hm_per_sample.mean() * 0.0
+    valid_weight = valid.to(dtype=hm_per_sample.dtype)
+    valid_den = valid_weight.sum().clamp_min(1.0)
+    hm_loss = (hm_per_sample * valid_weight).sum() / valid_den
     pred_xy = soft_argmax_2d(outputs["heatmap_logits"], temperature=softargmax_temperature)
-    if has_valid:
-        coord_loss = F.smooth_l1_loss(pred_xy[valid], targets[valid, :2])
-    else:
-        coord_loss = pred_xy.sum() * 0.0
+    coord_per_sample = F.smooth_l1_loss(pred_xy, targets[:, :2], reduction="none").mean(dim=1)
+    coord_loss = (coord_per_sample * valid_weight).sum() / valid_den
     conf_loss = F.binary_cross_entropy_with_logits(outputs["conf_logits"], targets[:, 2])
     total = float(heatmap_weight) * hm_loss + float(coord_weight) * coord_loss + float(conf_weight) * conf_loss
     parts = {
