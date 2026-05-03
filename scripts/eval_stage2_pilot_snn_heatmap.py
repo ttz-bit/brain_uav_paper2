@@ -96,6 +96,24 @@ def _nearest_distractor_error_px(pred_xy: np.ndarray, sample) -> tuple[float | N
     return float(min(errors)), int(len(errors))
 
 
+def _distractor_boxes_from_sample(sample) -> list[list[float]]:
+    boxes: list[list[float]] = []
+    for box in list((sample.meta or {}).get("distractor_bboxes_xywh", [])):
+        if not isinstance(box, (list, tuple)) or len(box) < 4:
+            continue
+        x, y, w, h = [float(v) for v in box[:4]]
+        if w <= 0.0 or h <= 0.0:
+            continue
+        boxes.append([x, y, w, h])
+    return boxes
+
+
+def _draw_distractor_boxes(vis: np.ndarray, boxes: list[list[float]]) -> None:
+    for box in boxes:
+        x, y, w, h = [int(round(float(v))) for v in box[:4]]
+        cv2.rectangle(vis, (x, y), (x + max(1, w), y + max(1, h)), (0, 255, 255), 1, cv2.LINE_AA)
+
+
 def _image_to_world(pred_xy: np.ndarray, sample) -> tuple[list[float] | None, list[float] | None, float | None]:
     meta = dict(sample.meta or {})
     crop = meta.get("crop_center_world")
@@ -130,6 +148,7 @@ def _make_visual(
     stage: str,
     background: str,
     world_error: float | None,
+    distractor_boxes: list[list[float]] | None = None,
 ) -> np.ndarray:
     h_img, w_img = img_bgr.shape[:2]
     pred_x = int(np.clip(pred_xy[0], 0.0, 1.0) * w_img)
@@ -137,6 +156,7 @@ def _make_visual(
     gt_x = int(np.clip(gt[0], 0.0, 1.0) * w_img)
     gt_y = int(np.clip(gt[1], 0.0, 1.0) * h_img)
     vis = img_bgr.copy()
+    _draw_distractor_boxes(vis, list(distractor_boxes or []))
     cv2.circle(vis, (gt_x, gt_y), 4, (0, 255, 0), -1)
     cv2.circle(vis, (pred_x, pred_y), 4, (0, 0, 255), -1)
     cv2.line(vis, (gt_x, gt_y), (pred_x, pred_y), (255, 255, 0), 1)
@@ -174,6 +194,7 @@ def _save_visual_bucket(*, ds, records: list[dict], bucket_dir: Path, count: int
             stage=str(rec["stage"]),
             background=str(rec["background_category"]),
             world_error=rec.get("world_error_m"),
+            distractor_boxes=_distractor_boxes_from_sample(sample),
         )
         name = (
             f"{rank:02d}_err{float(rec['pixel_error']):06.2f}_"

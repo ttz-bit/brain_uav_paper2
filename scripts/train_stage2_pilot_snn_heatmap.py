@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--decode-method", type=str, default="softargmax", choices=["argmax", "softargmax"])
     p.add_argument("--train-encoding", type=str, default="direct", choices=["rate", "direct"])
     p.add_argument("--eval-encoding", type=str, default="direct", choices=["rate", "direct"])
+    p.add_argument("--init-weights", type=str, default="")
     p.add_argument("--eval-interval", type=int, default=1)
     p.add_argument("--eval-batch-size", type=int, default=128)
     p.add_argument("--train-eval-max-samples", type=int, default=2048)
@@ -117,13 +118,39 @@ def _pixel_error_norm(pred_xy: np.ndarray, gt_xy: np.ndarray, h: int, w: int) ->
     return float(np.hypot(px - gx, py - gy))
 
 
-def _make_visual(img_bgr: np.ndarray, pred_xy: np.ndarray, gt: np.ndarray, tag: str, err: float) -> np.ndarray:
+def _distractor_boxes_from_sample(sample) -> list[list[float]]:
+    boxes: list[list[float]] = []
+    for box in list((sample.meta or {}).get("distractor_bboxes_xywh", [])):
+        if not isinstance(box, (list, tuple)) or len(box) < 4:
+            continue
+        x, y, w, h = [float(v) for v in box[:4]]
+        if w <= 0.0 or h <= 0.0:
+            continue
+        boxes.append([x, y, w, h])
+    return boxes
+
+
+def _draw_distractor_boxes(vis: np.ndarray, boxes: list[list[float]]) -> None:
+    for box in boxes:
+        x, y, w, h = [int(round(float(v))) for v in box[:4]]
+        cv2.rectangle(vis, (x, y), (x + max(1, w), y + max(1, h)), (0, 255, 255), 1, cv2.LINE_AA)
+
+
+def _make_visual(
+    img_bgr: np.ndarray,
+    pred_xy: np.ndarray,
+    gt: np.ndarray,
+    tag: str,
+    err: float,
+    distractor_boxes: list[list[float]] | None = None,
+) -> np.ndarray:
     h_img, w_img = img_bgr.shape[:2]
     pred_x = int(np.clip(pred_xy[0], 0.0, 1.0) * w_img)
     pred_y = int(np.clip(pred_xy[1], 0.0, 1.0) * h_img)
     gt_x = int(np.clip(gt[0], 0.0, 1.0) * w_img)
     gt_y = int(np.clip(gt[1], 0.0, 1.0) * h_img)
     vis = img_bgr.copy()
+    _draw_distractor_boxes(vis, list(distractor_boxes or []))
     cv2.circle(vis, (gt_x, gt_y), 4, (0, 255, 0), -1)
     cv2.circle(vis, (pred_x, pred_y), 4, (0, 0, 255), -1)
     cv2.line(vis, (gt_x, gt_y), (pred_x, pred_y), (255, 255, 0), 1)
@@ -252,6 +279,14 @@ def main() -> None:
     ).to(device)
     if bool(args.channels_last) and device == "cuda":
         model = model.to(memory_format=torch.channels_last)
+    init_weights = str(args.init_weights or "").strip()
+    if init_weights:
+        init_path = Path(init_weights).resolve()
+        if not init_path.exists():
+            raise FileNotFoundError(f"Missing init weights: {init_path}")
+        init_ckpt = torch.load(init_path, map_location=device)
+        state_dict = init_ckpt.get("state_dict", init_ckpt)
+        model.load_state_dict(state_dict, strict=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=float(args.learning_rate), weight_decay=float(args.weight_decay))
     amp_enabled = device == "cuda" and str(args.amp) != "none"
     amp_dtype = torch.float16 if str(args.amp) == "fp16" else torch.bfloat16
@@ -431,6 +466,7 @@ def main() -> None:
                     "beta": float(args.beta),
                     "train_encoding": str(args.train_encoding),
                     "eval_encoding": str(args.eval_encoding),
+                    "init_weights": init_weights,
                     "decode_method": str(args.decode_method),
                     "epoch": int(ep + 1),
                     "best_val_loss": float(best_val),
@@ -464,6 +500,7 @@ def main() -> None:
                     "beta": float(args.beta),
                     "train_encoding": str(args.train_encoding),
                     "eval_encoding": str(args.eval_encoding),
+                    "init_weights": init_weights,
                     "decode_method": str(args.decode_method),
                     "epoch": int(ep + 1),
                     "best_val_loss": float(best_val),
@@ -506,6 +543,7 @@ def main() -> None:
             "beta": float(args.beta),
             "train_encoding": str(args.train_encoding),
             "eval_encoding": str(args.eval_encoding),
+            "init_weights": init_weights,
             "decode_method": str(args.decode_method),
             "epoch": int(epochs),
             "best_val_loss": float(best_val),
@@ -541,7 +579,14 @@ def main() -> None:
                     pred_xy = peak_argmax_2d(outputs["heatmap_logits"])[0].detach().cpu().numpy()
                 gt = _target_from_sample(s)
                 err = _pixel_error_norm(pred_xy, gt[:2], s.image.shape[0], s.image.shape[1])
-                vis = _make_visual(s.image, pred_xy, gt, tag=tag, err=err)
+                vis = _make_visual(
+                    s.image,
+                    pred_xy,
+                    gt,
+                    tag=tag,
+                    err=err,
+                    distractor_boxes=_distractor_boxes_from_sample(s),
+                )
                 cv2.imwrite(str(vis_dir / f"{tag}_sample_{rank:02d}.jpg"), vis)
 
     report = {
@@ -571,6 +616,7 @@ def main() -> None:
             "beta": float(args.beta),
             "train_encoding": str(args.train_encoding),
             "eval_encoding": str(args.eval_encoding),
+            "init_weights": init_weights,
             "input_size": int(args.input_size),
             "heatmap_size": int(args.heatmap_size),
             "heatmap_sigma": float(args.heatmap_sigma),
