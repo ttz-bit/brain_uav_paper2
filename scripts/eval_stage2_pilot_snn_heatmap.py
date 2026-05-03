@@ -111,6 +111,42 @@ def _pred_on_land(pred_xy: np.ndarray, sample) -> bool | None:
     return bool(mask[py, px] <= 0)
 
 
+def _water_mask_from_sample(sample, *, input_size: int) -> np.ndarray:
+    sz = int(input_size)
+    h, w = sample.image.shape[:2]
+    out_h = sz if sz > 0 else h
+    out_w = sz if sz > 0 else w
+    if getattr(sample, "water_mask", None) is None:
+        return np.ones((1, out_h, out_w), dtype=np.float32)
+    water_mask = np.asarray(sample.water_mask)
+    if water_mask.shape[:2] != (h, w):
+        water_mask = cv2.resize(water_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    water = (water_mask > 0).astype(np.uint8)
+    if sz > 0 and (h != sz or w != sz):
+        water = cv2.resize(water, (sz, sz), interpolation=cv2.INTER_NEAREST)
+    return water.astype(np.float32, copy=False)[None, :, :]
+
+
+def _land_mask_from_sample(sample, *, input_size: int, dilate_px: int) -> np.ndarray:
+    sz = int(input_size)
+    h, w = sample.image.shape[:2]
+    out_h = sz if sz > 0 else h
+    out_w = sz if sz > 0 else w
+    if getattr(sample, "water_mask", None) is None:
+        return np.zeros((1, out_h, out_w), dtype=np.float32)
+    water_mask = np.asarray(sample.water_mask)
+    if water_mask.shape[:2] != (h, w):
+        water_mask = cv2.resize(water_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    land = (water_mask <= 0).astype(np.uint8)
+    if int(dilate_px) > 0 and int(land.sum()) > 0:
+        k = int(dilate_px) * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        land = cv2.dilate(land, kernel, iterations=1)
+    if sz > 0 and (h != sz or w != sz):
+        land = cv2.resize(land, (sz, sz), interpolation=cv2.INTER_NEAREST)
+    return land.astype(np.float32, copy=False)[None, :, :]
+
+
 def _distractor_boxes_from_sample(sample) -> list[list[float]]:
     boxes: list[list[float]] = []
     for box in list((sample.meta or {}).get("distractor_bboxes_xywh", [])):
@@ -267,6 +303,8 @@ def main() -> None:
     heatmap_weight = float(ckpt.get("heatmap_weight", 1.0))
     coord_weight = float(ckpt.get("coord_weight", 5.0))
     conf_weight = float(ckpt.get("conf_weight", 0.2))
+    land_penalty_weight = float(ckpt.get("land_penalty_weight", 0.0))
+    land_penalty_dilate_px = int(ckpt.get("land_penalty_dilate_px", 0))
     softargmax_temperature = float(ckpt.get("softargmax_temperature", 20.0))
     ckpt_train_encoding = str(ckpt.get("train_encoding", "rate"))
     ckpt_eval_encoding = str(ckpt.get("eval_encoding", "direct"))
@@ -314,6 +352,14 @@ def main() -> None:
             gt = _target_from_sample(s)
             x = torch.from_numpy(x_np).unsqueeze(0).to(device)
             y = torch.from_numpy(gt.reshape(1, 3)).to(device)
+            water = torch.from_numpy(_water_mask_from_sample(s, input_size=input_size)).unsqueeze(0).to(device)
+            land = torch.from_numpy(
+                _land_mask_from_sample(
+                    s,
+                    input_size=input_size,
+                    dilate_px=land_penalty_dilate_px,
+                )
+            ).unsqueeze(0).to(device)
             outputs = model(x, stochastic=False)
             loss, _ = heatmap_loss(
                 outputs,
@@ -324,12 +370,16 @@ def main() -> None:
                 heatmap_weight=heatmap_weight,
                 conf_weight=conf_weight,
                 softargmax_temperature=softargmax_temperature,
+                land_mask=land,
+                land_weight=land_penalty_weight,
+                valid_mask=water,
             )
             losses.append(float(loss.item()))
-            argmax_xy = peak_argmax_2d(outputs["heatmap_logits"])[0].detach().cpu().numpy()
+            argmax_xy = peak_argmax_2d(outputs["heatmap_logits"], valid_mask=water)[0].detach().cpu().numpy()
             soft_xy = soft_argmax_2d(
                 outputs["heatmap_logits"],
                 temperature=softargmax_temperature,
+                valid_mask=water,
             )[0].detach().cpu().numpy()
             pred_xy = soft_xy if decode_method == "softargmax" else argmax_xy
             pred_conf = float(torch.sigmoid(outputs["conf_logits"])[0].detach().cpu().item())
@@ -480,6 +530,9 @@ def main() -> None:
             "heatmap_weight": float(heatmap_weight),
             "coord_weight": float(coord_weight),
             "conf_weight": float(conf_weight),
+            "land_penalty_weight": float(land_penalty_weight),
+            "land_penalty_dilate_px": int(land_penalty_dilate_px),
+            "water_constrained_decode": True,
             "softargmax_temperature": float(softargmax_temperature),
             "eval_encoding": str(eval_encoding),
             "checkpoint_train_encoding": str(ckpt_train_encoding),

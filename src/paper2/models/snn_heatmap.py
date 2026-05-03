@@ -130,7 +130,35 @@ def make_gaussian_heatmaps(
     return heatmaps.unsqueeze(1) * valid.view(b, 1, 1, 1)
 
 
-def soft_argmax_2d(logits: torch.Tensor, *, temperature: float = 10.0) -> torch.Tensor:
+def _resize_mask_to_logits(mask: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+    valid = mask.to(device=logits.device, dtype=logits.dtype)
+    if valid.ndim == 3:
+        valid = valid.unsqueeze(1)
+    if valid.shape[-2:] != logits.shape[-2:]:
+        valid = F.interpolate(valid, size=logits.shape[-2:], mode="area")
+    valid = (valid > 0.5).to(dtype=logits.dtype)
+    flat = valid.flatten(1)
+    empty = flat.sum(dim=1) <= 0.0
+    if bool(empty.any()):
+        valid = valid.clone()
+        valid[empty] = 1.0
+    return valid
+
+
+def mask_heatmap_logits(logits: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+    if valid_mask is None or int(valid_mask.numel()) <= 0:
+        return logits
+    valid = _resize_mask_to_logits(valid_mask, logits)
+    return logits.masked_fill(valid <= 0.0, -1.0e4)
+
+
+def soft_argmax_2d(
+    logits: torch.Tensor,
+    *,
+    temperature: float = 10.0,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    logits = mask_heatmap_logits(logits, valid_mask)
     b, _, h, w = logits.shape
     flat = (logits.view(b, -1) * float(temperature)).softmax(dim=1)
     key = (_device_key(logits.device), logits.dtype, int(h), int(w))
@@ -149,7 +177,8 @@ def soft_argmax_2d(logits: torch.Tensor, *, temperature: float = 10.0) -> torch.
     return torch.stack([x, y], dim=1)
 
 
-def peak_argmax_2d(logits: torch.Tensor) -> torch.Tensor:
+def peak_argmax_2d(logits: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+    logits = mask_heatmap_logits(logits, valid_mask)
     b, _, h, w = logits.shape
     idx = logits.view(b, -1).argmax(dim=1)
     y = torch.div(idx, w, rounding_mode="floor").to(dtype=logits.dtype)
@@ -173,17 +202,22 @@ def heatmap_loss(
     distractor_sigma: float | None = None,
     land_mask: torch.Tensor | None = None,
     land_weight: float = 0.0,
+    valid_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     target_heatmaps = make_gaussian_heatmaps(targets, heatmap_size=heatmap_size, sigma=sigma)
+    heatmap_logits = mask_heatmap_logits(outputs["heatmap_logits"], valid_mask)
+    if valid_mask is not None and int(valid_mask.numel()) > 0:
+        target_valid = _resize_mask_to_logits(valid_mask, outputs["heatmap_logits"]).detach()
+        target_heatmaps = target_heatmaps * target_valid
     valid = targets[:, 2] > 0.5
     target_flat = target_heatmaps.flatten(1)
     target_probs = target_flat / target_flat.sum(dim=1, keepdim=True).clamp_min(1e-12)
-    log_probs = F.log_softmax(outputs["heatmap_logits"].flatten(1), dim=1)
+    log_probs = F.log_softmax(heatmap_logits.flatten(1), dim=1)
     hm_per_sample = -(target_probs * log_probs).sum(dim=1)
     valid_weight = valid.to(dtype=hm_per_sample.dtype)
     valid_den = valid_weight.sum().clamp_min(1.0)
     hm_loss = (hm_per_sample * valid_weight).sum() / valid_den
-    pred_xy = soft_argmax_2d(outputs["heatmap_logits"], temperature=softargmax_temperature)
+    pred_xy = soft_argmax_2d(heatmap_logits, temperature=softargmax_temperature)
     coord_per_sample = F.smooth_l1_loss(pred_xy, targets[:, :2], reduction="none").mean(dim=1)
     coord_loss = (coord_per_sample * valid_weight).sum() / valid_den
     conf_loss = F.binary_cross_entropy_with_logits(outputs["conf_logits"], targets[:, 2])
@@ -210,14 +244,14 @@ def heatmap_loss(
             sigma=float(distractor_sigma if distractor_sigma is not None else sigma),
         ).reshape(b, n, 1, int(heatmap_size), int(heatmap_size))
         d_mask = d_heatmaps.max(dim=1).values.flatten(1).detach()
-        pred_probs = F.softmax(outputs["heatmap_logits"].flatten(1), dim=1)
+        pred_probs = F.softmax(heatmap_logits.flatten(1), dim=1)
         d_per_sample = (pred_probs * d_mask).sum(dim=1)
         has_distractor = (d_valid.sum(dim=1) > 0.5).to(dtype=d_per_sample.dtype)
         d_den = (has_distractor * valid_weight).sum().clamp_min(1.0)
         distractor_loss = (d_per_sample * has_distractor * valid_weight).sum() / d_den
     land_loss = outputs["heatmap_logits"].new_tensor(0.0)
     if land_mask is not None and float(land_weight) > 0.0 and int(land_mask.numel()) > 0:
-        logits = outputs["heatmap_logits"]
+        logits = heatmap_logits
         if pred_probs is None:
             pred_probs = F.softmax(logits.flatten(1), dim=1)
         land = land_mask.to(device=logits.device, dtype=logits.dtype)

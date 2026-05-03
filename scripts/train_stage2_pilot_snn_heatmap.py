@@ -181,6 +181,22 @@ def _land_mask_from_sample(sample, *, input_size: int, dilate_px: int) -> np.nda
     return land.astype(np.float32, copy=False)[None, :, :]
 
 
+def _water_mask_from_sample(sample, *, input_size: int) -> np.ndarray:
+    sz = int(input_size)
+    h, w = sample.image.shape[:2]
+    out_h = sz if sz > 0 else h
+    out_w = sz if sz > 0 else w
+    if getattr(sample, "water_mask", None) is None:
+        return np.ones((1, out_h, out_w), dtype=np.float32)
+    water_mask = np.asarray(sample.water_mask)
+    if water_mask.shape[:2] != (h, w):
+        water_mask = cv2.resize(water_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    water = (water_mask > 0).astype(np.uint8)
+    if sz > 0 and (h != sz or w != sz):
+        water = cv2.resize(water, (sz, sz), interpolation=cv2.INTER_NEAREST)
+    return water.astype(np.float32, copy=False)[None, :, :]
+
+
 def _pixel_error_norm(pred_xy: np.ndarray, gt_xy: np.ndarray, h: int, w: int) -> float:
     px = float(np.clip(pred_xy[0], 0.0, 1.0) * w)
     py = float(np.clip(pred_xy[1], 0.0, 1.0) * h)
@@ -352,12 +368,14 @@ def main() -> None:
                 input_size=int(args.input_size),
                 dilate_px=int(args.land_penalty_dilate_px),
             )
+            water = _water_mask_from_sample(sample, input_size=int(args.input_size))
             return (
                 torch.from_numpy(x),
                 torch.from_numpy(y),
                 torch.from_numpy(d_xy),
                 torch.from_numpy(d_mask),
                 torch.from_numpy(land),
+                torch.from_numpy(water),
             )
 
     num_workers = max(0, int(args.num_workers))
@@ -396,7 +414,7 @@ def main() -> None:
     amp_dtype = torch.float16 if str(args.amp) == "fp16" else torch.bfloat16
     scaler = torch.cuda.amp.GradScaler(enabled=bool(amp_enabled and str(args.amp) == "fp16"))
 
-    def _loss(outputs, targets, distractor_centers=None, distractor_mask=None, land_mask=None):
+    def _loss(outputs, targets, distractor_centers=None, distractor_mask=None, land_mask=None, water_mask=None):
         return heatmap_loss(
             outputs,
             targets,
@@ -412,6 +430,7 @@ def main() -> None:
             distractor_sigma=float(args.distractor_repel_sigma),
             land_mask=land_mask,
             land_weight=float(args.land_penalty_weight),
+            valid_mask=water_mask if load_water_mask else None,
         )
 
     eval_batch_size = max(1, int(args.eval_batch_size))
@@ -438,24 +457,26 @@ def main() -> None:
         pred_x_px: list[float] = []
         pred_y_px: list[float] = []
         with torch.no_grad():
-            for xb, yb, db, dmask, land in eval_loader:
+            for xb, yb, db, dmask, land, water in eval_loader:
                 xb = xb.to(device, non_blocking=(device == "cuda"))
                 yb = yb.to(device, non_blocking=(device == "cuda"))
                 db = db.to(device, non_blocking=(device == "cuda"))
                 dmask = dmask.to(device, non_blocking=(device == "cuda"))
                 land = land.to(device, non_blocking=(device == "cuda"))
+                water = water.to(device, non_blocking=(device == "cuda"))
                 if bool(args.channels_last) and device == "cuda":
                     xb = xb.contiguous(memory_format=torch.channels_last)
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=bool(amp_enabled)):
                     outputs = model(xb, stochastic=False)
-                    loss, _ = _loss(outputs, yb, db, dmask, land)
+                    loss, _ = _loss(outputs, yb, db, dmask, land, water)
                 n = int(xb.shape[0])
                 total += float(loss.item()) * n
                 count += n
-                argmax_xy = peak_argmax_2d(outputs["heatmap_logits"]).detach().cpu().numpy()
+                argmax_xy = peak_argmax_2d(outputs["heatmap_logits"], valid_mask=water).detach().cpu().numpy()
                 soft_xy = soft_argmax_2d(
                     outputs["heatmap_logits"],
                     temperature=float(args.softargmax_temperature),
+                    valid_mask=water,
                 ).detach().cpu().numpy()
                 pred_xy = soft_xy if str(args.decode_method) == "softargmax" else argmax_xy
                 gt_xy = yb[:, :2].detach().cpu().numpy()
@@ -506,18 +527,19 @@ def main() -> None:
         batch_losses: list[float] = []
         batch_parts: list[dict[str, float]] = []
         t_train_loop_begin = time.perf_counter()
-        for xb, yb, db, dmask, land in loader:
+        for xb, yb, db, dmask, land, water in loader:
             xb = xb.to(device, non_blocking=(device == "cuda"))
             yb = yb.to(device, non_blocking=(device == "cuda"))
             db = db.to(device, non_blocking=(device == "cuda"))
             dmask = dmask.to(device, non_blocking=(device == "cuda"))
             land = land.to(device, non_blocking=(device == "cuda"))
+            water = water.to(device, non_blocking=(device == "cuda"))
             if bool(args.channels_last) and device == "cuda":
                 xb = xb.contiguous(memory_format=torch.channels_last)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=bool(amp_enabled)):
                 outputs = model(xb, stochastic=True)
-                loss, parts = _loss(outputs, yb, db, dmask, land)
+                loss, parts = _loss(outputs, yb, db, dmask, land, water)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -570,8 +592,9 @@ def main() -> None:
                     "max_distractors": int(args.max_distractors),
                     "land_penalty_weight": float(args.land_penalty_weight),
                     "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
+                    "water_logit_constraint": bool(load_water_mask),
                     "softargmax_temperature": float(args.softargmax_temperature),
-                    "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty",
+                    "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty_plus_water_logit_constraint",
                     "num_steps": int(args.num_steps),
                     "beta": float(args.beta),
                     "train_encoding": str(args.train_encoding),
@@ -606,8 +629,9 @@ def main() -> None:
                     "max_distractors": int(args.max_distractors),
                     "land_penalty_weight": float(args.land_penalty_weight),
                     "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
+                    "water_logit_constraint": bool(load_water_mask),
                     "softargmax_temperature": float(args.softargmax_temperature),
-                    "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty",
+                    "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty_plus_water_logit_constraint",
                     "num_steps": int(args.num_steps),
                     "beta": float(args.beta),
                     "train_encoding": str(args.train_encoding),
@@ -651,8 +675,9 @@ def main() -> None:
             "max_distractors": int(args.max_distractors),
             "land_penalty_weight": float(args.land_penalty_weight),
             "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
+            "water_logit_constraint": bool(load_water_mask),
             "softargmax_temperature": float(args.softargmax_temperature),
-            "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty",
+            "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty_plus_water_logit_constraint",
             "num_steps": int(args.num_steps),
             "beta": float(args.beta),
             "train_encoding": str(args.train_encoding),
@@ -680,6 +705,7 @@ def main() -> None:
             for rank, idx in enumerate(idxs):
                 s = ds[int(idx)]
                 x = torch.from_numpy(_to_tensor_image(s.image, input_size=int(args.input_size))).unsqueeze(0).to(device)
+                water = torch.from_numpy(_water_mask_from_sample(s, input_size=int(args.input_size))).unsqueeze(0).to(device)
                 if bool(args.channels_last) and device == "cuda":
                     x = x.contiguous(memory_format=torch.channels_last)
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=bool(amp_enabled)):
@@ -688,9 +714,13 @@ def main() -> None:
                     pred_xy = soft_argmax_2d(
                         outputs["heatmap_logits"],
                         temperature=float(args.softargmax_temperature),
+                        valid_mask=water if load_water_mask else None,
                     )[0].detach().cpu().numpy()
                 else:
-                    pred_xy = peak_argmax_2d(outputs["heatmap_logits"])[0].detach().cpu().numpy()
+                    pred_xy = peak_argmax_2d(
+                        outputs["heatmap_logits"],
+                        valid_mask=water if load_water_mask else None,
+                    )[0].detach().cpu().numpy()
                 gt = _target_from_sample(s)
                 err = _pixel_error_norm(pred_xy, gt[:2], s.image.shape[0], s.image.shape[1])
                 vis = _make_visual(
@@ -718,12 +748,14 @@ def main() -> None:
             "train": train_meta,
             "val": val_meta,
             "water_mask_supervision_enabled": bool(load_water_mask),
+            "water_logit_constraint_enabled": bool(load_water_mask),
         },
         "device": str(device),
         "model": {
             "type": "snn_heatmap",
             "output": "64x64 heatmap + confidence by default",
             "decode_method": str(args.decode_method),
+            "water_constrained_decode": bool(load_water_mask),
         },
         "hyperparams": {
             "batch_size": int(args.batch_size),
@@ -747,6 +779,7 @@ def main() -> None:
             "max_distractors": int(args.max_distractors),
             "land_penalty_weight": float(args.land_penalty_weight),
             "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
+            "water_logit_constraint": bool(load_water_mask),
             "softargmax_temperature": float(args.softargmax_temperature),
             "decode_method": str(args.decode_method),
             "eval_interval": int(eval_interval),
