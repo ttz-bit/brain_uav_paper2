@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-distractors", type=int, default=4)
     p.add_argument("--land-penalty-weight", type=float, default=0.0)
     p.add_argument("--land-penalty-dilate-px", type=int, default=4)
+    p.add_argument("--water-interior-erode-px", type=int, default=6)
     p.add_argument("--softargmax-temperature", type=float, default=20.0)
     p.add_argument("--decode-method", type=str, default="softargmax", choices=["argmax", "softargmax"])
     p.add_argument("--train-encoding", type=str, default="direct", choices=["rate", "direct"])
@@ -181,7 +182,7 @@ def _land_mask_from_sample(sample, *, input_size: int, dilate_px: int) -> np.nda
     return land.astype(np.float32, copy=False)[None, :, :]
 
 
-def _water_mask_from_sample(sample, *, input_size: int) -> np.ndarray:
+def _water_mask_from_sample(sample, *, input_size: int, interior_erode_px: int = 0) -> np.ndarray:
     sz = int(input_size)
     h, w = sample.image.shape[:2]
     out_h = sz if sz > 0 else h
@@ -192,6 +193,12 @@ def _water_mask_from_sample(sample, *, input_size: int) -> np.ndarray:
     if water_mask.shape[:2] != (h, w):
         water_mask = cv2.resize(water_mask, (w, h), interpolation=cv2.INTER_NEAREST)
     water = (water_mask > 0).astype(np.uint8)
+    if int(interior_erode_px) > 0 and int(water.sum()) > 0:
+        k = int(interior_erode_px) * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        eroded = cv2.erode(water, kernel, iterations=1)
+        if int(eroded.sum()) > 0:
+            water = eroded
     if sz > 0 and (h != sz or w != sz):
         water = cv2.resize(water, (sz, sz), interpolation=cv2.INTER_NEAREST)
     return water.astype(np.float32, copy=False)[None, :, :]
@@ -368,7 +375,11 @@ def main() -> None:
                 input_size=int(args.input_size),
                 dilate_px=int(args.land_penalty_dilate_px),
             )
-            water = _water_mask_from_sample(sample, input_size=int(args.input_size))
+            water = _water_mask_from_sample(
+                sample,
+                input_size=int(args.input_size),
+                interior_erode_px=int(args.water_interior_erode_px),
+            )
             return (
                 torch.from_numpy(x),
                 torch.from_numpy(y),
@@ -592,6 +603,7 @@ def main() -> None:
                     "max_distractors": int(args.max_distractors),
                     "land_penalty_weight": float(args.land_penalty_weight),
                     "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
+                    "water_interior_erode_px": int(args.water_interior_erode_px),
                     "water_logit_constraint": bool(load_water_mask),
                     "softargmax_temperature": float(args.softargmax_temperature),
                     "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty_plus_water_logit_constraint",
@@ -629,6 +641,7 @@ def main() -> None:
                     "max_distractors": int(args.max_distractors),
                     "land_penalty_weight": float(args.land_penalty_weight),
                     "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
+                    "water_interior_erode_px": int(args.water_interior_erode_px),
                     "water_logit_constraint": bool(load_water_mask),
                     "softargmax_temperature": float(args.softargmax_temperature),
                     "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty_plus_water_logit_constraint",
@@ -675,6 +688,7 @@ def main() -> None:
             "max_distractors": int(args.max_distractors),
             "land_penalty_weight": float(args.land_penalty_weight),
             "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
+            "water_interior_erode_px": int(args.water_interior_erode_px),
             "water_logit_constraint": bool(load_water_mask),
             "softargmax_temperature": float(args.softargmax_temperature),
             "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty_plus_water_logit_constraint",
@@ -779,6 +793,7 @@ def main() -> None:
             "max_distractors": int(args.max_distractors),
             "land_penalty_weight": float(args.land_penalty_weight),
             "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
+            "water_interior_erode_px": int(args.water_interior_erode_px),
             "water_logit_constraint": bool(load_water_mask),
             "softargmax_temperature": float(args.softargmax_temperature),
             "decode_method": str(args.decode_method),

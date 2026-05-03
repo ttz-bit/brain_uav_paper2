@@ -26,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-center-improve-ratio", type=float, default=0.10)
     p.add_argument("--min-offcenter-improve-ratio", type=float, default=0.10)
     p.add_argument("--min-unique-pred-xy", type=int, default=16)
+    p.add_argument("--water-interior-erode-px", type=int, default=6)
     p.add_argument(
         "--weights",
         type=str,
@@ -111,7 +112,7 @@ def _pred_on_land(pred_xy: np.ndarray, sample) -> bool | None:
     return bool(mask[py, px] <= 0)
 
 
-def _water_mask_from_sample(sample, *, input_size: int) -> np.ndarray:
+def _water_mask_from_sample(sample, *, input_size: int, interior_erode_px: int = 0) -> np.ndarray:
     sz = int(input_size)
     h, w = sample.image.shape[:2]
     out_h = sz if sz > 0 else h
@@ -122,6 +123,12 @@ def _water_mask_from_sample(sample, *, input_size: int) -> np.ndarray:
     if water_mask.shape[:2] != (h, w):
         water_mask = cv2.resize(water_mask, (w, h), interpolation=cv2.INTER_NEAREST)
     water = (water_mask > 0).astype(np.uint8)
+    if int(interior_erode_px) > 0 and int(water.sum()) > 0:
+        k = int(interior_erode_px) * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        eroded = cv2.erode(water, kernel, iterations=1)
+        if int(eroded.sum()) > 0:
+            water = eroded
     if sz > 0 and (h != sz or w != sz):
         water = cv2.resize(water, (sz, sz), interpolation=cv2.INTER_NEAREST)
     return water.astype(np.float32, copy=False)[None, :, :]
@@ -305,6 +312,7 @@ def main() -> None:
     conf_weight = float(ckpt.get("conf_weight", 0.2))
     land_penalty_weight = float(ckpt.get("land_penalty_weight", 0.0))
     land_penalty_dilate_px = int(ckpt.get("land_penalty_dilate_px", 0))
+    water_interior_erode_px = int(ckpt.get("water_interior_erode_px", args.water_interior_erode_px))
     softargmax_temperature = float(ckpt.get("softargmax_temperature", 20.0))
     ckpt_train_encoding = str(ckpt.get("train_encoding", "rate"))
     ckpt_eval_encoding = str(ckpt.get("eval_encoding", "direct"))
@@ -352,7 +360,13 @@ def main() -> None:
             gt = _target_from_sample(s)
             x = torch.from_numpy(x_np).unsqueeze(0).to(device)
             y = torch.from_numpy(gt.reshape(1, 3)).to(device)
-            water = torch.from_numpy(_water_mask_from_sample(s, input_size=input_size)).unsqueeze(0).to(device)
+            water = torch.from_numpy(
+                _water_mask_from_sample(
+                    s,
+                    input_size=input_size,
+                    interior_erode_px=int(water_interior_erode_px),
+                )
+            ).unsqueeze(0).to(device)
             land = torch.from_numpy(
                 _land_mask_from_sample(
                     s,
@@ -532,6 +546,7 @@ def main() -> None:
             "conf_weight": float(conf_weight),
             "land_penalty_weight": float(land_penalty_weight),
             "land_penalty_dilate_px": int(land_penalty_dilate_px),
+            "water_interior_erode_px": int(water_interior_erode_px),
             "water_constrained_decode": True,
             "softargmax_temperature": float(softargmax_temperature),
             "eval_encoding": str(eval_encoding),
