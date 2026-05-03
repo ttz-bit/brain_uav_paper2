@@ -31,11 +31,13 @@ class Stage2RenderedDataset:
         project_root: str | Path | None = None,
         max_samples: int | None = None,
         only_stage: str | None = None,
+        load_water_mask: bool = False,
     ):
         self.root = Path(root)
         self.split = str(split)
         self.project_root = Path(project_root) if project_root is not None else Path.cwd()
         self.only_stage = str(only_stage) if only_stage else None
+        self.load_water_mask = bool(load_water_mask)
 
         label_path = self.root / "labels" / f"{self.split}.jsonl"
         if not label_path.exists():
@@ -52,6 +54,44 @@ class Stage2RenderedDataset:
 
     def __len__(self) -> int:
         return len(self._rows)
+
+    def _resolve_meta_path(self, path_raw: Any) -> Path | None:
+        if path_raw is None:
+            return None
+        path_str = str(path_raw).replace("\\", "/")
+        if not path_str:
+            return None
+        path = Path(path_str)
+        if path.exists():
+            return path
+        if not path.is_absolute():
+            candidate = (self.project_root / path).resolve()
+            if candidate.exists():
+                return candidate
+        return path
+
+    def _load_water_mask_crop(self, row: dict[str, Any], image_shape: tuple[int, int]) -> np.ndarray | None:
+        meta = dict(row.get("meta", {}))
+        if not self.load_water_mask:
+            return None
+        crop_origin = meta.get("crop_origin_bg_px", meta.get("crop_origin_xy"))
+        mask_path = self._resolve_meta_path(meta.get("water_mask_path"))
+        if crop_origin is None or mask_path is None or not mask_path.exists():
+            return None
+        if not isinstance(crop_origin, (list, tuple)) or len(crop_origin) < 2:
+            return None
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            return None
+        h, w = int(image_shape[0]), int(image_shape[1])
+        x1 = int(round(float(crop_origin[0])))
+        y1 = int(round(float(crop_origin[1])))
+        if x1 < 0 or y1 < 0 or x1 + w > mask.shape[1] or y1 + h > mask.shape[0]:
+            return None
+        crop = mask[y1 : y1 + h, x1 : x1 + w].copy()
+        if crop.shape[:2] != (h, w):
+            return None
+        return crop
 
     def __getitem__(self, idx: int) -> PublicTrackingSample:
         row = self._rows[idx]
@@ -70,6 +110,7 @@ class Stage2RenderedDataset:
             sequence_id=str(row["sequence_id"]),
             frame_id=str(row["frame_id"]),
             meta=dict(row.get("meta", {})),
+            water_mask=self._load_water_mask_crop(row, image.shape[:2]),
         )
 
 
@@ -79,6 +120,7 @@ def build_stage2_rendered_dataset(
     project_root: str | Path | None = None,
     max_samples: int | None = None,
     only_stage: str | None = None,
+    load_water_mask: bool = False,
 ) -> Stage2RenderedDataset:
     return Stage2RenderedDataset(
         root=root,
@@ -86,5 +128,5 @@ def build_stage2_rendered_dataset(
         project_root=project_root,
         max_samples=max_samples,
         only_stage=only_stage,
+        load_water_mask=load_water_mask,
     )
-

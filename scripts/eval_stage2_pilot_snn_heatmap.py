@@ -96,6 +96,21 @@ def _nearest_distractor_error_px(pred_xy: np.ndarray, sample) -> tuple[float | N
     return float(min(errors)), int(len(errors))
 
 
+def _pred_on_land(pred_xy: np.ndarray, sample) -> bool | None:
+    water_mask = getattr(sample, "water_mask", None)
+    if water_mask is None:
+        return None
+    h, w = sample.image.shape[:2]
+    mask = np.asarray(water_mask)
+    if mask.shape[:2] != (h, w):
+        mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    px = int(np.clip(pred_xy[0], 0.0, 1.0) * w)
+    py = int(np.clip(pred_xy[1], 0.0, 1.0) * h)
+    px = min(max(px, 0), w - 1)
+    py = min(max(py, 0), h - 1)
+    return bool(mask[py, px] <= 0)
+
+
 def _distractor_boxes_from_sample(sample) -> list[list[float]]:
     boxes: list[list[float]] = []
     for box in list((sample.meta or {}).get("distractor_bboxes_xywh", [])):
@@ -237,6 +252,7 @@ def main() -> None:
         split=args.eval_split,
         project_root=project_root,
         max_samples=args.max_eval_samples,
+        load_water_mask=True,
     )
     weights = Path(args.weights).resolve()
     if not weights.exists():
@@ -280,6 +296,8 @@ def main() -> None:
     nearest_distractor_errors: list[float] = []
     pred_closer_to_distractor_count = 0
     frames_with_distractors = 0
+    pred_on_land_count = 0
+    frames_with_water_mask = 0
     pred_x_px: list[float] = []
     pred_y_px: list[float] = []
     gt_x_px: list[float] = []
@@ -345,6 +363,11 @@ def main() -> None:
                 frames_with_distractors += 1
                 if nearest_distractor_err < err:
                     pred_closer_to_distractor_count += 1
+            pred_land = _pred_on_land(pred_xy, s)
+            if pred_land is not None:
+                frames_with_water_mask += 1
+                if pred_land:
+                    pred_on_land_count += 1
 
             st = str(s.meta.get("perception_stage", "unknown"))
             bg = str(s.meta.get("background_category", "unknown")).lower()
@@ -375,12 +398,22 @@ def main() -> None:
                 "distractor_count": int(distractor_count),
                 "nearest_distractor_error_px": nearest_distractor_err,
                 "pred_closer_to_distractor": bool(nearest_distractor_err is not None and nearest_distractor_err < err),
+                "pred_on_land": pred_land,
             }
             all_rows.append(row)
             if i < 200:
                 rows_head.append(row)
             if i < 16:
-                vis = _make_visual(s.image, pred_xy, gt, pixel_error=err, stage=st, background=bg, world_error=world_err)
+                vis = _make_visual(
+                    s.image,
+                    pred_xy,
+                    gt,
+                    pixel_error=err,
+                    stage=st,
+                    background=bg,
+                    world_error=world_err,
+                    distractor_boxes=_distractor_boxes_from_sample(s),
+                )
                 cv2.imwrite(str(vis_dir / f"eval_sample_{i:02d}.jpg"), vis)
 
     center_mean = _mean(center_errors)
@@ -478,6 +511,9 @@ def main() -> None:
             "frames_with_distractors": int(frames_with_distractors),
             "pred_closer_to_distractor_count": int(pred_closer_to_distractor_count),
             "pred_closer_to_distractor_ratio": float(pred_closer_to_distractor_count / max(1, frames_with_distractors)),
+            "frames_with_water_mask": int(frames_with_water_mask),
+            "pred_on_land_count": int(pred_on_land_count),
+            "pred_on_land_ratio": float(pred_on_land_count / max(1, frames_with_water_mask)),
             "stage_pixel_error_mean": {k: _mean(v) for k, v in per_stage.items()},
             "background_pixel_error_mean": {k: _mean(v) for k, v in per_background.items()},
             "prediction_stats": {

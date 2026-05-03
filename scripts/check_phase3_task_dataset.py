@@ -46,6 +46,9 @@ def main() -> None:
     sequence_range_monotonic_violations = 0
     sequence_motion_mode_violations = 0
     target_motion_step_violations = 0
+    crop_origin_missing = 0
+    water_mask_crop_violations = 0
+    water_mask_target_center_violations = 0
     ranges = []
     offcenter = []
     center_bbox_deltas = []
@@ -57,6 +60,7 @@ def main() -> None:
     sequence_targets: dict[str, str] = {}
     rows_by_sequence: dict[str, list[dict]] = {}
     motion_mode_sequence_counts: dict[str, int] = {}
+    water_mask_cache: dict[str, np.ndarray | None] = {}
 
     for split in ("train", "val", "test"):
         label_path = labels_dir / f"{split}.jsonl"
@@ -87,6 +91,31 @@ def main() -> None:
             center_bbox_delta = float(np.hypot(cx - bbox_cx, cy - bbox_cy))
             center_bbox_deltas.append(center_bbox_delta)
             meta = dict(row.get("meta", {}))
+            water_mask_path_raw = meta.get("water_mask_path")
+            crop_origin = meta.get("crop_origin_bg_px", meta.get("crop_origin_xy"))
+            if water_mask_path_raw:
+                if not isinstance(crop_origin, (list, tuple)) or len(crop_origin) < 2:
+                    crop_origin_missing += 1
+                else:
+                    mask_path = Path(str(water_mask_path_raw))
+                    if not mask_path.is_absolute():
+                        mask_path = Path.cwd() / mask_path
+                    mask_key = str(mask_path)
+                    if mask_key not in water_mask_cache:
+                        water_mask_cache[mask_key] = cv2.imread(mask_key, cv2.IMREAD_GRAYSCALE)
+                    mask = water_mask_cache[mask_key]
+                    if mask is None:
+                        water_mask_crop_violations += 1
+                    else:
+                        x1 = int(round(float(crop_origin[0])))
+                        y1 = int(round(float(crop_origin[1])))
+                        if x1 < 0 or y1 < 0 or x1 + w > mask.shape[1] or y1 + h > mask.shape[0]:
+                            water_mask_crop_violations += 1
+                        else:
+                            mx = min(max(int(round(x1 + cx)), 0), mask.shape[1] - 1)
+                            my = min(max(int(round(y1 + cy)), 0), mask.shape[0] - 1)
+                            if mask[my, mx] <= 0:
+                                water_mask_target_center_violations += 1
             seq_id = str(row["sequence_id"])
             rows_by_sequence.setdefault(seq_id, []).append(row)
             bg_path = str(meta.get("background_path", row.get("background_asset_id", "")))
@@ -205,6 +234,9 @@ def main() -> None:
         "sequence_range_monotonic_violations": int(sequence_range_monotonic_violations),
         "sequence_motion_mode_violations": int(sequence_motion_mode_violations),
         "target_motion_step_violations": int(target_motion_step_violations),
+        "crop_origin_missing": int(crop_origin_missing),
+        "water_mask_crop_violations": int(water_mask_crop_violations),
+        "water_mask_target_center_violations": int(water_mask_target_center_violations),
         "target_not_water": int(not_water),
         "invalid_stage_ranges": int(invalid_stage),
         "errors": errors[:100],
@@ -225,6 +257,9 @@ def main() -> None:
             and sequence_range_monotonic_violations == 0
             and sequence_motion_mode_violations == 0
             and target_motion_step_violations == 0
+            and crop_origin_missing == 0
+            and water_mask_crop_violations == 0
+            and water_mask_target_center_violations == 0
             and motion_mode_coverage_ok
             and not_water == 0
             and invalid_stage == 0

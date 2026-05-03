@@ -171,6 +171,8 @@ def heatmap_loss(
     distractor_mask: torch.Tensor | None = None,
     distractor_weight: float = 0.0,
     distractor_sigma: float | None = None,
+    land_mask: torch.Tensor | None = None,
+    land_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     target_heatmaps = make_gaussian_heatmaps(targets, heatmap_size=heatmap_size, sigma=sigma)
     valid = targets[:, 2] > 0.5
@@ -186,6 +188,7 @@ def heatmap_loss(
     coord_loss = (coord_per_sample * valid_weight).sum() / valid_den
     conf_loss = F.binary_cross_entropy_with_logits(outputs["conf_logits"], targets[:, 2])
     distractor_loss = outputs["heatmap_logits"].new_tensor(0.0)
+    pred_probs = None
     if (
         distractor_centers is not None
         and distractor_mask is not None
@@ -212,16 +215,33 @@ def heatmap_loss(
         has_distractor = (d_valid.sum(dim=1) > 0.5).to(dtype=d_per_sample.dtype)
         d_den = (has_distractor * valid_weight).sum().clamp_min(1.0)
         distractor_loss = (d_per_sample * has_distractor * valid_weight).sum() / d_den
+    land_loss = outputs["heatmap_logits"].new_tensor(0.0)
+    if land_mask is not None and float(land_weight) > 0.0 and int(land_mask.numel()) > 0:
+        logits = outputs["heatmap_logits"]
+        if pred_probs is None:
+            pred_probs = F.softmax(logits.flatten(1), dim=1)
+        land = land_mask.to(device=logits.device, dtype=logits.dtype)
+        if land.ndim == 3:
+            land = land.unsqueeze(1)
+        if land.shape[-2:] != logits.shape[-2:]:
+            land = F.interpolate(land, size=logits.shape[-2:], mode="area")
+        land = land.clamp(0.0, 1.0).flatten(1).detach()
+        land_per_sample = (pred_probs * land).sum(dim=1)
+        has_land = (land.sum(dim=1) > 0.0).to(dtype=land_per_sample.dtype)
+        land_den = (has_land * valid_weight).sum().clamp_min(1.0)
+        land_loss = (land_per_sample * has_land * valid_weight).sum() / land_den
     total = (
         float(heatmap_weight) * hm_loss
         + float(coord_weight) * coord_loss
         + float(conf_weight) * conf_loss
         + float(distractor_weight) * distractor_loss
+        + float(land_weight) * land_loss
     )
     parts = {
         "heatmap_loss": float(hm_loss.detach().cpu().item()),
         "coord_loss": float(coord_loss.detach().cpu().item()),
         "conf_loss": float(conf_loss.detach().cpu().item()),
         "distractor_loss": float(distractor_loss.detach().cpu().item()),
+        "land_loss": float(land_loss.detach().cpu().item()),
     }
     return total, parts

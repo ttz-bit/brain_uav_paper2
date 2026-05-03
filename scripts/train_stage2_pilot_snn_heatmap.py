@@ -38,6 +38,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--distractor-repel-weight", type=float, default=0.0)
     p.add_argument("--distractor-repel-sigma", type=float, default=2.0)
     p.add_argument("--max-distractors", type=int, default=4)
+    p.add_argument("--land-penalty-weight", type=float, default=0.0)
+    p.add_argument("--land-penalty-dilate-px", type=int, default=4)
     p.add_argument("--softargmax-temperature", type=float, default=20.0)
     p.add_argument("--decode-method", type=str, default="softargmax", choices=["argmax", "softargmax"])
     p.add_argument("--train-encoding", type=str, default="direct", choices=["rate", "direct"])
@@ -108,6 +110,26 @@ def _distractors_from_sample(sample, *, max_distractors: int) -> tuple[np.ndarra
         centers[i, 1] = np.float32((y + 0.5 * bh) / max(1.0, float(h)))
         mask[i] = np.float32(1.0)
     return centers, mask
+
+
+def _land_mask_from_sample(sample, *, input_size: int, dilate_px: int) -> np.ndarray:
+    sz = int(input_size)
+    h, w = sample.image.shape[:2]
+    out_h = sz if sz > 0 else h
+    out_w = sz if sz > 0 else w
+    if getattr(sample, "water_mask", None) is None:
+        return np.zeros((1, out_h, out_w), dtype=np.float32)
+    water_mask = np.asarray(sample.water_mask)
+    if water_mask.shape[:2] != (h, w):
+        water_mask = cv2.resize(water_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    land = (water_mask <= 0).astype(np.uint8)
+    if int(dilate_px) > 0 and int(land.sum()) > 0:
+        k = int(dilate_px) * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        land = cv2.dilate(land, kernel, iterations=1)
+    if sz > 0 and (h != sz or w != sz):
+        land = cv2.resize(land, (sz, sz), interpolation=cv2.INTER_NEAREST)
+    return land.astype(np.float32, copy=False)[None, :, :]
 
 
 def _pixel_error_norm(pred_xy: np.ndarray, gt_xy: np.ndarray, h: int, w: int) -> float:
@@ -237,8 +259,21 @@ def main() -> None:
     if args.strict_no_leak and has_leak:
         raise RuntimeError(f"Asset leakage detected: {leak}")
 
-    train_ds = build_stage2_rendered_dataset(root=dataset_root, split=args.train_split, project_root=project_root, max_samples=args.max_train_samples)
-    val_ds = build_stage2_rendered_dataset(root=dataset_root, split=args.val_split, project_root=project_root, max_samples=args.max_val_samples)
+    load_water_mask = float(args.land_penalty_weight) > 0.0
+    train_ds = build_stage2_rendered_dataset(
+        root=dataset_root,
+        split=args.train_split,
+        project_root=project_root,
+        max_samples=args.max_train_samples,
+        load_water_mask=load_water_mask,
+    )
+    val_ds = build_stage2_rendered_dataset(
+        root=dataset_root,
+        split=args.val_split,
+        project_root=project_root,
+        max_samples=args.max_val_samples,
+        load_water_mask=load_water_mask,
+    )
 
     class _RenderedTorchDataset(Dataset):
         def __init__(self, ds, indices: np.ndarray | None = None):
@@ -254,7 +289,18 @@ def main() -> None:
             x = _to_tensor_image(sample.image, input_size=int(args.input_size))
             y = _target_from_sample(sample)
             d_xy, d_mask = _distractors_from_sample(sample, max_distractors=int(args.max_distractors))
-            return torch.from_numpy(x), torch.from_numpy(y), torch.from_numpy(d_xy), torch.from_numpy(d_mask)
+            land = _land_mask_from_sample(
+                sample,
+                input_size=int(args.input_size),
+                dilate_px=int(args.land_penalty_dilate_px),
+            )
+            return (
+                torch.from_numpy(x),
+                torch.from_numpy(y),
+                torch.from_numpy(d_xy),
+                torch.from_numpy(d_mask),
+                torch.from_numpy(land),
+            )
 
     num_workers = max(0, int(args.num_workers))
     def _loader(ds, *, batch_size: int, shuffle: bool):
@@ -292,7 +338,7 @@ def main() -> None:
     amp_dtype = torch.float16 if str(args.amp) == "fp16" else torch.bfloat16
     scaler = torch.cuda.amp.GradScaler(enabled=bool(amp_enabled and str(args.amp) == "fp16"))
 
-    def _loss(outputs, targets, distractor_centers=None, distractor_mask=None):
+    def _loss(outputs, targets, distractor_centers=None, distractor_mask=None, land_mask=None):
         return heatmap_loss(
             outputs,
             targets,
@@ -306,6 +352,8 @@ def main() -> None:
             distractor_mask=distractor_mask,
             distractor_weight=float(args.distractor_repel_weight),
             distractor_sigma=float(args.distractor_repel_sigma),
+            land_mask=land_mask,
+            land_weight=float(args.land_penalty_weight),
         )
 
     eval_batch_size = max(1, int(args.eval_batch_size))
@@ -332,16 +380,17 @@ def main() -> None:
         pred_x_px: list[float] = []
         pred_y_px: list[float] = []
         with torch.no_grad():
-            for xb, yb, db, dmask in eval_loader:
+            for xb, yb, db, dmask, land in eval_loader:
                 xb = xb.to(device, non_blocking=(device == "cuda"))
                 yb = yb.to(device, non_blocking=(device == "cuda"))
                 db = db.to(device, non_blocking=(device == "cuda"))
                 dmask = dmask.to(device, non_blocking=(device == "cuda"))
+                land = land.to(device, non_blocking=(device == "cuda"))
                 if bool(args.channels_last) and device == "cuda":
                     xb = xb.contiguous(memory_format=torch.channels_last)
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=bool(amp_enabled)):
                     outputs = model(xb, stochastic=False)
-                    loss, _ = _loss(outputs, yb, db, dmask)
+                    loss, _ = _loss(outputs, yb, db, dmask, land)
                 n = int(xb.shape[0])
                 total += float(loss.item()) * n
                 count += n
@@ -399,17 +448,18 @@ def main() -> None:
         batch_losses: list[float] = []
         batch_parts: list[dict[str, float]] = []
         t_train_loop_begin = time.perf_counter()
-        for xb, yb, db, dmask in loader:
+        for xb, yb, db, dmask, land in loader:
             xb = xb.to(device, non_blocking=(device == "cuda"))
             yb = yb.to(device, non_blocking=(device == "cuda"))
             db = db.to(device, non_blocking=(device == "cuda"))
             dmask = dmask.to(device, non_blocking=(device == "cuda"))
+            land = land.to(device, non_blocking=(device == "cuda"))
             if bool(args.channels_last) and device == "cuda":
                 xb = xb.contiguous(memory_format=torch.channels_last)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=bool(amp_enabled)):
                 outputs = model(xb, stochastic=True)
-                loss, parts = _loss(outputs, yb, db, dmask)
+                loss, parts = _loss(outputs, yb, db, dmask, land)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -434,7 +484,7 @@ def main() -> None:
                 "val_loss": val_loss,
                 "train_parts_mean": {
                     k: float(np.mean([p[k] for p in batch_parts])) if batch_parts else 0.0
-                    for k in ("heatmap_loss", "coord_loss", "conf_loss", "distractor_loss")
+                    for k in ("heatmap_loss", "coord_loss", "conf_loss", "distractor_loss", "land_loss")
                 },
                 "val_metrics": val_metrics,
             }
@@ -460,8 +510,10 @@ def main() -> None:
                     "distractor_repel_weight": float(args.distractor_repel_weight),
                     "distractor_repel_sigma": float(args.distractor_repel_sigma),
                     "max_distractors": int(args.max_distractors),
+                    "land_penalty_weight": float(args.land_penalty_weight),
+                    "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
                     "softargmax_temperature": float(args.softargmax_temperature),
-                    "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel",
+                    "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty",
                     "num_steps": int(args.num_steps),
                     "beta": float(args.beta),
                     "train_encoding": str(args.train_encoding),
@@ -494,8 +546,10 @@ def main() -> None:
                     "distractor_repel_weight": float(args.distractor_repel_weight),
                     "distractor_repel_sigma": float(args.distractor_repel_sigma),
                     "max_distractors": int(args.max_distractors),
+                    "land_penalty_weight": float(args.land_penalty_weight),
+                    "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
                     "softargmax_temperature": float(args.softargmax_temperature),
-                    "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel",
+                    "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty",
                     "num_steps": int(args.num_steps),
                     "beta": float(args.beta),
                     "train_encoding": str(args.train_encoding),
@@ -537,8 +591,10 @@ def main() -> None:
             "distractor_repel_weight": float(args.distractor_repel_weight),
             "distractor_repel_sigma": float(args.distractor_repel_sigma),
             "max_distractors": int(args.max_distractors),
+            "land_penalty_weight": float(args.land_penalty_weight),
+            "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
             "softargmax_temperature": float(args.softargmax_temperature),
-            "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel",
+            "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty",
             "num_steps": int(args.num_steps),
             "beta": float(args.beta),
             "train_encoding": str(args.train_encoding),
@@ -626,6 +682,8 @@ def main() -> None:
             "distractor_repel_weight": float(args.distractor_repel_weight),
             "distractor_repel_sigma": float(args.distractor_repel_sigma),
             "max_distractors": int(args.max_distractors),
+            "land_penalty_weight": float(args.land_penalty_weight),
+            "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
             "softargmax_temperature": float(args.softargmax_temperature),
             "decode_method": str(args.decode_method),
             "eval_interval": int(eval_interval),

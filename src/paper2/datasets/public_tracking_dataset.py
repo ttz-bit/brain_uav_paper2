@@ -17,10 +17,11 @@ class PublicTrackingSample:
     sequence_id: str
     frame_id: str
     meta: dict[str, Any]
+    water_mask: np.ndarray | None = None
 
 
 def resolve_image_path(path_str: str, project_root: Path) -> Path:
-    p = Path(path_str.replace("/", "\\"))
+    p = Path(path_str.replace("\\", "/"))
     if p.is_absolute():
         return p
     return (project_root / p).resolve()
@@ -31,4 +32,3 @@ def load_bgr_image(image_path: Path) -> np.ndarray:
     if img is None:
         raise FileNotFoundError(f"Cannot read image: {image_path}")
     return img
-
