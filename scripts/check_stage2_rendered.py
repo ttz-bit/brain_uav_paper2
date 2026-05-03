@@ -30,6 +30,26 @@ def _read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def _example_row(split: str, row: dict, reason: str) -> dict:
+    return {
+        "reason": reason,
+        "split": split,
+        "sequence_id": row.get("sequence_id"),
+        "frame_id": row.get("frame_id"),
+        "stage": row.get("stage"),
+        "image_path": row.get("image_path"),
+        "background_asset_id": row.get("background_asset_id"),
+        "target_asset_id": row.get("target_asset_id"),
+        "land_overlap_ratio": row.get("land_overlap_ratio", row.get("meta", {}).get("land_overlap_ratio")),
+        "shore_buffer_overlap_ratio": row.get(
+            "shore_buffer_overlap_ratio",
+            row.get("meta", {}).get("shore_buffer_overlap_ratio"),
+        ),
+        "visibility": row.get("visibility"),
+        "obs_valid": row.get("obs_valid", row.get("meta", {}).get("obs_valid")),
+    }
+
+
 def main() -> None:
     args = parse_args()
     root = Path(args.dataset_root).resolve()
@@ -48,6 +68,7 @@ def main() -> None:
     truncation_violations = 0
     obs_invalid = 0
     center_biased = 0
+    violation_examples: list[dict] = []
 
     for split in ("train", "val", "test"):
         path = labels_dir / f"{split}.jsonl"
@@ -91,11 +112,17 @@ def main() -> None:
             shore_overlap = float(r.get("shore_buffer_overlap_ratio", r.get("meta", {}).get("shore_buffer_overlap_ratio", 1.0)))
             if land_overlap > float(args.max_land_overlap):
                 land_overlap_violations += 1
+                if len(violation_examples) < 50:
+                    violation_examples.append(_example_row(split, r, "land_overlap"))
             if shore_overlap > float(args.max_shore_overlap):
                 shore_overlap_violations += 1
+                if len(violation_examples) < 50:
+                    violation_examples.append(_example_row(split, r, "shore_overlap"))
 
             if not bool(r.get("obs_valid", r.get("meta", {}).get("obs_valid", False))):
                 obs_invalid += 1
+                if len(violation_examples) < 50:
+                    violation_examples.append(_example_row(split, r, "obs_invalid"))
 
             split_asset_sets[split]["background"].add(str(r["background_asset_id"]))
             split_asset_sets[split]["target"].add(str(r["target_asset_id"]))
@@ -126,6 +153,7 @@ def main() -> None:
         "truncation_violations": int(truncation_violations),
         "obs_invalid_count": int(obs_invalid),
         "split_asset_leakage": leakage,
+        "violation_examples": violation_examples,
         "pass": (
             len(errors) == 0
             and center_rate >= 1.0

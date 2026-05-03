@@ -338,6 +338,53 @@ def _random_water_point(mask_u8: np.ndarray, rng: np.random.Generator) -> tuple[
     return float(xs[i]), float(ys[i])
 
 
+def _find_valid_target_center(
+    *,
+    target_water: np.ndarray,
+    water_mask: np.ndarray,
+    land_mask: np.ndarray,
+    shore_mask: np.ndarray,
+    target_patch: np.ndarray,
+    rng: np.random.Generator,
+    image_size: int,
+    min_visibility: float,
+    max_truncation_ratio: float,
+    max_land_overlap: float,
+    max_shore_overlap: float,
+    require_water_mask: bool,
+    tries: int = 512,
+) -> tuple[float, float, float, float, float, float] | None:
+    """Find a globally valid target placement before writing a formal frame."""
+    for _ in range(int(max(1, tries))):
+        p = _random_water_point(target_water, rng)
+        if p is None:
+            return None
+        cx, cy = _sample_water_center(
+            target_water,
+            target_patch,
+            p[0],
+            p[1],
+            rng,
+            min_ratio=0.99,
+            tries=32,
+            local_radius=24,
+            global_fallback=True,
+        )
+        land_overlap = _alpha_overlap_ratio(land_mask, target_patch, cx, cy)
+        shore_overlap = _alpha_overlap_ratio(shore_mask, target_patch, cx, cy)
+        vis = _overlay_visibility(target_patch, cx, cy, image_size, image_size)
+        truncation = max(0.0, 1.0 - vis)
+        if (
+            float(land_overlap) <= float(max_land_overlap)
+            and float(shore_overlap) <= float(max_shore_overlap)
+            and float(vis) >= float(min_visibility)
+            and float(truncation) <= float(max_truncation_ratio)
+            and (not require_water_mask or _alpha_water_ratio(water_mask, target_patch, cx, cy) >= 0.96)
+        ):
+            return float(cx), float(cy), float(land_overlap), float(shore_overlap), float(vis), float(truncation)
+    return None
+
+
 def _is_water_pixel(mask_u8: np.ndarray, x: float, y: float) -> bool:
     h, w = mask_u8.shape[:2]
     xi = int(np.clip(round(x), 0, w - 1))
@@ -1057,6 +1104,40 @@ class Stage2Renderer:
                             pre_vis = _overlay_visibility(target_patch, tx, ty, image_size, image_size)
                             truncation_ratio = max(0.0, 1.0 - pre_vis)
 
+                    pre_write_hard_fail = (
+                        float(land_overlap_ratio) > float(max_land_overlap)
+                        or float(shore_overlap_ratio) > float(max_shore_overlap)
+                        or float(pre_vis) < float(min_visibility)
+                        or float(truncation_ratio) > float(max_truncation_ratio)
+                        or (
+                            require_water_mask
+                            and _alpha_water_ratio(water, target_patch, tx, ty) < 0.96
+                        )
+                    )
+                    if pre_write_hard_fail and prev_valid_tx_ty is None:
+                        fallback = _find_valid_target_center(
+                            target_water=target_water,
+                            water_mask=water,
+                            land_mask=land_mask,
+                            shore_mask=shore_mask,
+                            target_patch=target_patch,
+                            rng=self.rng,
+                            image_size=image_size,
+                            min_visibility=min_visibility,
+                            max_truncation_ratio=max_truncation_ratio,
+                            max_land_overlap=max_land_overlap,
+                            max_shore_overlap=max_shore_overlap,
+                            require_water_mask=require_water_mask,
+                            tries=1024,
+                        )
+                        if fallback is None:
+                            raise RuntimeError(
+                                "Cannot place a valid target before the first valid frame: "
+                                f"split={split}, sequence={seq_idx}, frame={frame_idx}, "
+                                f"background={bg.asset_id}, stage={stage_name}"
+                            )
+                        tx, ty, land_overlap_ratio, shore_overlap_ratio, pre_vis, truncation_ratio = fallback
+
                     target_patch = _harmonize_overlay_to_background(patch, target_patch, tx, ty, strength=0.35)
                     bbox, vis = alpha_blend_center(patch, target_patch, tx, ty)
                     obs_valid = (
@@ -1094,6 +1175,15 @@ class Stage2Renderer:
                         angle_deg = float(prev_valid_angle if prev_valid_angle is not None else angle_deg)
                         target_scale = float(prev_valid_scale if prev_valid_scale is not None else target_scale)
                         obs_valid = True
+
+                    if not bool(obs_valid):
+                        raise RuntimeError(
+                            "Renderer produced an invalid target observation after all fallbacks: "
+                            f"split={split}, sequence={seq_idx}, frame={frame_idx}, background={bg.asset_id}, "
+                            f"stage={stage_name}, land_overlap={float(land_overlap_ratio):.6f}, "
+                            f"shore_overlap={float(shore_overlap_ratio):.6f}, visibility={float(vis):.6f}, "
+                            f"truncation={float(truncation_ratio):.6f}"
+                        )
 
                     if bool(obs_valid):
                         prev_valid_patch = patch.copy()
