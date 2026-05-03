@@ -79,6 +79,23 @@ def _pixel_error_norm(pred_xy: np.ndarray, gt_xy: np.ndarray, h: int, w: int) ->
     return float(np.hypot(px - gx, py - gy))
 
 
+def _nearest_distractor_error_px(pred_xy: np.ndarray, sample) -> tuple[float | None, int]:
+    h, w = sample.image.shape[:2]
+    px = float(np.clip(pred_xy[0], 0.0, 1.0) * w)
+    py = float(np.clip(pred_xy[1], 0.0, 1.0) * h)
+    errors: list[float] = []
+    for box in list((sample.meta or {}).get("distractor_bboxes_xywh", [])):
+        if not isinstance(box, (list, tuple)) or len(box) < 4:
+            continue
+        x, y, bw, bh = [float(v) for v in box[:4]]
+        if bw <= 0.0 or bh <= 0.0:
+            continue
+        errors.append(float(np.hypot(px - (x + 0.5 * bw), py - (y + 0.5 * bh))))
+    if not errors:
+        return None, 0
+    return float(min(errors)), int(len(errors))
+
+
 def _image_to_world(pred_xy: np.ndarray, sample) -> tuple[list[float] | None, list[float] | None, float | None]:
     meta = dict(sample.meta or {})
     crop = meta.get("crop_center_world")
@@ -239,6 +256,9 @@ def main() -> None:
     offcenter_px_errors: list[float] = []
     offcenter_center_errors: list[float] = []
     world_errors: list[float] = []
+    nearest_distractor_errors: list[float] = []
+    pred_closer_to_distractor_count = 0
+    frames_with_distractors = 0
     pred_x_px: list[float] = []
     pred_y_px: list[float] = []
     gt_x_px: list[float] = []
@@ -298,6 +318,12 @@ def main() -> None:
             pred_world, gt_world, world_err = _image_to_world(pred_xy, s)
             if world_err is not None:
                 world_errors.append(float(world_err))
+            nearest_distractor_err, distractor_count = _nearest_distractor_error_px(pred_xy, s)
+            if nearest_distractor_err is not None:
+                nearest_distractor_errors.append(float(nearest_distractor_err))
+                frames_with_distractors += 1
+                if nearest_distractor_err < err:
+                    pred_closer_to_distractor_count += 1
 
             st = str(s.meta.get("perception_stage", "unknown"))
             bg = str(s.meta.get("background_category", "unknown")).lower()
@@ -325,6 +351,9 @@ def main() -> None:
                 "pred_world": pred_world,
                 "gt_world": gt_world,
                 "world_error_m": world_err,
+                "distractor_count": int(distractor_count),
+                "nearest_distractor_error_px": nearest_distractor_err,
+                "pred_closer_to_distractor": bool(nearest_distractor_err is not None and nearest_distractor_err < err),
             }
             all_rows.append(row)
             if i < 200:
@@ -424,6 +453,10 @@ def main() -> None:
             "offcenter_center_baseline_improve_ratio": offcenter_improve_ratio,
             "world_error_mean_m": _mean(world_errors),
             "world_error_p90_m": _p90(world_errors),
+            "nearest_distractor_error_mean_px": _mean(nearest_distractor_errors),
+            "frames_with_distractors": int(frames_with_distractors),
+            "pred_closer_to_distractor_count": int(pred_closer_to_distractor_count),
+            "pred_closer_to_distractor_ratio": float(pred_closer_to_distractor_count / max(1, frames_with_distractors)),
             "stage_pixel_error_mean": {k: _mean(v) for k, v in per_stage.items()},
             "background_pixel_error_mean": {k: _mean(v) for k, v in per_background.items()},
             "prediction_stats": {

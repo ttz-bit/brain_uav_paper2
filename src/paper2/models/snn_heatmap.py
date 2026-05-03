@@ -167,6 +167,10 @@ def heatmap_loss(
     heatmap_weight: float,
     conf_weight: float,
     softargmax_temperature: float,
+    distractor_centers: torch.Tensor | None = None,
+    distractor_mask: torch.Tensor | None = None,
+    distractor_weight: float = 0.0,
+    distractor_sigma: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     target_heatmaps = make_gaussian_heatmaps(targets, heatmap_size=heatmap_size, sigma=sigma)
     valid = targets[:, 2] > 0.5
@@ -181,10 +185,43 @@ def heatmap_loss(
     coord_per_sample = F.smooth_l1_loss(pred_xy, targets[:, :2], reduction="none").mean(dim=1)
     coord_loss = (coord_per_sample * valid_weight).sum() / valid_den
     conf_loss = F.binary_cross_entropy_with_logits(outputs["conf_logits"], targets[:, 2])
-    total = float(heatmap_weight) * hm_loss + float(coord_weight) * coord_loss + float(conf_weight) * conf_loss
+    distractor_loss = outputs["heatmap_logits"].new_tensor(0.0)
+    if (
+        distractor_centers is not None
+        and distractor_mask is not None
+        and float(distractor_weight) > 0.0
+        and int(distractor_centers.numel()) > 0
+    ):
+        b, n, _ = distractor_centers.shape
+        d_valid = distractor_mask.to(device=targets.device, dtype=targets.dtype).clamp(0.0, 1.0)
+        d_targets = torch.cat(
+            [
+                distractor_centers.to(device=targets.device, dtype=targets.dtype).reshape(b * n, 2),
+                d_valid.reshape(b * n, 1),
+            ],
+            dim=1,
+        )
+        d_heatmaps = make_gaussian_heatmaps(
+            d_targets,
+            heatmap_size=heatmap_size,
+            sigma=float(distractor_sigma if distractor_sigma is not None else sigma),
+        ).reshape(b, n, 1, int(heatmap_size), int(heatmap_size))
+        d_mask = d_heatmaps.max(dim=1).values.flatten(1).detach()
+        pred_probs = F.softmax(outputs["heatmap_logits"].flatten(1), dim=1)
+        d_per_sample = (pred_probs * d_mask).sum(dim=1)
+        has_distractor = (d_valid.sum(dim=1) > 0.5).to(dtype=d_per_sample.dtype)
+        d_den = (has_distractor * valid_weight).sum().clamp_min(1.0)
+        distractor_loss = (d_per_sample * has_distractor * valid_weight).sum() / d_den
+    total = (
+        float(heatmap_weight) * hm_loss
+        + float(coord_weight) * coord_loss
+        + float(conf_weight) * conf_loss
+        + float(distractor_weight) * distractor_loss
+    )
     parts = {
         "heatmap_loss": float(hm_loss.detach().cpu().item()),
         "coord_loss": float(coord_loss.detach().cpu().item()),
         "conf_loss": float(conf_loss.detach().cpu().item()),
+        "distractor_loss": float(distractor_loss.detach().cpu().item()),
     }
     return total, parts

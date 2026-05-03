@@ -252,6 +252,8 @@ def _render_real_asset_frame(
     distractor_count_min: int = 0,
     distractor_count_max: int = 0,
     min_distractor_target_distance_px: float = 48.0,
+    distractor_scale_min: float = DISTRACTOR_SCALE_RANGE[0],
+    distractor_scale_max: float = DISTRACTOR_SCALE_RANGE[1],
     fixed_background: dict | None = None,
     fixed_target: Path | None = None,
     allow_relaxed_water_ratio: bool = False,
@@ -338,6 +340,7 @@ def _render_real_asset_frame(
                 count_min=int(distractor_count_min),
                 count_max=int(distractor_count_max),
                 min_target_distance_px=float(min_distractor_target_distance_px),
+                scale_range=(float(distractor_scale_min), float(distractor_scale_max)),
                 min_water_ratio=float(min_target_water_ratio),
                 min_visibility=float(min_target_visibility),
             )
@@ -387,6 +390,7 @@ def _place_distractors(
     count_min: int,
     count_max: int,
     min_target_distance_px: float,
+    scale_range: tuple[float, float],
     min_water_ratio: float,
     min_visibility: float,
 ) -> tuple[list[dict], bool]:
@@ -401,6 +405,8 @@ def _place_distractors(
     image_h, image_w = canvas.shape[:2]
     target_long = float(max(target_overlay.shape[:2]))
     target_cx, target_cy = float(target_center[0]), float(target_center[1])
+    scale_min = max(0.05, float(min(scale_range[0], scale_range[1])))
+    scale_max = max(scale_min, float(max(scale_range[0], scale_range[1])))
     placed: list[dict] = []
 
     water = mask_u8 > 0
@@ -415,7 +421,7 @@ def _place_distractors(
             distractor = read_bgra(path)
             distractor = trim_bgra_to_alpha_bbox(distractor)
             scale = float(STAGE_SCALE_PX.get(stage, 18.0)) * float(
-                rng.uniform(DISTRACTOR_SCALE_RANGE[0], DISTRACTOR_SCALE_RANGE[1])
+                rng.uniform(scale_min, scale_max)
             )
             distractor = _resize_bgra_to_long_side(distractor, scale, image_w)
             distractor = rotate_bgra(distractor, float(rng.uniform(0.0, 360.0)))
@@ -606,6 +612,8 @@ def main() -> None:
     parser.add_argument("--distractor-count-min", type=int, default=0)
     parser.add_argument("--distractor-count-max", type=int, default=0)
     parser.add_argument("--min-distractor-target-distance-px", type=float, default=48.0)
+    parser.add_argument("--distractor-scale-min", type=float, default=DISTRACTOR_SCALE_RANGE[0])
+    parser.add_argument("--distractor-scale-max", type=float, default=DISTRACTOR_SCALE_RANGE[1])
     parser.add_argument(
         "--target-allow-keywords",
         type=str,
@@ -635,6 +643,8 @@ def main() -> None:
         raise ValueError("Distractor counts must be non-negative.")
     if int(args.distractor_count_min) > int(args.distractor_count_max):
         raise ValueError("--distractor-count-min cannot exceed --distractor-count-max.")
+    if float(args.distractor_scale_min) <= 0.0 or float(args.distractor_scale_max) <= 0.0:
+        raise ValueError("Distractor scale factors must be positive.")
 
     project_root = Path.cwd().resolve()
     cfg = load_yaml(Path(args.config))
@@ -740,6 +750,8 @@ def main() -> None:
                                     distractor_count_min=int(args.distractor_count_min),
                                     distractor_count_max=int(args.distractor_count_max),
                                     min_distractor_target_distance_px=float(args.min_distractor_target_distance_px),
+                                    distractor_scale_min=float(args.distractor_scale_min),
+                                    distractor_scale_max=float(args.distractor_scale_max),
                                     fixed_background=seq_background,
                                     fixed_target=seq_target,
                                     allow_relaxed_water_ratio=bool(args.allow_relaxed_water_ratio),
@@ -820,6 +832,8 @@ def main() -> None:
             "distractor_count_min": int(args.distractor_count_min),
             "distractor_count_max": int(args.distractor_count_max),
             "min_distractor_target_distance_px": float(args.min_distractor_target_distance_px),
+            "distractor_scale_min": float(args.distractor_scale_min),
+            "distractor_scale_max": float(args.distractor_scale_max),
         },
         "stage_counts": stage_counts,
         "split_counts": split_counts,

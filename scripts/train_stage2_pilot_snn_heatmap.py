@@ -35,6 +35,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--heatmap-weight", type=float, default=1.0)
     p.add_argument("--coord-weight", type=float, default=5.0)
     p.add_argument("--conf-weight", type=float, default=0.2)
+    p.add_argument("--distractor-repel-weight", type=float, default=0.0)
+    p.add_argument("--distractor-repel-sigma", type=float, default=2.0)
+    p.add_argument("--max-distractors", type=int, default=4)
     p.add_argument("--softargmax-temperature", type=float, default=20.0)
     p.add_argument("--decode-method", type=str, default="softargmax", choices=["argmax", "softargmax"])
     p.add_argument("--train-encoding", type=str, default="direct", choices=["rate", "direct"])
@@ -85,6 +88,25 @@ def _target_from_sample(sample) -> np.ndarray:
     cy = float(sample.target_center[1]) / max(1.0, float(h))
     conf = 1.0 if bool(sample.valid) else 0.0
     return np.array([cx, cy, conf], dtype=np.float32)
+
+
+def _distractors_from_sample(sample, *, max_distractors: int) -> tuple[np.ndarray, np.ndarray]:
+    h, w = sample.image.shape[:2]
+    centers = np.zeros((max(0, int(max_distractors)), 2), dtype=np.float32)
+    mask = np.zeros((max(0, int(max_distractors)),), dtype=np.float32)
+    if max_distractors <= 0:
+        return centers, mask
+    raw_boxes = list((sample.meta or {}).get("distractor_bboxes_xywh", []))
+    for i, box in enumerate(raw_boxes[: int(max_distractors)]):
+        if not isinstance(box, (list, tuple)) or len(box) < 4:
+            continue
+        x, y, bw, bh = [float(v) for v in box[:4]]
+        if bw <= 0.0 or bh <= 0.0:
+            continue
+        centers[i, 0] = np.float32((x + 0.5 * bw) / max(1.0, float(w)))
+        centers[i, 1] = np.float32((y + 0.5 * bh) / max(1.0, float(h)))
+        mask[i] = np.float32(1.0)
+    return centers, mask
 
 
 def _pixel_error_norm(pred_xy: np.ndarray, gt_xy: np.ndarray, h: int, w: int) -> float:
@@ -204,7 +226,8 @@ def main() -> None:
             sample = self.ds[src_idx]
             x = _to_tensor_image(sample.image, input_size=int(args.input_size))
             y = _target_from_sample(sample)
-            return torch.from_numpy(x), torch.from_numpy(y)
+            d_xy, d_mask = _distractors_from_sample(sample, max_distractors=int(args.max_distractors))
+            return torch.from_numpy(x), torch.from_numpy(y), torch.from_numpy(d_xy), torch.from_numpy(d_mask)
 
     num_workers = max(0, int(args.num_workers))
     def _loader(ds, *, batch_size: int, shuffle: bool):
@@ -234,7 +257,7 @@ def main() -> None:
     amp_dtype = torch.float16 if str(args.amp) == "fp16" else torch.bfloat16
     scaler = torch.cuda.amp.GradScaler(enabled=bool(amp_enabled and str(args.amp) == "fp16"))
 
-    def _loss(outputs, targets):
+    def _loss(outputs, targets, distractor_centers=None, distractor_mask=None):
         return heatmap_loss(
             outputs,
             targets,
@@ -244,6 +267,10 @@ def main() -> None:
             heatmap_weight=float(args.heatmap_weight),
             conf_weight=float(args.conf_weight),
             softargmax_temperature=float(args.softargmax_temperature),
+            distractor_centers=distractor_centers,
+            distractor_mask=distractor_mask,
+            distractor_weight=float(args.distractor_repel_weight),
+            distractor_sigma=float(args.distractor_repel_sigma),
         )
 
     eval_batch_size = max(1, int(args.eval_batch_size))
@@ -270,14 +297,16 @@ def main() -> None:
         pred_x_px: list[float] = []
         pred_y_px: list[float] = []
         with torch.no_grad():
-            for xb, yb in eval_loader:
+            for xb, yb, db, dmask in eval_loader:
                 xb = xb.to(device, non_blocking=(device == "cuda"))
                 yb = yb.to(device, non_blocking=(device == "cuda"))
+                db = db.to(device, non_blocking=(device == "cuda"))
+                dmask = dmask.to(device, non_blocking=(device == "cuda"))
                 if bool(args.channels_last) and device == "cuda":
                     xb = xb.contiguous(memory_format=torch.channels_last)
                 with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=bool(amp_enabled)):
                     outputs = model(xb, stochastic=False)
-                    loss, _ = _loss(outputs, yb)
+                    loss, _ = _loss(outputs, yb, db, dmask)
                 n = int(xb.shape[0])
                 total += float(loss.item()) * n
                 count += n
@@ -335,15 +364,17 @@ def main() -> None:
         batch_losses: list[float] = []
         batch_parts: list[dict[str, float]] = []
         t_train_loop_begin = time.perf_counter()
-        for xb, yb in loader:
+        for xb, yb, db, dmask in loader:
             xb = xb.to(device, non_blocking=(device == "cuda"))
             yb = yb.to(device, non_blocking=(device == "cuda"))
+            db = db.to(device, non_blocking=(device == "cuda"))
+            dmask = dmask.to(device, non_blocking=(device == "cuda"))
             if bool(args.channels_last) and device == "cuda":
                 xb = xb.contiguous(memory_format=torch.channels_last)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=bool(amp_enabled)):
                 outputs = model(xb, stochastic=True)
-                loss, parts = _loss(outputs, yb)
+                loss, parts = _loss(outputs, yb, db, dmask)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -368,7 +399,7 @@ def main() -> None:
                 "val_loss": val_loss,
                 "train_parts_mean": {
                     k: float(np.mean([p[k] for p in batch_parts])) if batch_parts else 0.0
-                    for k in ("heatmap_loss", "coord_loss", "conf_loss")
+                    for k in ("heatmap_loss", "coord_loss", "conf_loss", "distractor_loss")
                 },
                 "val_metrics": val_metrics,
             }
@@ -391,8 +422,11 @@ def main() -> None:
                     "heatmap_weight": float(args.heatmap_weight),
                     "coord_weight": float(args.coord_weight),
                     "conf_weight": float(args.conf_weight),
+                    "distractor_repel_weight": float(args.distractor_repel_weight),
+                    "distractor_repel_sigma": float(args.distractor_repel_sigma),
+                    "max_distractors": int(args.max_distractors),
                     "softargmax_temperature": float(args.softargmax_temperature),
-                    "loss_kind": "spatial_cross_entropy_plus_coordinate",
+                    "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel",
                     "num_steps": int(args.num_steps),
                     "beta": float(args.beta),
                     "train_encoding": str(args.train_encoding),
@@ -421,8 +455,11 @@ def main() -> None:
                     "heatmap_weight": float(args.heatmap_weight),
                     "coord_weight": float(args.coord_weight),
                     "conf_weight": float(args.conf_weight),
+                    "distractor_repel_weight": float(args.distractor_repel_weight),
+                    "distractor_repel_sigma": float(args.distractor_repel_sigma),
+                    "max_distractors": int(args.max_distractors),
                     "softargmax_temperature": float(args.softargmax_temperature),
-                    "loss_kind": "spatial_cross_entropy_plus_coordinate",
+                    "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel",
                     "num_steps": int(args.num_steps),
                     "beta": float(args.beta),
                     "train_encoding": str(args.train_encoding),
@@ -460,8 +497,11 @@ def main() -> None:
             "heatmap_weight": float(args.heatmap_weight),
             "coord_weight": float(args.coord_weight),
             "conf_weight": float(args.conf_weight),
+            "distractor_repel_weight": float(args.distractor_repel_weight),
+            "distractor_repel_sigma": float(args.distractor_repel_sigma),
+            "max_distractors": int(args.max_distractors),
             "softargmax_temperature": float(args.softargmax_temperature),
-            "loss_kind": "spatial_cross_entropy_plus_coordinate",
+            "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel",
             "num_steps": int(args.num_steps),
             "beta": float(args.beta),
             "train_encoding": str(args.train_encoding),
@@ -537,6 +577,9 @@ def main() -> None:
             "heatmap_weight": float(args.heatmap_weight),
             "coord_weight": float(args.coord_weight),
             "conf_weight": float(args.conf_weight),
+            "distractor_repel_weight": float(args.distractor_repel_weight),
+            "distractor_repel_sigma": float(args.distractor_repel_sigma),
+            "max_distractors": int(args.max_distractors),
             "softargmax_temperature": float(args.softargmax_temperature),
             "decode_method": str(args.decode_method),
             "eval_interval": int(eval_interval),
