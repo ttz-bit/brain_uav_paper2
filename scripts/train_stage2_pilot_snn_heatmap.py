@@ -10,7 +10,13 @@ import cv2
 import numpy as np
 
 from paper2.datasets.stage2_rendered_dataset import build_stage2_rendered_dataset
-from paper2.models.snn_heatmap import HeatmapSNN, heatmap_loss, peak_argmax_2d, soft_argmax_2d
+try:
+    from paper2.models.snn_heatmap import HeatmapSNN, heatmap_loss, peak_argmax_2d, soft_argmax_2d
+except Exception as e:
+    raise RuntimeError(
+        "Failed to import the SNN model stack. If you see a GLIBC_2.27 error, "
+        "activate the paper2_torch_gpu environment on the server and rerun."
+    ) from e
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +47,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--land-penalty-weight", type=float, default=0.0)
     p.add_argument("--land-penalty-dilate-px", type=int, default=4)
     p.add_argument("--water-interior-erode-px", type=int, default=6)
+    p.add_argument("--water-interior-erode-far-px", type=int, default=10)
+    p.add_argument("--water-interior-erode-mid-px", type=int, default=6)
+    p.add_argument("--water-interior-erode-terminal-px", type=int, default=4)
     p.add_argument("--softargmax-temperature", type=float, default=20.0)
     p.add_argument("--decode-method", type=str, default="softargmax", choices=["argmax", "softargmax"])
     p.add_argument("--train-encoding", type=str, default="direct", choices=["rate", "direct"])
@@ -202,6 +211,17 @@ def _water_mask_from_sample(sample, *, input_size: int, interior_erode_px: int =
     if sz > 0 and (h != sz or w != sz):
         water = cv2.resize(water, (sz, sz), interpolation=cv2.INTER_NEAREST)
     return water.astype(np.float32, copy=False)[None, :, :]
+
+
+def _water_interior_erode_px_for_sample(sample, args) -> int:
+    stage = str((sample.meta or {}).get("perception_stage", "")).lower()
+    if stage == "far":
+        return int(args.water_interior_erode_far_px)
+    if stage == "mid":
+        return int(args.water_interior_erode_mid_px)
+    if stage == "terminal":
+        return int(args.water_interior_erode_terminal_px)
+    return int(args.water_interior_erode_px)
 
 
 def _pixel_error_norm(pred_xy: np.ndarray, gt_xy: np.ndarray, h: int, w: int) -> float:
@@ -378,7 +398,7 @@ def main() -> None:
             water = _water_mask_from_sample(
                 sample,
                 input_size=int(args.input_size),
-                interior_erode_px=int(args.water_interior_erode_px),
+                interior_erode_px=_water_interior_erode_px_for_sample(sample, args),
             )
             return (
                 torch.from_numpy(x),
@@ -604,6 +624,9 @@ def main() -> None:
                     "land_penalty_weight": float(args.land_penalty_weight),
                     "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
                     "water_interior_erode_px": int(args.water_interior_erode_px),
+                    "water_interior_erode_far_px": int(args.water_interior_erode_far_px),
+                    "water_interior_erode_mid_px": int(args.water_interior_erode_mid_px),
+                    "water_interior_erode_terminal_px": int(args.water_interior_erode_terminal_px),
                     "water_logit_constraint": bool(load_water_mask),
                     "softargmax_temperature": float(args.softargmax_temperature),
                     "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty_plus_water_logit_constraint",
@@ -642,6 +665,9 @@ def main() -> None:
                     "land_penalty_weight": float(args.land_penalty_weight),
                     "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
                     "water_interior_erode_px": int(args.water_interior_erode_px),
+                    "water_interior_erode_far_px": int(args.water_interior_erode_far_px),
+                    "water_interior_erode_mid_px": int(args.water_interior_erode_mid_px),
+                    "water_interior_erode_terminal_px": int(args.water_interior_erode_terminal_px),
                     "water_logit_constraint": bool(load_water_mask),
                     "softargmax_temperature": float(args.softargmax_temperature),
                     "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty_plus_water_logit_constraint",
@@ -689,6 +715,9 @@ def main() -> None:
             "land_penalty_weight": float(args.land_penalty_weight),
             "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
             "water_interior_erode_px": int(args.water_interior_erode_px),
+            "water_interior_erode_far_px": int(args.water_interior_erode_far_px),
+            "water_interior_erode_mid_px": int(args.water_interior_erode_mid_px),
+            "water_interior_erode_terminal_px": int(args.water_interior_erode_terminal_px),
             "water_logit_constraint": bool(load_water_mask),
             "softargmax_temperature": float(args.softargmax_temperature),
             "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty_plus_water_logit_constraint",
@@ -794,6 +823,9 @@ def main() -> None:
             "land_penalty_weight": float(args.land_penalty_weight),
             "land_penalty_dilate_px": int(args.land_penalty_dilate_px),
             "water_interior_erode_px": int(args.water_interior_erode_px),
+            "water_interior_erode_far_px": int(args.water_interior_erode_far_px),
+            "water_interior_erode_mid_px": int(args.water_interior_erode_mid_px),
+            "water_interior_erode_terminal_px": int(args.water_interior_erode_terminal_px),
             "water_logit_constraint": bool(load_water_mask),
             "softargmax_temperature": float(args.softargmax_temperature),
             "decode_method": str(args.decode_method),

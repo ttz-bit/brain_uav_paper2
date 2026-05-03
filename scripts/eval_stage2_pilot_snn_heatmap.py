@@ -8,7 +8,13 @@ import cv2
 import numpy as np
 
 from paper2.datasets.stage2_rendered_dataset import build_stage2_rendered_dataset
-from paper2.models.snn_heatmap import HeatmapSNN, heatmap_loss, peak_argmax_2d, soft_argmax_2d
+try:
+    from paper2.models.snn_heatmap import HeatmapSNN, heatmap_loss, peak_argmax_2d, soft_argmax_2d
+except Exception as e:
+    raise RuntimeError(
+        "Failed to import the SNN model stack. If you see a GLIBC_2.27 error, "
+        "activate the paper2_torch_gpu environment on the server and rerun."
+    ) from e
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,6 +33,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-offcenter-improve-ratio", type=float, default=0.10)
     p.add_argument("--min-unique-pred-xy", type=int, default=16)
     p.add_argument("--water-interior-erode-px", type=int, default=6)
+    p.add_argument("--water-interior-erode-far-px", type=int, default=10)
+    p.add_argument("--water-interior-erode-mid-px", type=int, default=6)
+    p.add_argument("--water-interior-erode-terminal-px", type=int, default=4)
     p.add_argument(
         "--weights",
         type=str,
@@ -132,6 +141,17 @@ def _water_mask_from_sample(sample, *, input_size: int, interior_erode_px: int =
     if sz > 0 and (h != sz or w != sz):
         water = cv2.resize(water, (sz, sz), interpolation=cv2.INTER_NEAREST)
     return water.astype(np.float32, copy=False)[None, :, :]
+
+
+def _water_interior_erode_px_for_sample(sample, args) -> int:
+    stage = str((sample.meta or {}).get("perception_stage", "")).lower()
+    if stage == "far":
+        return int(args.water_interior_erode_far_px)
+    if stage == "mid":
+        return int(args.water_interior_erode_mid_px)
+    if stage == "terminal":
+        return int(args.water_interior_erode_terminal_px)
+    return int(args.water_interior_erode_px)
 
 
 def _land_mask_from_sample(sample, *, input_size: int, dilate_px: int) -> np.ndarray:
@@ -364,7 +384,7 @@ def main() -> None:
                 _water_mask_from_sample(
                     s,
                     input_size=input_size,
-                    interior_erode_px=int(water_interior_erode_px),
+                    interior_erode_px=_water_interior_erode_px_for_sample(s, args),
                 )
             ).unsqueeze(0).to(device)
             land = torch.from_numpy(
@@ -547,6 +567,9 @@ def main() -> None:
             "land_penalty_weight": float(land_penalty_weight),
             "land_penalty_dilate_px": int(land_penalty_dilate_px),
             "water_interior_erode_px": int(water_interior_erode_px),
+            "water_interior_erode_far_px": int(args.water_interior_erode_far_px),
+            "water_interior_erode_mid_px": int(args.water_interior_erode_mid_px),
+            "water_interior_erode_terminal_px": int(args.water_interior_erode_terminal_px),
             "water_constrained_decode": True,
             "softargmax_temperature": float(softargmax_temperature),
             "eval_encoding": str(eval_encoding),
