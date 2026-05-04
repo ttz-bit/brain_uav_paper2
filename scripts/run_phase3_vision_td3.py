@@ -16,7 +16,10 @@ from paper2.env_adapter.paper1_bridge import Paper1EnvBridge
 from paper2.env_adapter.phase3_target_motion import propagate_phase3_target_truth, sample_phase3_initial_target
 from paper2.env_adapter.world_frame import paper2_xyz_to_paper1_xyz
 from paper2.paper1_method.curriculum import parse_curriculum_mix
+from paper2.models.cnn_heatmap import HeatmapCNN
+from paper2.models.snn_heatmap import HeatmapSNN, peak_argmax_2d, soft_argmax_2d
 from paper2.planning.paper1_td3_policy import Paper1TD3Policy
+from paper2.tracking.kalman import ConstantVelocityKalmanFilter
 from paper2.tracking.vision_to_estimate import image_point_to_world_xy, vision_observation_to_target_estimate
 
 
@@ -25,9 +28,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", type=str, default="configs/env.yaml")
     p.add_argument("--dataset-root", type=str, required=True)
     p.add_argument("--eval-split", choices=["train", "val", "test"], default="test")
-    p.add_argument("--cnn-weights", type=str, required=True)
+    p.add_argument("--vision-weights", type=str, required=True)
     p.add_argument("--td3-checkpoint", type=str, required=True)
     p.add_argument("--model", choices=["snn", "ann"], default="snn")
+    p.add_argument("--vision-model", choices=["auto", "cnn_coord", "cnn_heatmap", "snn_heatmap"], default="auto")
+    p.add_argument("--decode-method", choices=["auto", "argmax", "softargmax"], default="auto")
+    p.add_argument("--estimate-filter", choices=["none", "gated_smooth", "kalman"], default="gated_smooth")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--episodes", type=int, default=16)
     p.add_argument("--steps", type=int, default=1000)
@@ -45,6 +51,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gain-far", type=float, default=0.25)
     p.add_argument("--gain-mid", type=float, default=0.50)
     p.add_argument("--gain-terminal", type=float, default=0.80)
+    p.add_argument("--kf-process-accel-std", type=float, default=2.0)
+    p.add_argument("--kf-gate-far-km", type=float, default=300.0)
+    p.add_argument("--kf-gate-mid-km", type=float, default=120.0)
+    p.add_argument("--kf-gate-terminal-km", type=float, default=25.0)
+    p.add_argument("--vision-input-size", type=int, default=0)
     p.add_argument("--out-dir", type=str, default="outputs/phase3_vision_td3/cnn_td3_snn_hard")
     return p.parse_args()
 
@@ -118,26 +129,68 @@ def _make_cnn_model(nn: Any):
     return _SmallCNN()
 
 
-def _load_cnn(weights: Path, device: str):
+def _load_vision_model(weights: Path, device: str, requested: str = "auto"):
     torch, nn = _import_torch()
-    model = _make_cnn_model(nn).to(device)
     ckpt = torch.load(weights, map_location=device)
+    model_type = str(ckpt.get("model_type", "cnn_coord"))
+    if requested != "auto":
+        model_type = str(requested)
+    if model_type == "cnn_coord":
+        model = _make_cnn_model(nn).to(device)
+    elif model_type == "cnn_heatmap":
+        model = HeatmapCNN(width=int(ckpt.get("width", 32))).to(device)
+    elif model_type == "snn_heatmap":
+        model = HeatmapSNN(
+            beta=float(ckpt.get("beta", 0.95)),
+            num_steps=int(ckpt.get("num_steps", 12)),
+            train_encoding=str(ckpt.get("train_encoding", "direct")),
+            eval_encoding=str(ckpt.get("eval_encoding", "direct")),
+        ).to(device)
+    else:
+        raise RuntimeError(f"Unsupported vision model_type={model_type}")
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
-    return model, ckpt
+    return model, ckpt, model_type
 
 
-def _predict_cnn(model: Any, image_bgr: np.ndarray, device: str) -> tuple[float, float, float]:
+def _predict_vision(
+    model: Any,
+    model_type: str,
+    image_bgr: np.ndarray,
+    device: str,
+    *,
+    input_size: int = 0,
+    decode_method: str = "auto",
+    softargmax_temperature: float = 20.0,
+) -> tuple[float, float, float]:
     torch, _ = _import_torch()
-    with torch.no_grad():
-        x = torch.from_numpy(_to_tensor_image(image_bgr)).unsqueeze(0).to(device)
-        pred = model(x)[0].detach().cpu().numpy()
-    h, w = image_bgr.shape[:2]
-    return (
-        float(np.clip(pred[0], 0.0, 1.0) * w),
-        float(np.clip(pred[1], 0.0, 1.0) * h),
-        float(np.clip(pred[2], 0.0, 1.0)),
-    )
+    orig_h, orig_w = image_bgr.shape[:2]
+    proc_h, proc_w = orig_h, orig_w
+    x_img = image_bgr
+    if int(input_size) > 0 and (orig_h != int(input_size) or orig_w != int(input_size)):
+        proc_w = proc_h = int(input_size)
+        x_img = cv2.resize(image_bgr, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
+    with torch.inference_mode():
+        x = torch.from_numpy(_to_tensor_image(x_img)).unsqueeze(0).to(device)
+        if model_type == "cnn_coord":
+            pred = model(x)[0].detach().cpu().numpy()
+            px = float(np.clip(pred[0], 0.0, 1.0) * proc_w)
+            py = float(np.clip(pred[1], 0.0, 1.0) * proc_h)
+            conf = float(np.clip(pred[2], 0.0, 1.0))
+            sx = orig_w / max(1.0, float(proc_w))
+            sy = orig_h / max(1.0, float(proc_h))
+            return (float(px * sx), float(py * sy), conf)
+        outputs = model(x) if model_type == "cnn_heatmap" else model(x, stochastic=False)
+        if str(decode_method) == "softargmax":
+            pred_xy = soft_argmax_2d(outputs["heatmap_logits"], temperature=float(softargmax_temperature))[0].detach().cpu().numpy()
+        else:
+            pred_xy = peak_argmax_2d(outputs["heatmap_logits"])[0].detach().cpu().numpy()
+        px = float(np.clip(pred_xy[0], 0.0, 1.0) * max(1, proc_w - 1))
+        py = float(np.clip(pred_xy[1], 0.0, 1.0) * max(1, proc_h - 1))
+        conf = float(torch.sigmoid(outputs["conf_logits"])[0].detach().cpu().item())
+    sx = orig_w / max(1.0, float(proc_w))
+    sy = orig_h / max(1.0, float(proc_h))
+    return (float(px * sx), float(py * sy), float(np.clip(conf, 0.0, 1.0)))
 
 
 def _stage_for_range(range_km: float, stage_cfg: dict[str, Any]) -> str:
@@ -347,6 +400,33 @@ def _gate_and_smooth_estimate(
     return fused, True, innovation, gain
 
 
+def _apply_estimate_filter(
+    candidate: TargetEstimateState,
+    previous: TargetEstimateState | None,
+    *,
+    stage: str,
+    args: argparse.Namespace,
+    kf: ConstantVelocityKalmanFilter | None,
+) -> tuple[TargetEstimateState, bool, float, float]:
+    if str(args.estimate_filter) == "none":
+        return candidate, True, 0.0, 1.0
+    if str(args.estimate_filter) == "gated_smooth":
+        return _gate_and_smooth_estimate(candidate, previous, stage=stage, args=args)
+    if kf is None:
+        raise RuntimeError("Kalman filter requested but not initialized.")
+    gate = _kf_stage_threshold(stage, args)
+    estimate, info = kf.update(candidate, gate_threshold=float(gate))
+    return estimate, bool(info.accepted), float(info.innovation_norm), float(info.gate_threshold or gate)
+
+
+def _kf_stage_threshold(stage: str, args: argparse.Namespace) -> float:
+    if stage == "terminal":
+        return float(args.kf_gate_terminal_km)
+    if stage == "mid":
+        return float(args.kf_gate_mid_km)
+    return float(args.kf_gate_far_km)
+
+
 def _set_goal_from_estimate(bridge: Paper1EnvBridge, estimate: TargetEstimateState, target_z_km: float) -> None:
     pos = np.asarray(estimate.pos_world_est, dtype=float).reshape(-1)
     pos3 = np.array([pos[0], pos[1], float(target_z_km)], dtype=float)
@@ -421,7 +501,19 @@ def main() -> None:
 
     torch, _ = _import_torch()
     device = _resolve_device(torch, args.device)
-    cnn_model, cnn_ckpt = _load_cnn(Path(args.cnn_weights).resolve(), device)
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
+    vision_model, vision_ckpt, vision_model_type = _load_vision_model(
+        Path(args.vision_weights).resolve(),
+        device,
+        requested=str(args.vision_model),
+    )
+    vision_input_size = int(args.vision_input_size) if int(args.vision_input_size) > 0 else int(vision_ckpt.get("input_size", 256))
+    decode_method = str(args.decode_method)
+    if decode_method == "auto":
+        decode_method = str(vision_ckpt.get("decode_method", "softargmax"))
+        if decode_method == "heatmap_argmax":
+            decode_method = "argmax"
 
     label_path = dataset_root / "labels" / f"{args.eval_split}.jsonl"
     rows = _read_jsonl(label_path, max_rows=args.max_vision_samples)
@@ -468,6 +560,9 @@ def main() -> None:
             else float(getattr(bridge.env.scenario, "goal_radius", 5.0))
         )
         prev_estimate: TargetEstimateState | None = None
+        kf: ConstantVelocityKalmanFilter | None = None
+        if str(args.estimate_filter) == "kalman":
+            kf = ConstantVelocityKalmanFilter(dim=3, process_accel_std=float(args.kf_process_accel_std))
 
         for step_idx in range(int(args.steps)):
             aircraft = bridge.get_aircraft_state()
@@ -481,7 +576,15 @@ def main() -> None:
             image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
             if image is None:
                 raise FileNotFoundError(f"Could not read vision sample image: {image_path}")
-            pred_x, pred_y, pred_conf = _predict_cnn(cnn_model, image, device)
+            pred_x, pred_y, pred_conf = _predict_vision(
+                vision_model,
+                vision_model_type,
+                image,
+                device,
+                input_size=int(vision_input_size),
+                decode_method=decode_method,
+                softargmax_temperature=float(vision_ckpt.get("softargmax_temperature", 20.0)),
+            )
             raw_estimate, vision_error_km = _vision_estimate_from_row(
                 row=sample_row,
                 pred_center_px=(pred_x, pred_y),
@@ -490,11 +593,12 @@ def main() -> None:
                 current_target_z=target_z,
                 t=float(aircraft.t),
             )
-            estimate, gate_accepted, gate_innovation_km, gate_gain = _gate_and_smooth_estimate(
+            estimate, gate_accepted, gate_innovation_km, gate_gain = _apply_estimate_filter(
                 raw_estimate,
                 prev_estimate,
                 stage=stage,
                 args=args,
+                kf=kf,
             )
             prev_estimate = estimate
             _set_goal_from_estimate(bridge, estimate, target_z)
@@ -510,7 +614,8 @@ def main() -> None:
                 "episode": int(ep),
                 "step": int(step_idx),
                 "t": float(aircraft.t),
-                "observer": "cnn",
+                "observer": str(vision_model_type),
+                "estimate_filter": str(args.estimate_filter),
                 "planner": f"paper1_{args.model}_td3",
                 "vision_stage": stage,
                 "vision_sequence_id": str(sample_row.get("sequence_id")),
@@ -555,7 +660,7 @@ def main() -> None:
             )
 
         summary = _episode_summary(ep_rows, capture_radius_km)
-        summary.update({"episode": int(ep), "seed": int(ep_seed), "observer": "cnn"})
+        summary.update({"episode": int(ep), "seed": int(ep_seed), "observer": str(vision_model_type)})
         summaries.append(summary)
 
     traj_path = out_dir / "trajectory.jsonl"
@@ -581,17 +686,18 @@ def main() -> None:
 
     report = {
         "task": "run_phase3_vision_td3",
-        "purpose": "cnn_observer_closed_loop_eval",
+        "purpose": "vision_observer_closed_loop_eval",
         "config": str(args.config),
         "env_source": env_source,
         "planner": f"paper1_{args.model}_td3",
-        "observer": "cnn",
+        "observer": str(vision_model_type),
+        "estimate_filter": str(args.estimate_filter),
         "dataset_root": str(dataset_root),
         "eval_split": str(args.eval_split),
-        "cnn_weights_path": str(Path(args.cnn_weights).expanduser()),
+        "vision_weights_path": str(Path(args.vision_weights).expanduser()),
         "td3_checkpoint_path": str(Path(args.td3_checkpoint).expanduser()),
-        "cnn_train_split": str(cnn_ckpt.get("train_split", "unknown")),
-        "cnn_val_split": str(cnn_ckpt.get("val_split", "unknown")),
+        "vision_train_split": str(vision_ckpt.get("train_split", "unknown")),
+        "vision_val_split": str(vision_ckpt.get("val_split", "unknown")),
         "phase3_target_init": str(args.phase3_target_init),
         "paper1_curriculum_level": str(args.paper1_curriculum_level),
         "paper1_curriculum_mix": paper1_curriculum_mix,

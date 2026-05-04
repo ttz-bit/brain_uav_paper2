@@ -9,6 +9,7 @@ import numpy as np
 
 from paper2.datasets.stage2_rendered_dataset import build_stage2_rendered_dataset
 try:
+    from paper2.models.cnn_heatmap import HeatmapCNN
     from paper2.models.snn_heatmap import HeatmapSNN, heatmap_loss, peak_argmax_2d, soft_argmax_2d
 except Exception as e:
     raise RuntimeError(
@@ -302,6 +303,8 @@ def main() -> None:
         device = "cuda"
     elif args.device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     dataset_root = Path(args.dataset_root).resolve()
     project_root = Path(args.project_root).resolve()
@@ -321,8 +324,9 @@ def main() -> None:
     if not weights.exists():
         raise FileNotFoundError(f"Missing weights: {weights}")
     ckpt = torch.load(weights, map_location=device)
-    if str(ckpt.get("model_type", "")) != "snn_heatmap":
-        raise RuntimeError(f"Expected snn_heatmap checkpoint, got model_type={ckpt.get('model_type')}")
+    ckpt_model_type = str(ckpt.get("model_type", "snn_heatmap"))
+    if ckpt_model_type not in {"snn_heatmap", "cnn_heatmap"}:
+        raise RuntimeError(f"Expected heatmap checkpoint, got model_type={ckpt_model_type}")
 
     input_size = int(args.input_size) if int(args.input_size) > 0 else int(ckpt.get("input_size", 256))
     heatmap_size = int(ckpt.get("heatmap_size", 64))
@@ -342,12 +346,15 @@ def main() -> None:
         ckpt_decode_method = "argmax"
     decode_method = ckpt_decode_method if args.decode_method == "auto" else str(args.decode_method)
 
-    model = HeatmapSNN(
-        beta=float(ckpt.get("beta", 0.95)),
-        num_steps=int(ckpt.get("num_steps", 12)),
-        train_encoding=ckpt_train_encoding,
-        eval_encoding=eval_encoding,
-    ).to(device)
+    if ckpt_model_type == "cnn_heatmap":
+        model = HeatmapCNN(width=int(ckpt.get("width", 32))).to(device)
+    else:
+        model = HeatmapSNN(
+            beta=float(ckpt.get("beta", 0.95)),
+            num_steps=int(ckpt.get("num_steps", 12)),
+            train_encoding=ckpt_train_encoding,
+            eval_encoding=eval_encoding,
+        ).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
 
@@ -373,7 +380,7 @@ def main() -> None:
     rows_head: list[dict] = []
     all_rows: list[dict] = []
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for i in range(len(ds)):
             s = ds[i]
             x_np = _to_tensor_image(s.image, input_size=input_size)
@@ -394,7 +401,7 @@ def main() -> None:
                     dilate_px=land_penalty_dilate_px,
                 )
             ).unsqueeze(0).to(device)
-            outputs = model(x, stochastic=False)
+            outputs = model(x) if ckpt_model_type == "cnn_heatmap" else model(x, stochastic=False)
             loss, _ = heatmap_loss(
                 outputs,
                 y,
@@ -541,7 +548,7 @@ def main() -> None:
     }
 
     report = {
-        "task": "eval_stage2_pilot_snn_heatmap",
+        "task": "eval_stage2_pilot_heatmap",
         "purpose": "generalization_eval",
         "dataset": {
             "name": "stage2_rendered",
@@ -578,6 +585,7 @@ def main() -> None:
             "checkpoint_decode_method": str(ckpt_decode_method),
             "decode_method": str(decode_method),
             "loss_kind": str(ckpt.get("loss_kind", "unknown")),
+            "checkpoint_model_type": str(ckpt_model_type),
         },
         "metrics": {
             "eval_loss_mean": _mean(losses),
