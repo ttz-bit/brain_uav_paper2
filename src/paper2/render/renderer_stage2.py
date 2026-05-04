@@ -14,6 +14,8 @@ from paper2.render.motion_sampler import generate_motion_sequence, sample_mode
 from paper2.render.perturbations import apply_perturbations
 from paper2.render.schema import RenderedFrameRecord
 
+PNG_WRITE_PARAMS = [cv2.IMWRITE_PNG_COMPRESSION, 1]
+
 
 def _extract_patch(background_bgr: np.ndarray, cx: float, cy: float, size: int) -> np.ndarray:
     h, w = background_bgr.shape[:2]
@@ -641,6 +643,11 @@ class Stage2Renderer:
                     )
                     if _is_water_pixel(water_mask_global, spx3, spy3):
                         xw, yw = background_px_to_world(spx3, spy3, world_size_m, bg_w, bg_h)
+                        dx3 = float(xw - prev_x)
+                        dy3 = float(yw - prev_y)
+                        d3 = float(np.hypot(dx3, dy3))
+                        if d3 > float(max_world_step_m) and d3 > 1e-6:
+                            xw, yw = float(prev_x), float(prev_y)
                     else:
                         xw, yw = float(prev_x), float(prev_y)
 
@@ -1349,7 +1356,7 @@ class Stage2Renderer:
                     rel_img_path = self._image_rel_path(split, seq_idx, frame_idx)
                     abs_img_path = self.project_root / Path(rel_img_path)
                     abs_img_path.parent.mkdir(parents=True, exist_ok=True)
-                    cv2.imwrite(str(abs_img_path), patch)
+                    cv2.imwrite(str(abs_img_path), patch, PNG_WRITE_PARAMS)
 
                     row = RenderedFrameRecord(
                         image_path=str(rel_img_path).replace("\\", "/"),
