@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-distractors", type=int, default=4)
     p.add_argument("--land-penalty-weight", type=float, default=0.0)
     p.add_argument("--land-penalty-dilate-px", type=int, default=4)
+    p.add_argument("--water-logit-constraint", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--water-interior-erode-px", type=int, default=6)
     p.add_argument("--water-interior-erode-far-px", type=int, default=10)
     p.add_argument("--water-interior-erode-mid-px", type=int, default=6)
@@ -57,6 +58,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--init-weights", type=str, default="")
     p.add_argument("--eval-interval", type=int, default=1)
     p.add_argument("--eval-batch-size", type=int, default=128)
+    p.add_argument(
+        "--selection-metric",
+        type=str,
+        default="val_pixel_error",
+        choices=["val_loss", "val_pixel_error", "val_argmax_pixel_error", "val_softargmax_pixel_error", "val_center_improve"],
+    )
     p.add_argument("--train-eval-max-samples", type=int, default=2048)
     p.add_argument("--val-eval-max-samples", type=int, default=0)
     p.add_argument("--num-workers", type=int, default=0)
@@ -351,7 +358,8 @@ def main() -> None:
     if args.strict_no_leak and has_leak:
         raise RuntimeError(f"Asset leakage detected: {leak}")
 
-    load_water_mask = float(args.land_penalty_weight) > 0.0
+    water_constraint = bool(args.water_logit_constraint) or float(args.land_penalty_weight) > 0.0
+    load_water_mask = bool(water_constraint)
     train_ds = build_stage2_rendered_dataset(
         root=dataset_root,
         split=args.train_split,
@@ -461,7 +469,7 @@ def main() -> None:
             distractor_sigma=float(args.distractor_repel_sigma),
             land_mask=land_mask,
             land_weight=float(args.land_penalty_weight),
-            valid_mask=water_mask if load_water_mask else None,
+            valid_mask=water_mask if water_constraint else None,
         )
 
     eval_batch_size = max(1, int(args.eval_batch_size))
@@ -487,7 +495,7 @@ def main() -> None:
         center_errors: list[float] = []
         pred_x_px: list[float] = []
         pred_y_px: list[float] = []
-        with torch.no_grad():
+        with torch.inference_mode():
             for xb, yb, db, dmask, land, water in eval_loader:
                 xb = xb.to(device, non_blocking=(device == "cuda"))
                 yb = yb.to(device, non_blocking=(device == "cuda"))
@@ -503,11 +511,12 @@ def main() -> None:
                 n = int(xb.shape[0])
                 total += float(loss.item()) * n
                 count += n
-                argmax_xy = peak_argmax_2d(outputs["heatmap_logits"], valid_mask=water).detach().cpu().numpy()
+                valid_mask = water if water_constraint else None
+                argmax_xy = peak_argmax_2d(outputs["heatmap_logits"], valid_mask=valid_mask).detach().cpu().numpy()
                 soft_xy = soft_argmax_2d(
                     outputs["heatmap_logits"],
                     temperature=float(args.softargmax_temperature),
-                    valid_mask=water,
+                    valid_mask=valid_mask,
                 ).detach().cpu().numpy()
                 pred_xy = soft_xy if str(args.decode_method) == "softargmax" else argmax_xy
                 gt_xy = yb[:, :2].detach().cpu().numpy()
@@ -539,11 +548,24 @@ def main() -> None:
             "rounded_unique_pred_xy": int(len(rounded_unique)),
         }
 
-    with torch.no_grad():
+    def _selection_score(metrics: dict[str, float]) -> float:
+        metric = str(args.selection_metric)
+        if metric == "val_loss":
+            return float(metrics["loss"])
+        if metric == "val_argmax_pixel_error":
+            return float(metrics["argmax_pixel_error_mean"])
+        if metric == "val_softargmax_pixel_error":
+            return float(metrics["softargmax_pixel_error_mean"])
+        if metric == "val_center_improve":
+            return -float(metrics["center_baseline_improve_ratio"])
+        return float(metrics["pixel_error_mean"])
+
+    with torch.inference_mode():
         train_initial = _eval_loader(train_eval_loader)
         val_initial = _eval_loader(val_eval_loader)
 
-    best_val = float("inf")
+    best_score = float("inf")
+    best_val_loss = float("inf")
     best_path = out_dir / "model_best.pth"
     last_path = out_dir / "model_last.pth"
     loss_trace: list[dict] = []
@@ -588,11 +610,14 @@ def main() -> None:
             val_eval_sec_total += float(time.perf_counter() - t_eval_begin)
         else:
             val_metrics = {}
+        selection_score = _selection_score(val_metrics) if do_eval else float("nan")
         loss_trace.append(
             {
                 "epoch": int(ep + 1),
                 "train_loss": train_loss,
                 "val_loss": val_loss,
+                "selection_metric": str(args.selection_metric),
+                "selection_score": float(selection_score),
                 "train_parts_mean": {
                     k: float(np.mean([p[k] for p in batch_parts])) if batch_parts else 0.0
                     for k in ("heatmap_loss", "coord_loss", "conf_loss", "distractor_loss", "land_loss")
@@ -600,8 +625,9 @@ def main() -> None:
                 "val_metrics": val_metrics,
             }
         )
-        if do_eval and val_loss < best_val:
-            best_val = val_loss
+        if do_eval and selection_score < best_score:
+            best_score = float(selection_score)
+            best_val_loss = float(val_loss)
             torch.save(
                 {
                     "state_dict": model.state_dict(),
@@ -627,7 +653,7 @@ def main() -> None:
                     "water_interior_erode_far_px": int(args.water_interior_erode_far_px),
                     "water_interior_erode_mid_px": int(args.water_interior_erode_mid_px),
                     "water_interior_erode_terminal_px": int(args.water_interior_erode_terminal_px),
-                    "water_logit_constraint": bool(load_water_mask),
+                    "water_logit_constraint": bool(water_constraint),
                     "softargmax_temperature": float(args.softargmax_temperature),
                     "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty_plus_water_logit_constraint",
                     "num_steps": int(args.num_steps),
@@ -637,7 +663,9 @@ def main() -> None:
                     "init_weights": init_weights,
                     "decode_method": str(args.decode_method),
                     "epoch": int(ep + 1),
-                    "best_val_loss": float(best_val),
+                    "selection_metric": str(args.selection_metric),
+                    "best_selection_score": float(best_score),
+                    "best_val_loss": float(best_val_loss),
                     "optimizer_state": optimizer.state_dict(),
                 },
                 best_path,
@@ -668,7 +696,7 @@ def main() -> None:
                     "water_interior_erode_far_px": int(args.water_interior_erode_far_px),
                     "water_interior_erode_mid_px": int(args.water_interior_erode_mid_px),
                     "water_interior_erode_terminal_px": int(args.water_interior_erode_terminal_px),
-                    "water_logit_constraint": bool(load_water_mask),
+                    "water_logit_constraint": bool(water_constraint),
                     "softargmax_temperature": float(args.softargmax_temperature),
                     "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty_plus_water_logit_constraint",
                     "num_steps": int(args.num_steps),
@@ -678,7 +706,9 @@ def main() -> None:
                     "init_weights": init_weights,
                     "decode_method": str(args.decode_method),
                     "epoch": int(ep + 1),
-                    "best_val_loss": float(best_val),
+                    "selection_metric": str(args.selection_metric),
+                    "best_selection_score": float(best_score),
+                    "best_val_loss": float(best_val_loss),
                     "optimizer_state": optimizer.state_dict(),
                 },
                 last_path,
@@ -689,7 +719,8 @@ def main() -> None:
         val_msg = f"{val_loss:.6f}" if do_eval else "skip"
         print(
             f"[SNN-HEATMAP-FIT] epoch={ep+1:03d}/{epochs} "
-            f"train_loss={train_loss:.6f} val_loss={val_msg} epoch_sec={epoch_sec:.1f}",
+            f"train_loss={train_loss:.6f} val_loss={val_msg} "
+            f"selection={selection_score:.6f} epoch_sec={epoch_sec:.1f}",
             flush=True,
         )
 
@@ -718,7 +749,7 @@ def main() -> None:
             "water_interior_erode_far_px": int(args.water_interior_erode_far_px),
             "water_interior_erode_mid_px": int(args.water_interior_erode_mid_px),
             "water_interior_erode_terminal_px": int(args.water_interior_erode_terminal_px),
-            "water_logit_constraint": bool(load_water_mask),
+            "water_logit_constraint": bool(water_constraint),
             "softargmax_temperature": float(args.softargmax_temperature),
             "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty_plus_water_logit_constraint",
             "num_steps": int(args.num_steps),
@@ -728,7 +759,9 @@ def main() -> None:
             "init_weights": init_weights,
             "decode_method": str(args.decode_method),
             "epoch": int(epochs),
-            "best_val_loss": float(best_val),
+            "selection_metric": str(args.selection_metric),
+            "best_selection_score": float(best_score),
+            "best_val_loss": float(best_val_loss),
             "optimizer_state": optimizer.state_dict(),
         },
         last_path,
@@ -743,7 +776,7 @@ def main() -> None:
 
     for tag, ds, n_vis in [("train", train_ds, 8), ("val", val_ds, 8)]:
         idxs = rng.choice(len(ds), size=min(n_vis, len(ds)), replace=False)
-        with torch.no_grad():
+        with torch.inference_mode():
             model.eval()
             for rank, idx in enumerate(idxs):
                 s = ds[int(idx)]
@@ -757,12 +790,12 @@ def main() -> None:
                     pred_xy = soft_argmax_2d(
                         outputs["heatmap_logits"],
                         temperature=float(args.softargmax_temperature),
-                        valid_mask=water if load_water_mask else None,
+                        valid_mask=water if water_constraint else None,
                     )[0].detach().cpu().numpy()
                 else:
                     pred_xy = peak_argmax_2d(
                         outputs["heatmap_logits"],
-                        valid_mask=water if load_water_mask else None,
+                        valid_mask=water if water_constraint else None,
                     )[0].detach().cpu().numpy()
                 gt = _target_from_sample(s)
                 err = _pixel_error_norm(pred_xy, gt[:2], s.image.shape[0], s.image.shape[1])
@@ -791,14 +824,14 @@ def main() -> None:
             "train": train_meta,
             "val": val_meta,
             "water_mask_supervision_enabled": bool(load_water_mask),
-            "water_logit_constraint_enabled": bool(load_water_mask),
+            "water_logit_constraint_enabled": bool(water_constraint),
         },
         "device": str(device),
         "model": {
             "type": "snn_heatmap",
             "output": "64x64 heatmap + confidence by default",
             "decode_method": str(args.decode_method),
-            "water_constrained_decode": bool(load_water_mask),
+            "water_constrained_decode": bool(water_constraint),
         },
         "hyperparams": {
             "batch_size": int(args.batch_size),
@@ -826,7 +859,8 @@ def main() -> None:
             "water_interior_erode_far_px": int(args.water_interior_erode_far_px),
             "water_interior_erode_mid_px": int(args.water_interior_erode_mid_px),
             "water_interior_erode_terminal_px": int(args.water_interior_erode_terminal_px),
-            "water_logit_constraint": bool(load_water_mask),
+            "water_logit_constraint": bool(water_constraint),
+            "selection_metric": str(args.selection_metric),
             "softargmax_temperature": float(args.softargmax_temperature),
             "decode_method": str(args.decode_method),
             "eval_interval": int(eval_interval),
@@ -882,7 +916,7 @@ def main() -> None:
             "val_beats_center_baseline": bool(val_final["center_baseline_improve_ratio"] > 0.0),
             "val_prediction_not_constant": bool(val_final["rounded_unique_pred_xy"] > 5),
             "water_mask_metadata_complete": bool(
-                (not load_water_mask)
+                (not water_constraint)
                 or (train_meta["water_mask_missing"] == 0 and val_meta["water_mask_missing"] == 0)
             ),
         },

@@ -336,6 +336,7 @@ def main() -> None:
     conf_weight = float(ckpt.get("conf_weight", 0.2))
     land_penalty_weight = float(ckpt.get("land_penalty_weight", 0.0))
     land_penalty_dilate_px = int(ckpt.get("land_penalty_dilate_px", 0))
+    water_logit_constraint = bool(ckpt.get("water_logit_constraint", False))
     water_interior_erode_px = int(ckpt.get("water_interior_erode_px", args.water_interior_erode_px))
     softargmax_temperature = float(ckpt.get("softargmax_temperature", 20.0))
     ckpt_train_encoding = str(ckpt.get("train_encoding", "rate"))
@@ -413,14 +414,15 @@ def main() -> None:
                 softargmax_temperature=softargmax_temperature,
                 land_mask=land,
                 land_weight=land_penalty_weight,
-                valid_mask=water,
+                valid_mask=water if water_logit_constraint else None,
             )
             losses.append(float(loss.item()))
-            argmax_xy = peak_argmax_2d(outputs["heatmap_logits"], valid_mask=water)[0].detach().cpu().numpy()
+            valid_mask = water if water_logit_constraint else None
+            argmax_xy = peak_argmax_2d(outputs["heatmap_logits"], valid_mask=valid_mask)[0].detach().cpu().numpy()
             soft_xy = soft_argmax_2d(
                 outputs["heatmap_logits"],
                 temperature=softargmax_temperature,
-                valid_mask=water,
+                valid_mask=valid_mask,
             )[0].detach().cpu().numpy()
             pred_xy = soft_xy if decode_method == "softargmax" else argmax_xy
             pred_conf = float(torch.sigmoid(outputs["conf_logits"])[0].detach().cpu().item())
@@ -577,7 +579,8 @@ def main() -> None:
             "water_interior_erode_far_px": int(args.water_interior_erode_far_px),
             "water_interior_erode_mid_px": int(args.water_interior_erode_mid_px),
             "water_interior_erode_terminal_px": int(args.water_interior_erode_terminal_px),
-            "water_constrained_decode": True,
+            "water_logit_constraint": bool(water_logit_constraint),
+            "water_constrained_decode": bool(water_logit_constraint),
             "softargmax_temperature": float(softargmax_temperature),
             "eval_encoding": str(eval_encoding),
             "checkpoint_train_encoding": str(ckpt_train_encoding),

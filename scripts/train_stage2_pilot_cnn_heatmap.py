@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--width", type=int, default=32)
     p.add_argument("--eval-interval", type=int, default=1)
     p.add_argument("--eval-batch-size", type=int, default=256)
+    p.add_argument(
+        "--selection-metric",
+        type=str,
+        default="val_pixel_error",
+        choices=["val_loss", "val_pixel_error", "val_center_improve"],
+    )
     p.add_argument("--train-eval-max-samples", type=int, default=2048)
     p.add_argument("--val-eval-max-samples", type=int, default=0)
     p.add_argument("--num-workers", type=int, default=0)
@@ -287,7 +293,16 @@ def main() -> None:
         train_initial = _eval_loader(train_eval_loader)
         val_initial = _eval_loader(val_eval_loader)
 
-    best_val = float("inf")
+    def _selection_score(metrics: dict[str, float | int]) -> float:
+        metric = str(args.selection_metric)
+        if metric == "val_loss":
+            return float(metrics["loss"])
+        if metric == "val_center_improve":
+            return -float(metrics["center_baseline_improve_ratio"])
+        return float(metrics["pixel_error_mean"])
+
+    best_score = float("inf")
+    best_val_loss = float("inf")
     best_path = out_dir / "model_best.pth"
     last_path = out_dir / "model_last.pth"
     loss_trace: list[dict] = []
@@ -324,15 +339,21 @@ def main() -> None:
             val_metrics = _eval_loader(val_eval_loader)
             val_loss = float(val_metrics["loss"])
             val_eval_sec_total += float(time.perf_counter() - t_eval)
-            if val_loss < best_val:
-                best_val = val_loss
-                _save_checkpoint(best_path, model, args, dataset_root, train_ds, val_ds, best_val, ep + 1)
-        _save_checkpoint(last_path, model, args, dataset_root, train_ds, val_ds, best_val, ep + 1)
+            selection_score = _selection_score(val_metrics)
+            if selection_score < best_score:
+                best_score = float(selection_score)
+                best_val_loss = float(val_loss)
+                _save_checkpoint(best_path, model, args, dataset_root, train_ds, val_ds, best_val_loss, ep + 1, best_score)
+        else:
+            selection_score = float("nan")
+        _save_checkpoint(last_path, model, args, dataset_root, train_ds, val_ds, best_val_loss, ep + 1, best_score)
         loss_trace.append(
             {
                 "epoch": int(ep + 1),
                 "train_loss": float(np.mean(batch_losses)) if batch_losses else 0.0,
                 "val_loss": val_loss,
+                "selection_metric": str(args.selection_metric),
+                "selection_score": float(selection_score),
                 "val_metrics": val_metrics,
             }
         )
@@ -379,6 +400,7 @@ def main() -> None:
             "conf_weight": float(args.conf_weight),
             "softargmax_temperature": float(args.softargmax_temperature),
             "decode_method": str(args.decode_method),
+            "selection_metric": str(args.selection_metric),
             "eval_interval": int(eval_interval),
             "eval_batch_size": int(args.eval_batch_size),
             "train_eval_max_samples": int(train_eval_count),
@@ -424,7 +446,17 @@ def main() -> None:
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
-def _save_checkpoint(path: Path, model, args: argparse.Namespace, dataset_root: Path, train_ds, val_ds, best_val: float, epoch: int) -> None:
+def _save_checkpoint(
+    path: Path,
+    model,
+    args: argparse.Namespace,
+    dataset_root: Path,
+    train_ds,
+    val_ds,
+    best_val: float,
+    epoch: int,
+    best_score: float,
+) -> None:
     import torch
 
     torch.save(
@@ -447,6 +479,8 @@ def _save_checkpoint(path: Path, model, args: argparse.Namespace, dataset_root: 
             "decode_method": str(args.decode_method),
             "width": int(args.width),
             "epoch": int(epoch),
+            "selection_metric": str(args.selection_metric),
+            "best_selection_score": float(best_score),
             "best_val_loss": float(best_val),
         },
         path,
