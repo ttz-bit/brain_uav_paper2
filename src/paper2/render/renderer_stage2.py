@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -721,9 +722,17 @@ class Stage2Renderer:
         used_target_ids: set[str] = set()
         used_distractor_ids: set[str] = set()
         bg_category_schedule = self._build_background_category_schedule(split, num_sequences)
+        seq_attempts_by_idx: dict[int, int] = defaultdict(int)
 
         with label_path.open("w", encoding="utf-8") as f:
-            for seq_idx in range(num_sequences):
+            seq_idx = 0
+            while seq_idx < num_sequences:
+                seq_attempts_by_idx[seq_idx] += 1
+                if seq_attempts_by_idx[seq_idx] > 64:
+                    raise RuntimeError(
+                        f"Sequence render exceeded retry budget: split={split}, sequence={seq_idx}, "
+                        f"attempts={seq_attempts_by_idx[seq_idx]}"
+                    )
                 desired_bg_category = bg_category_schedule[seq_idx] if seq_idx < len(bg_category_schedule) else None
                 # Ensure chosen background contains enough water area for maritime rendering.
                 bg = None
@@ -757,10 +766,6 @@ class Stage2Renderer:
                 distractors = self.registry.sample_many("distractor", split, d_num, self.rng)
                 seq_perturb_cfg = self._build_sequence_perturb_cfg(perturb_cfg)
 
-                used_background_ids.add(bg.asset_id)
-                for d in distractors:
-                    used_distractor_ids.add(d.asset_id)
-
                 # Enforce allowed target viewpoints for aerial realism.
                 split_targets = self.registry.get("target", split)
                 allowed_targets = [a for a in split_targets if str(a.category) in allowed_target_categories]
@@ -769,9 +774,11 @@ class Stage2Renderer:
                         f"No allowed target templates in split={split}; expected categories={sorted(allowed_target_categories)}"
                     )
                 target = allowed_targets[int(self.rng.integers(0, len(allowed_targets)))]
-                used_target_ids.add(target.asset_id)
                 target_bgra = read_bgra(target.path)
                 distractor_bgras = [read_bgra(d.path) for d in distractors]
+                seq_used_background_ids = {bg.asset_id}
+                seq_used_target_ids = {target.asset_id}
+                seq_used_distractor_ids = {d.asset_id for d in distractors}
 
                 mode = sample_mode(motion_probs, self.rng)
                 # Start with far-stage dt; the per-frame gsd/dt is still saved in labels.
@@ -804,6 +811,7 @@ class Stage2Renderer:
                 fixed_scale_range = target_cfg.get("fixed_scale_range", [0.14, 0.20])
                 seq_target_scale = float(self.rng.uniform(float(fixed_scale_range[0]), float(fixed_scale_range[1])))
                 scale_mode = str(target_cfg.get("scale_mode", "fixed_sequence"))
+                sequence_retry = False
 
                 for frame_idx, state in enumerate(motion):
                     stage_name = stage_schedule[frame_idx]
@@ -1244,11 +1252,8 @@ class Stage2Renderer:
                                         fallback = alt_fallback
                                         break
                         if fallback is None:
-                            raise RuntimeError(
-                                "Cannot place a valid target before the first valid frame: "
-                                f"split={split}, sequence={seq_idx}, frame={frame_idx}, "
-                                f"background={bg.asset_id}, stage={stage_name}"
-                            )
+                            sequence_retry = True
+                            break
                         tx, ty, land_overlap_ratio, shore_overlap_ratio, pre_vis, truncation_ratio = fallback
 
                     target_patch = _harmonize_overlay_to_background(patch, target_patch, tx, ty, strength=0.35)
@@ -1412,6 +1417,14 @@ class Stage2Renderer:
                         },
                     )
                     f.write(json.dumps(row.to_dict(), ensure_ascii=False) + "\n")
+
+                if sequence_retry:
+                    continue
+
+                used_background_ids.update(seq_used_background_ids)
+                used_target_ids.update(seq_used_target_ids)
+                used_distractor_ids.update(seq_used_distractor_ids)
+                seq_idx += 1
 
         return RenderSplitResult(
             split=split,
