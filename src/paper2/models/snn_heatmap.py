@@ -15,6 +15,16 @@ def _device_key(device: torch.device) -> str:
     return f"{device.type}:{device.index}"
 
 
+def _has_inference_tensor(cached: tuple[torch.Tensor, ...] | None) -> bool:
+    if cached is None:
+        return False
+    for tensor in cached:
+        is_inference = getattr(tensor, "is_inference", None)
+        if callable(is_inference) and bool(is_inference()):
+            return True
+    return False
+
+
 class HeatmapSNN(nn.Module):
     def __init__(
         self,
@@ -116,11 +126,15 @@ def make_gaussian_heatmaps(
     dtype = targets.dtype
     key = (_device_key(device), dtype, size)
     cached = _HEATMAP_GRID_CACHE.get(key)
+    if _has_inference_tensor(cached):
+        _HEATMAP_GRID_CACHE.pop(key, None)
+        cached = None
     if cached is None:
         ys = torch.arange(size, device=device, dtype=dtype).view(1, size, 1)
         xs = torch.arange(size, device=device, dtype=dtype).view(1, 1, size)
-        cached = (ys.clone(), xs.clone())
-        _HEATMAP_GRID_CACHE[key] = cached
+        cached = (ys, xs)
+        if not torch.is_inference_mode_enabled():
+            _HEATMAP_GRID_CACHE[key] = cached
     ys, xs = cached
     cx = targets[:, 0].clamp(0.0, 1.0).view(b, 1, 1) * float(size - 1)
     cy = targets[:, 1].clamp(0.0, 1.0).view(b, 1, 1) * float(size - 1)
@@ -163,14 +177,18 @@ def soft_argmax_2d(
     flat = (logits.view(b, -1) * float(temperature)).softmax(dim=1)
     key = (_device_key(logits.device), logits.dtype, int(h), int(w))
     cached = _SOFTARGMAX_GRID_CACHE.get(key)
+    if _has_inference_tensor(cached):
+        _SOFTARGMAX_GRID_CACHE.pop(key, None)
+        cached = None
     if cached is None:
         ys, xs = torch.meshgrid(
             torch.linspace(0.0, 1.0, h, device=logits.device, dtype=logits.dtype),
             torch.linspace(0.0, 1.0, w, device=logits.device, dtype=logits.dtype),
             indexing="ij",
         )
-        cached = (ys.reshape(1, -1).clone(), xs.reshape(1, -1).clone())
-        _SOFTARGMAX_GRID_CACHE[key] = cached
+        cached = (ys.reshape(1, -1), xs.reshape(1, -1))
+        if not torch.is_inference_mode_enabled():
+            _SOFTARGMAX_GRID_CACHE[key] = cached
     ys_flat, xs_flat = cached
     x = (flat * xs_flat).sum(dim=1)
     y = (flat * ys_flat).sum(dim=1)
