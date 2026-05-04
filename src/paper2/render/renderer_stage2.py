@@ -1131,6 +1131,109 @@ class Stage2Renderer:
                             tries=1024,
                         )
                         if fallback is None:
+                            scale_min, scale_max = [float(x) for x in stage_cfg["target_scale_range"]]
+                            scale_candidates = [
+                                float(target_scale),
+                                float(max(scale_min, target_scale * 0.9)),
+                                float(max(scale_min, target_scale * 0.8)),
+                                float(scale_min),
+                            ]
+                            scale_candidates = [s for i, s in enumerate(scale_candidates) if s > 0.0 and s not in scale_candidates[:i]]
+                            for alt_scale in scale_candidates:
+                                alt_patch = resize_bgra_with_scale(target_bgra, alt_scale, image_size=image_size)
+                                alt_patch = rotate_bgra(alt_patch, angle_deg)
+                                alt_fallback = _find_valid_target_center(
+                                    target_water=target_water,
+                                    water_mask=water,
+                                    land_mask=land_mask,
+                                    shore_mask=shore_mask,
+                                    target_patch=alt_patch,
+                                    rng=self.rng,
+                                    image_size=image_size,
+                                    min_visibility=min_visibility,
+                                    max_truncation_ratio=max_truncation_ratio,
+                                    max_land_overlap=max_land_overlap,
+                                    max_shore_overlap=max_shore_overlap,
+                                    require_water_mask=require_water_mask,
+                                    tries=1024,
+                                )
+                                if alt_fallback is not None:
+                                    target_scale = float(alt_scale)
+                                    target_patch = alt_patch
+                                    fallback = alt_fallback
+                                    break
+                        if fallback is None:
+                            tgt_bg_x, tgt_bg_y = world_to_background_px(
+                                state.x, state.y, world_size_m, bg_img.shape[1], bg_img.shape[0]
+                            )
+                            nwx, nwy = _snap_to_water(
+                                bg_target_water_global,
+                                tgt_bg_x,
+                                tgt_bg_y,
+                                max_radius=max(bg_img.shape[0], bg_img.shape[1]),
+                            )
+                            crop_center_x, crop_center_y = background_px_to_world(
+                                nwx, nwy, world_size_m, bg_img.shape[1], bg_img.shape[0]
+                            )
+                            bg_cx, bg_cy = nwx, nwy
+                            patch = _extract_patch(bg_img, bg_cx, bg_cy, image_size)
+                            water = _extract_patch(bg_water_global, bg_cx, bg_cy, image_size)
+                            if water.ndim == 3:
+                                water = water[:, :, 0]
+                            water = water.astype(np.uint8)
+                            target_water = _extract_patch(bg_target_water_global, bg_cx, bg_cy, image_size)
+                            if target_water.ndim == 3:
+                                target_water = target_water[:, :, 0]
+                            target_water = target_water.astype(np.uint8)
+                            tx, ty = world_to_image(state.x, state.y, crop_center_x, crop_center_y, gsd, image_size)
+                            fallback = _find_valid_target_center(
+                                target_water=target_water,
+                                water_mask=water,
+                                land_mask=((water > 0).astype(np.uint8) == 0).astype(np.uint8) * 255,
+                                shore_mask=(
+                                    ((water > 0) & (cv2.distanceTransform((water > 0).astype(np.uint8), cv2.DIST_L2, 3) < float(shoreline_margin))).astype(np.uint8)
+                                ) * 255,
+                                target_patch=target_patch,
+                                rng=self.rng,
+                                image_size=image_size,
+                                min_visibility=min_visibility,
+                                max_truncation_ratio=max_truncation_ratio,
+                                max_land_overlap=max_land_overlap,
+                                max_shore_overlap=max_shore_overlap,
+                                require_water_mask=require_water_mask,
+                                tries=1024,
+                            )
+                            if fallback is None:
+                                for alt_scale in scale_candidates:
+                                    alt_patch = resize_bgra_with_scale(target_bgra, alt_scale, image_size=image_size)
+                                    alt_patch = rotate_bgra(alt_patch, angle_deg)
+                                    alt_fallback = _find_valid_target_center(
+                                        target_water=target_water,
+                                        water_mask=water,
+                                        land_mask=((water > 0).astype(np.uint8) == 0).astype(np.uint8) * 255,
+                                        shore_mask=(
+                                            (
+                                                (water > 0)
+                                                & (cv2.distanceTransform((water > 0).astype(np.uint8), cv2.DIST_L2, 3) < float(shoreline_margin))
+                                            ).astype(np.uint8)
+                                        )
+                                        * 255,
+                                        target_patch=alt_patch,
+                                        rng=self.rng,
+                                        image_size=image_size,
+                                        min_visibility=min_visibility,
+                                        max_truncation_ratio=max_truncation_ratio,
+                                        max_land_overlap=max_land_overlap,
+                                        max_shore_overlap=max_shore_overlap,
+                                        require_water_mask=require_water_mask,
+                                        tries=1024,
+                                    )
+                                    if alt_fallback is not None:
+                                        target_scale = float(alt_scale)
+                                        target_patch = alt_patch
+                                        fallback = alt_fallback
+                                        break
+                        if fallback is None:
                             raise RuntimeError(
                                 "Cannot place a valid target before the first valid frame: "
                                 f"split={split}, sequence={seq_idx}, frame={frame_idx}, "
