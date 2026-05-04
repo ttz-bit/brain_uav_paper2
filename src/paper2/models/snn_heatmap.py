@@ -119,7 +119,7 @@ def make_gaussian_heatmaps(
     if cached is None:
         ys = torch.arange(size, device=device, dtype=dtype).view(1, size, 1)
         xs = torch.arange(size, device=device, dtype=dtype).view(1, 1, size)
-        cached = (ys, xs)
+        cached = (ys.clone(), xs.clone())
         _HEATMAP_GRID_CACHE[key] = cached
     ys, xs = cached
     cx = targets[:, 0].clamp(0.0, 1.0).view(b, 1, 1) * float(size - 1)
@@ -169,7 +169,7 @@ def soft_argmax_2d(
             torch.linspace(0.0, 1.0, w, device=logits.device, dtype=logits.dtype),
             indexing="ij",
         )
-        cached = (ys.reshape(1, -1), xs.reshape(1, -1))
+        cached = (ys.reshape(1, -1).clone(), xs.reshape(1, -1).clone())
         _SOFTARGMAX_GRID_CACHE[key] = cached
     ys_flat, xs_flat = cached
     x = (flat * xs_flat).sum(dim=1)
