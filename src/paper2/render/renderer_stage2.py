@@ -690,9 +690,10 @@ class Stage2Renderer:
 
     def render_split(self, split: str, num_sequences: int) -> RenderSplitResult:
         ds_name = str(self.output_root.name)
-        frames_per_sequence = int(self.cfg["dataset"]["frames_per_sequence"])
-        image_size = int(self.cfg["dataset"]["image_size"])
-        world_size_m = float(self.cfg["dataset"]["world_size_m"])
+        dataset_cfg = dict(self.cfg["dataset"])
+        frames_per_sequence = int(dataset_cfg["frames_per_sequence"])
+        image_size = int(dataset_cfg["image_size"])
+        world_size_m = float(dataset_cfg["world_size_m"])
         motion_probs = dict(self.cfg["motion_modes"])
         perturb_cfg = dict(self.cfg["perturbations"])
         distractor_cfg = dict(self.cfg["distractors"])
@@ -1385,7 +1386,7 @@ class Stage2Renderer:
                     abs_img_path.parent.mkdir(parents=True, exist_ok=True)
                     cv2.imwrite(str(abs_img_path), patch, PNG_WRITE_PARAMS)
                     rel_water_mask_path = ""
-                    if bool(ds_cfg.get("write_water_mask_crops", False)):
+                    if bool(dataset_cfg.get("write_water_mask_crops", False)):
                         rel_water_mask_path = self._water_mask_rel_path(split, seq_idx, frame_idx)
                         abs_water_mask_path = self.project_root / Path(rel_water_mask_path)
                         abs_water_mask_path.parent.mkdir(parents=True, exist_ok=True)
