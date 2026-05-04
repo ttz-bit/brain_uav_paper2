@@ -515,6 +515,14 @@ class Stage2Renderer:
             # Fallback to absolute path when output_root is outside project_root.
             return str(image_abs.resolve()).replace("\\", "/")
 
+    def _water_mask_rel_path(self, split: str, seq_id: int, frame_id: int) -> str:
+        mask_abs = self.output_root / "water_masks" / split / f"seq_{seq_id:04d}_frame_{frame_id:04d}.png"
+        try:
+            rel = mask_abs.resolve().relative_to(self.project_root.resolve())
+            return str(rel).replace("\\", "/")
+        except Exception:
+            return str(mask_abs.resolve()).replace("\\", "/")
+
     def _read_background(self, asset: AssetRecord) -> np.ndarray:
         img = cv2.imread(str(asset.path), cv2.IMREAD_COLOR)
         if img is None:
@@ -806,6 +814,8 @@ class Stage2Renderer:
                 prev_valid_trunc: float | None = None
                 prev_valid_angle: float | None = None
                 prev_valid_scale: float | None = None
+                prev_valid_water: np.ndarray | None = None
+                prev_valid_crop_center: tuple[float, float] | None = None
                 stage_schedule = self._stage_schedule(frames_per_sequence)
                 # Keep target scale stable per sequence by default (more realistic temporal continuity).
                 fixed_scale_range = target_cfg.get("fixed_scale_range", [0.14, 0.20])
@@ -1292,6 +1302,13 @@ class Stage2Renderer:
                         truncation_ratio = float(prev_valid_trunc if prev_valid_trunc is not None else 0.0)
                         angle_deg = float(prev_valid_angle if prev_valid_angle is not None else angle_deg)
                         target_scale = float(prev_valid_scale if prev_valid_scale is not None else target_scale)
+                        if prev_valid_water is not None:
+                            water = prev_valid_water.copy()
+                            distractor_water = _water_with_clearance(water, min_clearance_px=2)
+                            if self._mask_ratio(distractor_water) < 0.01:
+                                distractor_water = water
+                        if prev_valid_crop_center is not None:
+                            crop_center_x, crop_center_y = prev_valid_crop_center
                         obs_valid = True
 
                     if not bool(obs_valid):
@@ -1313,6 +1330,8 @@ class Stage2Renderer:
                         prev_valid_trunc = float(truncation_ratio)
                         prev_valid_angle = float(angle_deg)
                         prev_valid_scale = float(target_scale)
+                        prev_valid_water = water.copy()
+                        prev_valid_crop_center = (float(crop_center_x), float(crop_center_y))
 
                     prev_target_xy = (tx, ty)
                     prev_crop_center = (crop_center_x, crop_center_y)
@@ -1320,6 +1339,7 @@ class Stage2Renderer:
                     prev_angle_deg = angle_deg
 
                     d_ids: list[str] = []
+                    d_bboxes: list[list[float]] = []
                     placed_bboxes: list[tuple[int, int, int, int]] = [bbox]
                     d_min, d_max = distractor_cfg["scale_range"]
                     for d_asset, d_img in zip(distractors, distractor_bgras):
@@ -1351,6 +1371,7 @@ class Stage2Renderer:
                             d_patch = _harmonize_overlay_to_background(patch, d_patch, d_center_x, d_center_y, strength=0.30)
                             alpha_blend_center(patch, d_patch, d_center_x, d_center_y)
                             d_ids.append(d_asset.asset_id)
+                            d_bboxes.append([float(d_bbox[0]), float(d_bbox[1]), float(d_bbox[2]), float(d_bbox[3])])
                             placed_bboxes.append(d_bbox)
                             placed = True
                             break
@@ -1363,6 +1384,12 @@ class Stage2Renderer:
                     abs_img_path = self.project_root / Path(rel_img_path)
                     abs_img_path.parent.mkdir(parents=True, exist_ok=True)
                     cv2.imwrite(str(abs_img_path), patch, PNG_WRITE_PARAMS)
+                    rel_water_mask_path = ""
+                    if bool(ds_cfg.get("write_water_mask_crops", False)):
+                        rel_water_mask_path = self._water_mask_rel_path(split, seq_idx, frame_idx)
+                        abs_water_mask_path = self.project_root / Path(rel_water_mask_path)
+                        abs_water_mask_path.parent.mkdir(parents=True, exist_ok=True)
+                        cv2.imwrite(str(abs_water_mask_path), water, PNG_WRITE_PARAMS)
 
                     row = RenderedFrameRecord(
                         image_path=str(rel_img_path).replace("\\", "/"),
@@ -1405,6 +1432,8 @@ class Stage2Renderer:
                             "center_x": float(tx),
                             "center_y": float(ty),
                             "bbox_xywh": [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
+                            "distractor_bboxes_xywh": d_bboxes,
+                            "water_mask_crop_path": rel_water_mask_path,
                             "visibility": float(vis),
                             "gsd": float(gsd),
                             "perception_stage": str(stage_name),

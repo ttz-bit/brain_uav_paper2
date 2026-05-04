@@ -75,6 +75,15 @@ class Stage2RenderedDataset:
         meta = dict(row.get("meta", {}))
         if not self.load_water_mask:
             return None
+        direct_crop_path = self._resolve_meta_path(meta.get("water_mask_crop_path"))
+        if direct_crop_path is not None and direct_crop_path.exists():
+            crop = cv2.imread(str(direct_crop_path), cv2.IMREAD_GRAYSCALE)
+            if crop is None:
+                return None
+            h, w = int(image_shape[0]), int(image_shape[1])
+            if crop.shape[:2] != (h, w):
+                crop = cv2.resize(crop, (w, h), interpolation=cv2.INTER_NEAREST)
+            return crop
         crop_origin = (
             meta.get("crop_origin_bg_px")
             or meta.get("crop_origin_xy")

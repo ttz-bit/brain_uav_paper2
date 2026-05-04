@@ -155,26 +155,36 @@ def _metadata_coverage(ds, *, project_root: Path) -> dict[str, float | int]:
     total = len(rows)
     crop_ready = 0
     water_ready = 0
-    distractor_rows = 0
+    distractor_asset_rows = 0
+    distractor_bbox_rows = 0
     for row in rows:
         meta = dict(row.get("meta", {}))
         if _crop_origin_from_meta(meta) is not None:
             crop_ready += 1
-        mask_path = _resolve_optional_path(meta.get("water_mask_path"), project_root)
-        if mask_path is not None and mask_path.exists():
+        crop_mask_path = _resolve_optional_path(meta.get("water_mask_crop_path"), project_root)
+        full_mask_path = _resolve_optional_path(meta.get("water_mask_path"), project_root)
+        if (crop_mask_path is not None and crop_mask_path.exists()) or (
+            _crop_origin_from_meta(meta) is not None and full_mask_path is not None and full_mask_path.exists()
+        ):
             water_ready += 1
+        if len(list(row.get("distractor_asset_ids", []))) > 0:
+            distractor_asset_rows += 1
         if len(list(meta.get("distractor_bboxes_xywh", []))) > 0:
-            distractor_rows += 1
+            distractor_bbox_rows += 1
     return {
         "total_rows": int(total),
         "crop_origin_rows": int(crop_ready),
         "crop_origin_missing": int(total - crop_ready),
         "water_mask_rows": int(water_ready),
         "water_mask_missing": int(total - water_ready),
-        "distractor_rows": int(distractor_rows),
+        "distractor_asset_rows": int(distractor_asset_rows),
+        "distractor_bbox_rows": int(distractor_bbox_rows),
+        "distractor_rows": int(distractor_bbox_rows),
         "crop_origin_coverage": float(crop_ready / max(1, total)),
         "water_mask_coverage": float(water_ready / max(1, total)),
-        "distractor_row_ratio": float(distractor_rows / max(1, total)),
+        "distractor_asset_row_ratio": float(distractor_asset_rows / max(1, total)),
+        "distractor_bbox_row_ratio": float(distractor_bbox_rows / max(1, total)),
+        "distractor_row_ratio": float(distractor_bbox_rows / max(1, total)),
     }
 
 
@@ -381,7 +391,15 @@ def main() -> None:
         raise RuntimeError(
             "Water-mask supervision requested but crop/mask metadata is incomplete. "
             f"train_missing={train_meta['water_mask_missing']}, val_missing={val_meta['water_mask_missing']}. "
-            "Re-render the dataset with crop_origin_bg_px / water_mask_path populated."
+            "Re-render the dataset with water_mask_crop_path populated, or with crop_origin_bg_px / water_mask_path populated."
+        )
+    if float(args.distractor_repel_weight) > 0.0 and (
+        train_meta["distractor_bbox_rows"] <= 0 or val_meta["distractor_bbox_rows"] <= 0
+    ):
+        raise RuntimeError(
+            "Distractor repel supervision requested but distractor bbox metadata is unavailable. "
+            f"train_bbox_rows={train_meta['distractor_bbox_rows']}, val_bbox_rows={val_meta['distractor_bbox_rows']}. "
+            "Re-render the dataset with distractor_bboxes_xywh populated, or rerun with --distractor-repel-weight 0."
         )
 
     class _RenderedTorchDataset(Dataset):
@@ -825,6 +843,12 @@ def main() -> None:
             "val": val_meta,
             "water_mask_supervision_enabled": bool(load_water_mask),
             "water_logit_constraint_enabled": bool(water_constraint),
+            "water_mask_metadata_complete": bool(
+                train_meta["water_mask_missing"] == 0 and val_meta["water_mask_missing"] == 0
+            ),
+            "distractor_bbox_metadata_available": bool(
+                train_meta["distractor_bbox_rows"] > 0 and val_meta["distractor_bbox_rows"] > 0
+            ),
         },
         "device": str(device),
         "model": {
@@ -893,9 +917,13 @@ def main() -> None:
         },
         "metrics": {
             "train_initial_loss": float(train_initial["loss"]),
+            "train_initial_pixel_error_mean": float(train_initial["pixel_error_mean"]),
+            "train_initial_center_baseline_improve_ratio": float(train_initial["center_baseline_improve_ratio"]),
             "train_final_loss": float(train_final["loss"]),
             "train_improve_ratio": float(train_improve_ratio),
             "val_initial_loss": float(val_initial["loss"]),
+            "val_initial_pixel_error_mean": float(val_initial["pixel_error_mean"]),
+            "val_initial_center_baseline_improve_ratio": float(val_initial["center_baseline_improve_ratio"]),
             "val_final_loss": float(val_final["loss"]),
             "val_improve_ratio": float(val_improve_ratio),
             "train_final_pixel_error_mean": float(train_final["pixel_error_mean"]),
@@ -916,8 +944,14 @@ def main() -> None:
             "val_beats_center_baseline": bool(val_final["center_baseline_improve_ratio"] > 0.0),
             "val_prediction_not_constant": bool(val_final["rounded_unique_pred_xy"] > 5),
             "water_mask_metadata_complete": bool(
-                (not water_constraint)
-                or (train_meta["water_mask_missing"] == 0 and val_meta["water_mask_missing"] == 0)
+                train_meta["water_mask_missing"] == 0 and val_meta["water_mask_missing"] == 0
+            ),
+            "requested_supervision_metadata_available": bool(
+                ((not water_constraint) or (train_meta["water_mask_missing"] == 0 and val_meta["water_mask_missing"] == 0))
+                and (
+                    float(args.distractor_repel_weight) <= 0.0
+                    or (train_meta["distractor_bbox_rows"] > 0 and val_meta["distractor_bbox_rows"] > 0)
+                )
             ),
         },
         "artifacts": {

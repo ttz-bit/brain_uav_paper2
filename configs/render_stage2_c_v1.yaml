@@ -4,6 +4,7 @@ dataset:
   heatmap_size: 64
   frames_per_sequence: 40
   world_size_m: 4000.0
+  write_water_mask_crops: true
 
 stage_ratios:
   far: 0.15

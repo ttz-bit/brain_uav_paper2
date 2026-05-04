@@ -181,6 +181,55 @@ def test_stage2_rendered_dataset_accepts_crop_origin_aliases(tmp_path):
     assert int(sample.water_mask[-1, -1]) == 255
 
 
+def test_stage2_rendered_dataset_accepts_direct_water_mask_crop(tmp_path):
+    root = tmp_path / "dataset"
+    image_dir = root / "images" / "train"
+    label_dir = root / "labels"
+    crop_dir = root / "water_masks" / "train"
+    image_dir.mkdir(parents=True)
+    label_dir.mkdir(parents=True)
+    crop_dir.mkdir(parents=True)
+
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+    cv2.imwrite(str(image_dir / "sample.png"), image)
+
+    mask_crop = np.zeros((4, 4), dtype=np.uint8)
+    mask_crop[1:3, 1:3] = 255
+    cv2.imwrite(str(crop_dir / "sample_mask.png"), mask_crop)
+
+    row = {
+        "image_path": "images/train/sample.png",
+        "split": "train",
+        "sequence_id": "train_0000",
+        "frame_id": "0000",
+        "stage": "far",
+        "target_center_px": [2.0, 2.0],
+        "bbox_xywh": [1.0, 1.0, 2.0, 2.0],
+        "visibility": 1.0,
+        "background_asset_id": "bg_1",
+        "target_asset_id": "target_1",
+        "distractor_asset_ids": [],
+        "motion_mode": "cv",
+        "land_overlap_ratio": 0.0,
+        "shore_buffer_overlap_ratio": 0.0,
+        "scale_px": 2.0,
+        "angle_deg": 0.0,
+        "obs_valid": True,
+        "meta": {
+            "water_mask_crop_path": "water_masks/train/sample_mask.png",
+            "target_state_world": {"x": 0.0, "y": 0.0},
+        },
+    }
+    (label_dir / "train.jsonl").write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    ds = build_stage2_rendered_dataset(root=root, split="train", project_root=root, load_water_mask=True)
+    sample = ds[0]
+    assert sample.water_mask is not None
+    assert sample.water_mask.shape == (4, 4)
+    assert int(sample.water_mask[1, 1]) == 255
+    assert int(sample.water_mask[0, 0]) == 0
+
+
 def test_distractor_track_advances_without_collision_or_land(tmp_path):
     mask = np.ones((24, 24), dtype=np.uint8) * 255
     mask[:2, :] = 0
