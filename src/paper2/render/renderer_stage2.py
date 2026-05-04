@@ -122,6 +122,15 @@ def _water_with_clearance(mask_u8: np.ndarray, min_clearance_px: int) -> np.ndar
     return out
 
 
+def _frame_semantic_masks(water: np.ndarray, shoreline_margin: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    water_binary = (water > 0).astype(np.uint8)
+    land_mask = ((water_binary == 0).astype(np.uint8)) * 255
+    shore_mask = (
+        ((water_binary > 0) & (cv2.distanceTransform(water_binary, cv2.DIST_L2, 3) < float(shoreline_margin))).astype(np.uint8)
+    ) * 255
+    return water_binary, land_mask, shore_mask
+
+
 def _harmonize_overlay_to_background(
     bg_bgr: np.ndarray,
     overlay_bgra: np.ndarray,
@@ -1000,9 +1009,10 @@ class Stage2Renderer:
                                 tx, ty = px, py
                             # else: keep tx,ty as-is to avoid sudden teleports.
 
-                    water_binary = (water > 0).astype(np.uint8)
-                    land_mask = ((water_binary == 0).astype(np.uint8)) * 255
-                    shore_mask = (((water_binary > 0) & (cv2.distanceTransform(water_binary, cv2.DIST_L2, 3) < float(shoreline_margin))).astype(np.uint8)) * 255
+                    _, land_mask, shore_mask = _frame_semantic_masks(water, shoreline_margin)
+                    distractor_water = _water_with_clearance(water, min_clearance_px=2)
+                    if self._mask_ratio(distractor_water) < 0.01:
+                        distractor_water = water
 
                     # Placement retry under hard semantic constraints.
                     for _ in range(12):
@@ -1192,14 +1202,13 @@ class Stage2Renderer:
                             if target_water.ndim == 3:
                                 target_water = target_water[:, :, 0]
                             target_water = target_water.astype(np.uint8)
+                            _, land_mask, shore_mask = _frame_semantic_masks(water, shoreline_margin)
                             tx, ty = world_to_image(state.x, state.y, crop_center_x, crop_center_y, gsd, image_size)
                             fallback = _find_valid_target_center(
                                 target_water=target_water,
                                 water_mask=water,
-                                land_mask=((water > 0).astype(np.uint8) == 0).astype(np.uint8) * 255,
-                                shore_mask=(
-                                    ((water > 0) & (cv2.distanceTransform((water > 0).astype(np.uint8), cv2.DIST_L2, 3) < float(shoreline_margin))).astype(np.uint8)
-                                ) * 255,
+                                land_mask=land_mask,
+                                shore_mask=shore_mask,
                                 target_patch=target_patch,
                                 rng=self.rng,
                                 image_size=image_size,
@@ -1217,14 +1226,8 @@ class Stage2Renderer:
                                     alt_fallback = _find_valid_target_center(
                                         target_water=target_water,
                                         water_mask=water,
-                                        land_mask=((water > 0).astype(np.uint8) == 0).astype(np.uint8) * 255,
-                                        shore_mask=(
-                                            (
-                                                (water > 0)
-                                                & (cv2.distanceTransform((water > 0).astype(np.uint8), cv2.DIST_L2, 3) < float(shoreline_margin))
-                                            ).astype(np.uint8)
-                                        )
-                                        * 255,
+                                        land_mask=land_mask,
+                                        shore_mask=shore_mask,
                                         target_patch=alt_patch,
                                         rng=self.rng,
                                         image_size=image_size,
@@ -1322,9 +1325,7 @@ class Stage2Renderer:
                             p = _random_water_point(water, self.rng)
                             if p is None:
                                 break
-                            d_water = _water_with_clearance(water, min_clearance_px=2)
-                            if self._mask_ratio(d_water) < 0.01:
-                                d_water = water
+                            d_water = distractor_water
                             d_center_x, d_center_y = _sample_water_center(
                                 d_water,
                                 d_patch,
