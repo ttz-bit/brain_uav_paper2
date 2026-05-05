@@ -1319,6 +1319,9 @@ class Stage2Renderer:
                         obs_valid = True
 
                     if not bool(obs_valid):
+                        if prev_valid_state is None:
+                            sequence_retry = True
+                            break
                         raise RuntimeError(
                             "Renderer produced an invalid target observation after all fallbacks: "
                             f"split={split}, sequence={seq_idx}, frame={frame_idx}, background={bg.asset_id}, "
