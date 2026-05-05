@@ -82,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--terminal-controller-range-km", type=float, default=80.0)
     p.add_argument("--terminal-controller-blend", type=float, default=0.5)
     p.add_argument("--vision-input-size", type=int, default=0)
+    p.add_argument("--visual-audit-count", type=int, default=16)
     p.add_argument("--out-dir", type=str, default="outputs/phase3_vision_td3/cnn_td3_snn_hard")
     return p.parse_args()
 
@@ -214,6 +215,48 @@ def _live_frame_to_phase3_row(
         "target_center_px": [float(target_center_px[0]), float(target_center_px[1])],
         "meta": meta,
     }
+
+
+def _sample_gt_center_px(row: dict[str, Any]) -> tuple[float, float] | None:
+    if "target_center_px" in row and isinstance(row["target_center_px"], (list, tuple)) and len(row["target_center_px"]) >= 2:
+        return float(row["target_center_px"][0]), float(row["target_center_px"][1])
+    meta = dict(row.get("meta", {}))
+    if "center_x" in meta and "center_y" in meta:
+        return float(meta["center_x"]), float(meta["center_y"])
+    if "target_center_px" in meta and isinstance(meta["target_center_px"], (list, tuple)) and len(meta["target_center_px"]) >= 2:
+        return float(meta["target_center_px"][0]), float(meta["target_center_px"][1])
+    return None
+
+
+def _write_vision_audit_image(
+    *,
+    image_bgr: np.ndarray,
+    row: dict[str, Any],
+    pred_center_px: tuple[float, float],
+    stage: str,
+    episode: int,
+    step: int,
+    out_dir: Path,
+) -> tuple[str, float]:
+    gt = _sample_gt_center_px(row)
+    if gt is None:
+        return "", float("nan")
+    px = float(pred_center_px[0])
+    py = float(pred_center_px[1])
+    gx = float(gt[0])
+    gy = float(gt[1])
+    err_px = float(np.hypot(px - gx, py - gy))
+
+    vis = image_bgr.copy()
+    cv2.circle(vis, (int(round(gx)), int(round(gy))), 5, (0, 255, 0), -1, cv2.LINE_AA)
+    cv2.circle(vis, (int(round(px)), int(round(py))), 5, (0, 0, 255), -1, cv2.LINE_AA)
+    cv2.line(vis, (int(round(gx)), int(round(gy))), (int(round(px)), int(round(py))), (255, 255, 0), 1, cv2.LINE_AA)
+    label = f"ep={episode:03d} step={step:04d} {stage} gt=green pred=red err={err_px:.1f}px"
+    cv2.putText(vis, label, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"ep{episode:03d}_step{step:04d}_{stage}_err{err_px:06.2f}px.jpg"
+    cv2.imwrite(str(path), vis)
+    return str(path), err_px
 
 
 def _make_cnn_model(nn: Any):
@@ -733,6 +776,8 @@ def main() -> None:
 
     all_rows: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
+    visual_audit_dir = out_dir / "visuals" / "vision_audit"
+    visual_audit_saved = 0
     policy: Paper1TD3Policy | None = None
     policy_diag: dict[str, Any] = {}
     env_source = "unknown"
@@ -853,6 +898,21 @@ def main() -> None:
                     done_reason = "estimate_goal_reached"
             violation = _zone_violation(aircraft_pos, zones, include_safety_margin=False)
             safety_violation = _zone_violation(aircraft_pos, zones, include_safety_margin=True)
+            vision_audit_path = ""
+            vision_pixel_error_px = float("nan")
+            if int(args.visual_audit_count) > 0 and visual_audit_saved < int(args.visual_audit_count):
+                vision_audit_path, vision_pixel_error_px = _write_vision_audit_image(
+                    image_bgr=image,
+                    row=sample_row,
+                    pred_center_px=(pred_x, pred_y),
+                    stage=stage,
+                    episode=ep,
+                    step=step_idx,
+                    out_dir=visual_audit_dir,
+                )
+                if vision_audit_path:
+                    visual_audit_saved += 1
+            gt_center = _sample_gt_center_px(sample_row)
             row = {
                 "episode": int(ep),
                 "step": int(step_idx),
@@ -865,8 +925,11 @@ def main() -> None:
                 "vision_stage": stage,
                 "vision_sequence_id": str(sample_row.get("sequence_id")),
                 "vision_frame_id": str(sample_row.get("frame_id")),
+                "vision_gt_x": float(gt_center[0]) if gt_center is not None else float("nan"),
+                "vision_gt_y": float(gt_center[1]) if gt_center is not None else float("nan"),
                 "vision_pred_x": float(pred_x),
                 "vision_pred_y": float(pred_y),
+                "vision_pixel_error_px": float(vision_pixel_error_px),
                 "vision_conf": float(pred_conf),
                 "vision_gate_accepted": bool(gate_accepted),
                 "vision_gate_innovation_km": float(gate_innovation_km),
@@ -892,6 +955,7 @@ def main() -> None:
                 "done": bool(done),
                 "done_reason": str(done_reason),
                 "reward": float(step_result.reward),
+                "vision_audit_image_path": str(vision_audit_path),
             }
             ep_rows.append(row)
             all_rows.append(row)
@@ -925,6 +989,7 @@ def main() -> None:
     final_ranges = np.asarray([float(s["final_range_km"]) for s in summaries], dtype=float)
     est_errors = np.asarray([float(s["mean_est_error_km"]) for s in summaries], dtype=float)
     vision_errors = np.asarray([float(s["mean_vision_error_km"]) for s in summaries], dtype=float)
+    vision_px_errors = np.asarray([float(r["vision_pixel_error_px"]) for r in all_rows if np.isfinite(float(r.get("vision_pixel_error_px", float("nan"))))], dtype=float)
     gate_rejections = int(sum(1 for r in all_rows if not bool(r.get("vision_gate_accepted", True))))
     violation_counts = np.asarray([int(s["zone_violation_count"]) for s in summaries], dtype=int)
     safety_violation_counts = np.asarray([int(s["safety_margin_violation_count"]) for s in summaries], dtype=int)
@@ -981,6 +1046,8 @@ def main() -> None:
             "final_range_mean_km": float(final_ranges.mean()) if final_ranges.size else 0.0,
             "target_est_error_mean_km": float(est_errors.mean()) if est_errors.size else 0.0,
             "vision_error_mean_km": float(vision_errors.mean()) if vision_errors.size else 0.0,
+            "vision_pixel_error_mean_px": float(vision_px_errors.mean()) if vision_px_errors.size else 0.0,
+            "vision_pixel_error_p90_px": float(np.percentile(vision_px_errors, 90)) if vision_px_errors.size else 0.0,
             "vision_gate_rejection_count": int(gate_rejections),
             "vision_gate_rejection_rate": float(gate_rejections / max(1, len(all_rows))),
             "zone_violation_total": int(violation_counts.sum()) if violation_counts.size else 0,
@@ -1003,6 +1070,7 @@ def main() -> None:
             "trajectory_path": str(traj_path),
             "summary_csv_path": str(csv_path),
             "live_render_assets_dir": str((out_dir / "_live_render_assets")) if not replay_mode else "",
+            "vision_audit_dir": str(visual_audit_dir),
         },
     }
     report["accepted"] = bool(
