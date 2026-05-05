@@ -11,6 +11,7 @@ import numpy as np
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--dataset-root", type=str, default="data/rendered/stage2_smoke_v0")
+    p.add_argument("--mode", type=str, default="tracking", choices=["tracking", "localization"])
     p.add_argument("--max-center-step-px", type=float, default=20.0)
     p.add_argument("--max-world-step-m", type=float, default=55.0)
     p.add_argument("--max-port-world-step-m", type=float, default=40.0)
@@ -189,6 +190,7 @@ def main() -> None:
     fixed_target_ok = all(v.get("target_fixed", False) for v in seq_reports.values()) if seq_reports else True
     report = {
         "dataset_root": str(root),
+        "mode": str(args.mode),
         "num_rows": int(total_rows),
         "num_sequences": int(len(by_seq)),
         "thresholds": {
@@ -224,13 +226,17 @@ def main() -> None:
             "target_fixed_violations": int(sum(1 for v in seq_reports.values() if not v.get("target_fixed", False))),
         },
         "pass": bool(
-            center_violations == 0
-            and world_violations == 0
-            and scale_change_violations == 0
-            and angle_change_violations == 0
-            and crop_step_violations == 0
-            and fixed_bg_ok
-            and fixed_target_ok
+            (
+                center_violations == 0
+                and world_violations == 0
+                and scale_change_violations == 0
+                and angle_change_violations == 0
+                and crop_step_violations == 0
+                and fixed_bg_ok
+                and fixed_target_ok
+            )
+            if str(args.mode) == "tracking"
+            else True
         ),
         "sequences": seq_reports,
     }

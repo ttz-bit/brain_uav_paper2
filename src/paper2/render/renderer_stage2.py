@@ -1272,6 +1272,7 @@ class Stage2Renderer:
 
                     target_patch = _harmonize_overlay_to_background(patch, target_patch, tx, ty, strength=0.35)
                     bbox, vis = alpha_blend_center(patch, target_patch, tx, ty)
+                    truncation_ratio = max(0.0, 1.0 - float(vis))
                     obs_valid = (
                         (not require_water_mask or _alpha_water_ratio(water, target_patch, tx, ty) >= 0.96)
                         and float(land_overlap_ratio) <= float(max_land_overlap)
