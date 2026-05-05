@@ -16,8 +16,11 @@ from paper2.env_adapter.paper1_bridge import Paper1EnvBridge
 from paper2.env_adapter.phase3_target_motion import propagate_phase3_target_truth, sample_phase3_initial_target
 from paper2.env_adapter.world_frame import paper2_xyz_to_paper1_xyz
 from paper2.paper1_method.curriculum import parse_curriculum_mix
+from paper2.render.asset_registry import AssetRegistry, load_asset_inventory
+from paper2.render.coordinate_mapper import WorldState
 from paper2.models.cnn_heatmap import HeatmapCNN
 from paper2.models.snn_heatmap import HeatmapSNN, peak_argmax_2d, soft_argmax_2d
+from paper2.render.renderer_stage2 import Stage2Renderer
 from paper2.planning.paper1_td3_policy import Paper1TD3Policy
 from paper2.tracking.kalman import ConstantVelocityKalmanFilter
 from paper2.tracking.vision_to_estimate import image_point_to_world_xy, vision_observation_to_target_estimate
@@ -27,6 +30,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=str, default="configs/env.yaml")
     p.add_argument("--dataset-root", type=str, required=True)
+    p.add_argument("--vision-source", choices=["replay_dataset", "live_render"], default="replay_dataset")
+    p.add_argument("--render-config", type=str, default="configs/render_stage2_c_v1.yaml")
+    p.add_argument("--render-split", choices=["train", "val", "test"], default="test")
     p.add_argument("--eval-split", choices=["train", "val", "test"], default="test")
     p.add_argument("--vision-weights", type=str, required=True)
     p.add_argument("--td3-checkpoint", type=str, required=True)
@@ -120,6 +126,18 @@ def _resolve_image_path(path_text: str, project_root: Path) -> Path:
     if path.is_absolute():
         return path
     return project_root / path
+
+
+def _target_truth_to_world_state(truth: TargetTruthState) -> WorldState:
+    pos = np.asarray(truth.pos_world, dtype=float).reshape(-1)
+    vel = np.asarray(truth.vel_world, dtype=float).reshape(-1)
+    return WorldState(
+        x=float(pos[0]),
+        y=float(pos[1]),
+        vx=float(vel[0]) if vel.size > 0 else 0.0,
+        vy=float(vel[1]) if vel.size > 1 else 0.0,
+        heading=float(truth.heading),
+    )
 
 
 def _make_cnn_model(nn: Any):
@@ -608,9 +626,30 @@ def main() -> None:
         if decode_method == "heatmap_argmax":
             decode_method = "argmax"
 
-    label_path = dataset_root / "labels" / f"{args.eval_split}.jsonl"
-    rows = _read_jsonl(label_path, max_rows=args.max_vision_samples)
-    grouped = _group_rows_by_stage(rows)
+    replay_mode = str(args.vision_source) == "replay_dataset"
+    rows: list[dict[str, Any]] = []
+    grouped: dict[str, list[dict[str, Any]]] = {"far": [], "mid": [], "terminal": []}
+    live_renderer: Stage2Renderer | None = None
+    if replay_mode:
+        label_path = dataset_root / "labels" / f"{args.eval_split}.jsonl"
+        rows = _read_jsonl(label_path, max_rows=args.max_vision_samples)
+        grouped = _group_rows_by_stage(rows)
+    else:
+        render_cfg = load_yaml(args.render_config)
+        inventory_csv = Path(render_cfg["assets"]["inventory_csv"]).expanduser().resolve()
+        if not inventory_csv.is_absolute():
+            inventory_csv = (Path(__file__).resolve().parents[1] / inventory_csv).resolve()
+        assets = load_asset_inventory(inventory_csv)
+        registry = AssetRegistry(assets)
+        live_assets_dir = Path(args.out_dir).resolve() / "_live_render_assets"
+        live_assets_dir.mkdir(parents=True, exist_ok=True)
+        live_renderer = Stage2Renderer(
+            cfg=render_cfg,
+            registry=registry,
+            project_root=Path(__file__).resolve().parents[1],
+            output_root=live_assets_dir,
+            rng=np.random.default_rng(int(args.seed)),
+        )
     paper1_curriculum_mix = parse_curriculum_mix(
         args.paper1_curriculum_mix,
         fallback_level=str(args.paper1_curriculum_level),
@@ -639,6 +678,7 @@ def main() -> None:
             )
             policy_diag = policy.diagnostics(bridge.env._get_obs())
 
+        live_scene = live_renderer.create_live_scene(split=str(args.render_split)) if live_renderer is not None else None
         truth2d, internal = _init_phase3_dynamic_target(
             bridge,
             target_cfg,
@@ -664,11 +704,39 @@ def main() -> None:
             aircraft_pos_pre = np.asarray(aircraft.pos_world, dtype=float)
             range_pre = float(np.linalg.norm(aircraft_pos_pre[:3] - truth_pos[:3]))
             stage = _stage_for_range(range_pre, stage_cfg)
-            sample_row = _sample_stage_row(grouped, stage, vision_rng)
-            image_path = _resolve_image_path(str(sample_row["image_path"]), project_root)
-            image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-            if image is None:
-                raise FileNotFoundError(f"Could not read vision sample image: {image_path}")
+            if replay_mode:
+                sample_row = _sample_stage_row(grouped, stage, vision_rng)
+                image_path = _resolve_image_path(str(sample_row["image_path"]), project_root)
+                image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+                if image is None:
+                    raise FileNotFoundError(f"Could not read vision sample image: {image_path}")
+            else:
+                if live_renderer is None or live_scene is None:
+                    raise RuntimeError("Live renderer was not initialized.")
+                live_state = _target_truth_to_world_state(truth2d)
+                live_frame = live_renderer.render_live_frame(live_scene, live_state, stage)
+                sample_row = {
+                    "image_path": f"live_render/ep{ep:03d}_step{step_idx:04d}.png",
+                    "sequence_id": f"live_{ep:04d}",
+                    "frame_id": f"{step_idx:04d}",
+                    "stage": live_frame.stage,
+                    "vision_source": "live_render",
+                    "render_mode": "live_render",
+                    "background_asset_id": str(live_frame.background_asset_id),
+                    "target_asset_id": str(live_frame.target_asset_id),
+                    "distractor_asset_ids": list(live_frame.distractor_asset_ids),
+                    "render_background_asset_id": str(live_frame.background_asset_id),
+                    "render_target_asset_id": str(live_frame.target_asset_id),
+                    "render_distractor_asset_ids": list(live_frame.distractor_asset_ids),
+                    "render_obs_valid": bool(live_frame.obs_valid),
+                    "render_visibility": float(live_frame.visibility),
+                    "render_land_overlap_ratio": float(live_frame.land_overlap_ratio),
+                    "render_shore_buffer_overlap_ratio": float(live_frame.shore_buffer_overlap_ratio),
+                    "gsd_km_per_px": float(live_frame.gsd_m_per_px),
+                    "meta": dict(live_frame.meta),
+                }
+                image = live_frame.image_bgr
+
             pred_x, pred_y, pred_conf = _predict_vision(
                 vision_model,
                 vision_model_type,
@@ -724,9 +792,11 @@ def main() -> None:
                 "episode": int(ep),
                 "step": int(step_idx),
                 "t": float(aircraft.t),
+                "vision_source": "replay_dataset" if replay_mode else "live_render",
                 "observer": str(vision_model_type),
                 "estimate_filter": str(args.estimate_filter),
                 "planner": f"paper1_{args.model}_td3",
+                "render_mode": str(sample_row.get("render_mode", "replay_dataset")),
                 "vision_stage": stage,
                 "vision_sequence_id": str(sample_row.get("sequence_id")),
                 "vision_frame_id": str(sample_row.get("frame_id")),
@@ -800,11 +870,14 @@ def main() -> None:
         "purpose": "vision_observer_closed_loop_eval",
         "config": str(args.config),
         "env_source": env_source,
+        "vision_source": str(args.vision_source),
         "planner": f"paper1_{args.model}_td3",
         "observer": str(vision_model_type),
         "estimate_filter": str(args.estimate_filter),
         "dataset_root": str(dataset_root),
         "eval_split": str(args.eval_split),
+        "render_config": str(args.render_config),
+        "render_split": str(args.render_split),
         "vision_weights_path": str(Path(args.vision_weights).expanduser()),
         "td3_checkpoint_path": str(Path(args.td3_checkpoint).expanduser()),
         "vision_train_split": str(vision_ckpt.get("train_split", "unknown")),
@@ -821,7 +894,8 @@ def main() -> None:
         "seed": int(args.seed),
         "unit": "km",
         "capture_radius_km": float(args.capture_radius_km if args.capture_radius_km is not None else 5.0),
-        "vision_sample_counts": {k: int(len(v)) for k, v in grouped.items()},
+        "vision_sample_counts": {k: int(len(v)) for k, v in grouped.items()} if replay_mode else {},
+        "live_render_enabled": bool(not replay_mode),
         "estimate_gating": {
             "enabled": not bool(args.disable_estimate_gating),
             "gate_far_km": float(args.gate_far_km),
@@ -857,11 +931,13 @@ def main() -> None:
             "checkpoint_loaded": bool(policy is not None and not policy.random_init),
             "no_zone_violations": bool((violation_counts.sum() if violation_counts.size else 0) == 0),
             "finite_ranges": bool(np.isfinite(min_ranges).all() and np.isfinite(final_ranges).all()),
+            "vision_source_valid": bool(replay_mode or live_renderer is not None),
         },
         "artifacts": {
             "report_path": str(out_dir / "report.json"),
             "trajectory_path": str(traj_path),
             "summary_csv_path": str(csv_path),
+            "live_render_assets_dir": str((out_dir / "_live_render_assets")) if not replay_mode else "",
         },
     }
     report["accepted"] = bool(
@@ -870,6 +946,7 @@ def main() -> None:
         and report["acceptance"]["checkpoint_loaded"]
         and report["acceptance"]["finite_ranges"]
         and report["acceptance"]["no_zone_violations"]
+        and report["acceptance"]["vision_source_valid"]
     )
     (out_dir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(report, ensure_ascii=False, indent=2))

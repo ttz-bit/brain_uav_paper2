@@ -18,6 +18,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-root", type=str, required=True)
     p.add_argument("--vision-weights", type=str, required=True)
     p.add_argument("--td3-checkpoint", type=str, required=True)
+    p.add_argument("--vision-source", choices=["replay_dataset", "live_render"], default="replay_dataset")
+    p.add_argument("--render-config", type=str, default="configs/render_stage2_c_v1.yaml")
+    p.add_argument("--render-split", choices=["train", "val", "test"], default="test")
     p.add_argument("--vision-model", choices=["auto", "cnn_coord", "cnn_heatmap", "snn_heatmap"], default="auto")
     p.add_argument("--decode-method", choices=["auto", "argmax", "softargmax"], default="auto")
     p.add_argument("--model", choices=["snn", "ann"], default="snn")
@@ -76,6 +79,12 @@ def _build_vision_cmd(
         str(Path(args.dataset_root).resolve()),
         "--eval-split",
         str(args.eval_split),
+        "--vision-source",
+        str(args.vision_source),
+        "--render-config",
+        str(Path(args.render_config).resolve()),
+        "--render-split",
+        str(args.render_split),
         "--vision-weights",
         str(Path(args.vision_weights).resolve()),
         "--td3-checkpoint",

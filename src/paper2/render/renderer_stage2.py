@@ -441,6 +441,52 @@ class RenderSplitResult:
     label_path: Path
 
 
+@dataclass
+class LiveRenderScene:
+    split: str
+    background_asset: AssetRecord
+    target_asset: AssetRecord
+    distractor_assets: list[AssetRecord]
+    background_bgr: np.ndarray
+    background_water_global: np.ndarray
+    background_target_water_global: np.ndarray
+    target_bgra: np.ndarray
+    distractor_bgras: list[np.ndarray]
+    perturb_cfg: dict
+    target_scale: float
+    scale_mode: str
+    prev_valid_patch: np.ndarray | None = None
+    prev_valid_bbox: tuple[int, int, int, int] | None = None
+    prev_valid_vis: float | None = None
+    prev_valid_tx_ty: tuple[float, float] | None = None
+    prev_valid_land: float | None = None
+    prev_valid_shore: float | None = None
+    prev_valid_trunc: float | None = None
+    prev_valid_angle: float | None = None
+    prev_valid_scale: float | None = None
+    prev_valid_water: np.ndarray | None = None
+    prev_valid_crop_center: tuple[float, float] | None = None
+    prev_valid_state: WorldState | None = None
+
+
+@dataclass
+class LiveRenderFrameResult:
+    image_bgr: np.ndarray
+    target_center_px: tuple[float, float]
+    bbox_xywh: tuple[int, int, int, int]
+    visibility: float
+    obs_valid: bool
+    stage: str
+    gsd_m_per_px: float
+    crop_center_world: tuple[float, float]
+    land_overlap_ratio: float
+    shore_buffer_overlap_ratio: float
+    background_asset_id: str
+    target_asset_id: str
+    distractor_asset_ids: list[str]
+    meta: dict
+
+
 class Stage2Renderer:
     def __init__(
         self,
@@ -687,6 +733,344 @@ class Stage2Renderer:
             prev_x, prev_y = float(xw), float(yw)
 
         return out
+
+    def create_live_scene(
+        self,
+        split: str,
+        *,
+        preferred_background_category: str | None = None,
+        distractor_count: int | None = None,
+    ) -> LiveRenderScene:
+        dataset_cfg = dict(self.cfg["dataset"])
+        target_cfg = dict(self.cfg.get("target", {}))
+        perturb_cfg = dict(self.cfg["perturbations"])
+        distractor_cfg = dict(self.cfg.get("distractors", {}))
+
+        bg = None
+        bg_img = None
+        bg_water_global = None
+        for _ in range(32):
+            cand = self._sample_background(split, preferred_category=preferred_background_category)
+            cand_img = self._read_background(cand)
+            cand_water = _safe_water_mask(_water_mask(cand_img), margin_px=6)
+            cand_is_port = str(cand.category).strip().lower() == "port"
+            min_shore_clearance_px = int(self.cfg.get("placement", {}).get("port_min_shore_clearance_px", 14)) if cand_is_port else int(
+                self.cfg.get("placement", {}).get("min_shore_clearance_px", 5)
+            )
+            cand_core_water = _water_with_clearance(cand_water, int(max(4, min_shore_clearance_px)))
+            if self._mask_ratio(cand_water) >= 0.03 and self._mask_ratio(cand_core_water) >= 0.02:
+                bg = cand
+                bg_img = cand_img
+                bg_water_global = cand_water
+                break
+        if bg is None or bg_img is None or bg_water_global is None:
+            raise RuntimeError(f"No usable water background found for split={split}")
+
+        bg_target_water_global = _water_with_clearance(
+            bg_water_global,
+            int(max(4, self.cfg.get("placement", {}).get("min_shore_clearance_px", 5))),
+        )
+
+        split_targets = self.registry.get("target", split)
+        allowed_target_categories = {str(x) for x in target_cfg.get("allowed_categories", ["boat_top", "boat_oblique"])}
+        allowed_targets = [a for a in split_targets if str(a.category) in allowed_target_categories]
+        if not allowed_targets:
+            raise RuntimeError(
+                f"No allowed target templates in split={split}; expected categories={sorted(allowed_target_categories)}"
+            )
+        target = allowed_targets[int(self.rng.integers(0, len(allowed_targets)))]
+        target_bgra = read_bgra(target.path)
+
+        d_num = int(distractor_count) if distractor_count is not None else int(
+            self.rng.integers(int(distractor_cfg["min_count"]), int(distractor_cfg["max_count"]) + 1)
+        )
+        distractors = self.registry.sample_many("distractor", split, d_num, self.rng)
+        distractor_bgras = [read_bgra(d.path) for d in distractors]
+
+        fixed_scale_range = target_cfg.get("fixed_scale_range", [0.14, 0.20])
+        seq_target_scale = float(self.rng.uniform(float(fixed_scale_range[0]), float(fixed_scale_range[1])))
+        scale_mode = str(target_cfg.get("scale_mode", "fixed_sequence"))
+
+        return LiveRenderScene(
+            split=split,
+            background_asset=bg,
+            target_asset=target,
+            distractor_assets=list(distractors),
+            background_bgr=bg_img,
+            background_water_global=bg_water_global,
+            background_target_water_global=bg_target_water_global,
+            target_bgra=target_bgra,
+            distractor_bgras=distractor_bgras,
+            perturb_cfg=self._build_sequence_perturb_cfg(perturb_cfg),
+            target_scale=seq_target_scale,
+            scale_mode=scale_mode,
+        )
+
+    def render_live_frame(self, scene: LiveRenderScene, state: WorldState, stage_name: str) -> LiveRenderFrameResult:
+        dataset_cfg = dict(self.cfg["dataset"])
+        target_cfg = dict(self.cfg.get("target", {}))
+        placement_cfg = dict(self.cfg.get("placement", {}))
+        stages_cfg = dict(self.cfg["stages"])
+
+        image_size = int(dataset_cfg["image_size"])
+        world_size_m = float(dataset_cfg["world_size_m"])
+        stage_cfg = dict(stages_cfg[stage_name])
+        gsd = float(stage_cfg["gsd_m_per_px"])
+        center_jitter_px = float(stage_cfg["center_jitter_px"])
+        min_visibility = float(placement_cfg.get("min_visibility", 0.35))
+        max_truncation_ratio = float(placement_cfg.get("max_truncation_ratio", 0.20))
+        require_water_mask = bool(placement_cfg.get("require_water_mask", True))
+        max_land_overlap = float(placement_cfg.get("max_land_overlap", 0.0))
+        max_shore_overlap = float(placement_cfg.get("max_shore_buffer_overlap", 0.05))
+        min_shore_clearance_px = int(placement_cfg.get("min_shore_clearance_px", 5))
+        port_min_shore_clearance_px = int(placement_cfg.get("port_min_shore_clearance_px", min_shore_clearance_px))
+
+        bg_img = scene.background_bgr
+        bg_water_global = scene.background_water_global
+        bg_target_water_global = scene.background_target_water_global
+        target_bgra = scene.target_bgra
+        distractor_bgras = scene.distractor_bgras
+
+        is_port_bg = str(scene.background_asset.category).strip().lower() == "port"
+        seq_min_shore_clearance_px = port_min_shore_clearance_px if is_port_bg else min_shore_clearance_px
+
+        crop_center_x = float(state.x + self.rng.normal(0.0, center_jitter_px * gsd))
+        crop_center_y = float(state.y + self.rng.normal(0.0, center_jitter_px * gsd))
+        crop_center_x = float(np.clip(crop_center_x, 0.0, world_size_m))
+        crop_center_y = float(np.clip(crop_center_y, 0.0, world_size_m))
+        bg_cx, bg_cy = world_to_background_px(crop_center_x, crop_center_y, world_size_m, bg_img.shape[1], bg_img.shape[0])
+        patch = _extract_patch(bg_img, bg_cx, bg_cy, image_size)
+        water = _extract_patch(bg_water_global, bg_cx, bg_cy, image_size)
+        if water.ndim == 3:
+            water = water[:, :, 0]
+        water = water.astype(np.uint8)
+
+        if self._mask_ratio(water) < 0.20:
+            tgt_bg_x, tgt_bg_y = world_to_background_px(state.x, state.y, world_size_m, bg_img.shape[1], bg_img.shape[0])
+            nwx, nwy = _snap_to_water(bg_water_global, tgt_bg_x, tgt_bg_y, max_radius=max(bg_img.shape[0], bg_img.shape[1]))
+            crop_center_x, crop_center_y = background_px_to_world(nwx, nwy, world_size_m, bg_img.shape[1], bg_img.shape[0])
+            bg_cx, bg_cy = nwx, nwy
+            patch = _extract_patch(bg_img, bg_cx, bg_cy, image_size)
+            water = _extract_patch(bg_water_global, bg_cx, bg_cy, image_size)
+            if water.ndim == 3:
+                water = water[:, :, 0]
+            water = water.astype(np.uint8)
+
+        tx, ty = world_to_image(state.x, state.y, crop_center_x, crop_center_y, gsd, image_size)
+        if scene.scale_mode == "stage_progressive":
+            scale_min, scale_max = stage_cfg["target_scale_range"]
+            target_scale = float(self.rng.uniform(float(scale_min), float(scale_max)))
+        else:
+            target_scale = float(scene.target_scale)
+        if scene.prev_valid_scale is not None:
+            s_lo = float(scene.prev_valid_scale) * (1.0 - float(self.cfg.get("continuity", {}).get("max_scale_change_ratio", 0.05)))
+            s_hi = float(scene.prev_valid_scale) * (1.0 + float(self.cfg.get("continuity", {}).get("max_scale_change_ratio", 0.05)))
+            target_scale = float(np.clip(target_scale, s_lo, s_hi))
+
+        target_patch = resize_bgra_with_scale(target_bgra, target_scale, image_size=image_size)
+        heading_deg = float(np.degrees(np.arctan2(state.vy, state.vx)))
+        angle_noise_deg = float(target_cfg.get("heading_noise_deg", 10.0))
+        angle_deg = heading_deg + float(self.rng.uniform(-angle_noise_deg, angle_noise_deg))
+        if scene.prev_valid_angle is not None:
+            max_angle_change_deg = float(self.cfg.get("continuity", {}).get("max_angle_change_deg", 12.0))
+            d_ang = angle_deg - float(scene.prev_valid_angle)
+            while d_ang > 180.0:
+                d_ang -= 360.0
+            while d_ang < -180.0:
+                d_ang += 360.0
+            d_ang = float(np.clip(d_ang, -max_angle_change_deg, max_angle_change_deg))
+            angle_deg = float(scene.prev_valid_angle + d_ang)
+        target_patch = rotate_bgra(target_patch, angle_deg)
+
+        target_water = _extract_patch(bg_target_water_global, bg_cx, bg_cy, image_size)
+        if target_water.ndim == 3:
+            target_water = target_water[:, :, 0]
+        target_water = target_water.astype(np.uint8)
+        if self._mask_ratio(target_water) < 0.01:
+            target_water = _water_with_clearance(water, seq_min_shore_clearance_px)
+        if self._mask_ratio(target_water) < 0.01:
+            target_water = water
+
+        shoreline_margin = int(max(seq_min_shore_clearance_px, np.clip(round(0.55 * max(target_patch.shape[:2])), 4, 48)))
+        land_mask, shore_mask = _frame_semantic_masks(water, shoreline_margin)[1:]
+        fallback = _find_valid_target_center(
+            target_water=target_water,
+            water_mask=water,
+            land_mask=land_mask,
+            shore_mask=shore_mask,
+            target_patch=target_patch,
+            rng=self.rng,
+            image_size=image_size,
+            min_visibility=min_visibility,
+            max_truncation_ratio=max_truncation_ratio,
+            max_land_overlap=max_land_overlap,
+            max_shore_overlap=max_shore_overlap,
+            require_water_mask=require_water_mask,
+            tries=512,
+        )
+        if fallback is None:
+            tx, ty = _sample_water_center(
+                target_water,
+                target_patch,
+                tx,
+                ty,
+                self.rng,
+                min_ratio=0.99,
+                tries=64,
+                local_radius=24,
+                global_fallback=True,
+            )
+            land_overlap_ratio = _alpha_overlap_ratio(land_mask, target_patch, tx, ty)
+            shore_overlap_ratio = _alpha_overlap_ratio(shore_mask, target_patch, tx, ty)
+            vis = _overlay_visibility(target_patch, tx, ty, image_size, image_size)
+            truncation_ratio = max(0.0, 1.0 - vis)
+        else:
+            tx, ty, land_overlap_ratio, shore_overlap_ratio, vis, truncation_ratio = fallback
+
+        target_patch = _harmonize_overlay_to_background(patch, target_patch, tx, ty, strength=0.35)
+        bbox, vis = alpha_blend_center(patch, target_patch, tx, ty)
+        truncation_ratio = max(0.0, 1.0 - float(vis))
+        obs_valid = (
+            (not require_water_mask or _alpha_water_ratio(water, target_patch, tx, ty) >= 0.96)
+            and float(land_overlap_ratio) <= float(max_land_overlap)
+            and float(shore_overlap_ratio) <= float(max_shore_overlap)
+            and float(vis) >= float(min_visibility)
+            and float(truncation_ratio) <= float(max_truncation_ratio)
+        )
+
+        if not bool(obs_valid) and scene.prev_valid_patch is not None and scene.prev_valid_bbox is not None and scene.prev_valid_tx_ty is not None:
+            patch = scene.prev_valid_patch.copy()
+            tx, ty = scene.prev_valid_tx_ty
+            bbox = scene.prev_valid_bbox
+            vis = float(scene.prev_valid_vis if scene.prev_valid_vis is not None else vis)
+            land_overlap_ratio = float(scene.prev_valid_land if scene.prev_valid_land is not None else land_overlap_ratio)
+            shore_overlap_ratio = float(scene.prev_valid_shore if scene.prev_valid_shore is not None else shore_overlap_ratio)
+            truncation_ratio = float(scene.prev_valid_trunc if scene.prev_valid_trunc is not None else truncation_ratio)
+            angle_deg = float(scene.prev_valid_angle if scene.prev_valid_angle is not None else angle_deg)
+            target_scale = float(scene.prev_valid_scale if scene.prev_valid_scale is not None else target_scale)
+            if scene.prev_valid_water is not None:
+                water = scene.prev_valid_water.copy()
+            if scene.prev_valid_crop_center is not None:
+                crop_center_x, crop_center_y = scene.prev_valid_crop_center
+            if scene.prev_valid_state is not None:
+                state = scene.prev_valid_state
+            obs_valid = True
+
+        if not bool(obs_valid):
+            raise RuntimeError(
+                "Live renderer produced an invalid target observation: "
+                f"split={scene.split}, stage={stage_name}, land_overlap={float(land_overlap_ratio):.6f}, "
+                f"shore_overlap={float(shore_overlap_ratio):.6f}, visibility={float(vis):.6f}, "
+                f"truncation={float(truncation_ratio):.6f}"
+            )
+
+        d_ids: list[str] = []
+        d_bboxes: list[list[float]] = []
+        placed_bboxes: list[tuple[int, int, int, int]] = [bbox]
+        d_min, d_max = self.cfg.get("distractors", {}).get("scale_range", [0.04, 0.12])
+        distractor_water = _water_with_clearance(water, min_clearance_px=2)
+        if self._mask_ratio(distractor_water) < 0.01:
+            distractor_water = water
+        for d_asset, d_img in zip(scene.distractor_assets, distractor_bgras):
+            d_scale = float(self.rng.uniform(float(d_min), float(d_max)))
+            d_patch = resize_bgra_with_scale(d_img, d_scale, image_size=image_size)
+            placed = False
+            for _ in range(24):
+                p = _random_water_point(distractor_water, self.rng)
+                if p is None:
+                    break
+                d_center_x, d_center_y = _sample_water_center(
+                    distractor_water,
+                    d_patch,
+                    p[0],
+                    p[1],
+                    self.rng,
+                    min_ratio=0.96,
+                    tries=24,
+                    local_radius=28,
+                    global_fallback=True,
+                )
+                if _alpha_water_ratio(water, d_patch, d_center_x, d_center_y) < 0.96:
+                    continue
+                d_bbox = _bbox_from_center(d_patch, d_center_x, d_center_y, image_size, image_size)
+                if any(_iou_xywh(d_bbox, b2) > 0.02 for b2 in placed_bboxes):
+                    continue
+                d_patch = _harmonize_overlay_to_background(patch, d_patch, d_center_x, d_center_y, strength=0.30)
+                alpha_blend_center(patch, d_patch, d_center_x, d_center_y)
+                d_ids.append(d_asset.asset_id)
+                d_bboxes.append([float(d_bbox[0]), float(d_bbox[1]), float(d_bbox[2]), float(d_bbox[3])])
+                placed_bboxes.append(d_bbox)
+                placed = True
+                break
+            if not placed:
+                continue
+
+        patch = apply_perturbations(patch, scene.perturb_cfg, self.rng)
+
+        scene.prev_valid_patch = patch.copy()
+        scene.prev_valid_bbox = (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
+        scene.prev_valid_vis = float(vis)
+        scene.prev_valid_tx_ty = (float(tx), float(ty))
+        scene.prev_valid_land = float(land_overlap_ratio)
+        scene.prev_valid_shore = float(shore_overlap_ratio)
+        scene.prev_valid_trunc = float(truncation_ratio)
+        scene.prev_valid_angle = float(angle_deg)
+        scene.prev_valid_scale = float(target_scale)
+        scene.prev_valid_water = water.copy()
+        scene.prev_valid_crop_center = (float(crop_center_x), float(crop_center_y))
+        scene.prev_valid_state = state
+
+        meta = {
+            "background_asset_id": str(scene.background_asset.asset_id),
+            "target_asset_id": str(scene.target_asset.asset_id),
+            "distractor_asset_ids": list(d_ids),
+            "background_category": str(scene.background_asset.category),
+            "crop_center_world": [float(crop_center_x), float(crop_center_y)],
+            "crop_center_world_x": float(crop_center_x),
+            "crop_center_world_y": float(crop_center_y),
+            "target_state_world": {
+                "x": float(state.x),
+                "y": float(state.y),
+                "vx": float(state.vx),
+                "vy": float(state.vy),
+                "heading_deg": float(np.degrees(state.heading)),
+            },
+            "target_world_x": float(state.x),
+            "target_world_y": float(state.y),
+            "target_world_vx": float(state.vx),
+            "target_world_vy": float(state.vy),
+            "target_heading_deg": float(np.degrees(state.heading)),
+            "center_x": float(tx),
+            "center_y": float(ty),
+            "bbox_xywh": [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
+            "distractor_bboxes_xywh": d_bboxes,
+            "visibility": float(vis),
+            "gsd": float(gsd),
+            "perception_stage": str(stage_name),
+            "land_overlap_ratio": float(land_overlap_ratio),
+            "shore_buffer_overlap_ratio": float(shore_overlap_ratio),
+            "scale_px": float(max(target_patch.shape[0], target_patch.shape[1])),
+            "scale_factor": float(target_scale),
+            "angle_deg": float(angle_deg),
+            "obs_valid": bool(obs_valid),
+            "live_render": True,
+        }
+        return LiveRenderFrameResult(
+            image_bgr=patch,
+            target_center_px=(float(tx), float(ty)),
+            bbox_xywh=(int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])),
+            visibility=float(vis),
+            obs_valid=bool(obs_valid),
+            stage=str(stage_name),
+            gsd_m_per_px=float(gsd),
+            crop_center_world=(float(crop_center_x), float(crop_center_y)),
+            land_overlap_ratio=float(land_overlap_ratio),
+            shore_buffer_overlap_ratio=float(shore_overlap_ratio),
+            background_asset_id=str(scene.background_asset.asset_id),
+            target_asset_id=str(scene.target_asset.asset_id),
+            distractor_asset_ids=d_ids,
+            meta=meta,
+        )
 
     def render_split(self, split: str, num_sequences: int) -> RenderSplitResult:
         ds_name = str(self.output_root.name)
