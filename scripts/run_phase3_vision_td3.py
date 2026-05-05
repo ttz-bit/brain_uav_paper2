@@ -55,6 +55,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--kf-gate-far-km", type=float, default=300.0)
     p.add_argument("--kf-gate-mid-km", type=float, default=120.0)
     p.add_argument("--kf-gate-terminal-km", type=float, default=25.0)
+    p.add_argument(
+        "--kf-terminal-mode",
+        choices=["kalman", "raw"],
+        default="kalman",
+        help="When --estimate-filter=kalman, optionally bypass KF in terminal range to avoid end-game lag.",
+    )
     p.add_argument("--vision-input-size", type=int, default=0)
     p.add_argument("--out-dir", type=str, default="outputs/phase3_vision_td3/cnn_td3_snn_hard")
     return p.parse_args()
@@ -432,6 +438,17 @@ def _apply_estimate_filter(
         return _gate_and_smooth_estimate(candidate, previous, stage=stage, args=args)
     if kf is None:
         raise RuntimeError("Kalman filter requested but not initialized.")
+    if stage == "terminal" and str(args.kf_terminal_mode) == "raw":
+        meta = dict(candidate.meta or {})
+        meta.update(
+            {
+                "source": "vision_observation_terminal_raw",
+                "kalman_terminal_bypass": True,
+                "kalman_accepted": True,
+            }
+        )
+        candidate.meta = meta
+        return candidate, True, 0.0, 1.0
     gate = _kf_stage_threshold(stage, args)
     estimate, info = kf.update(candidate, gate_threshold=float(gate))
     return estimate, bool(info.accepted), float(info.innovation_norm), float(info.gate_threshold or gate)
@@ -734,6 +751,7 @@ def main() -> None:
             "gain_far": float(args.gain_far),
             "gain_mid": float(args.gain_mid),
             "gain_terminal": float(args.gain_terminal),
+            "kf_terminal_mode": str(args.kf_terminal_mode),
         },
         "policy_diagnostics": policy_diag,
         "metrics": {
