@@ -10,7 +10,7 @@ import numpy as np
 
 from paper2.render.asset_registry import AssetRecord, AssetRegistry
 from paper2.render.compositor import alpha_blend_center, read_bgra, resize_bgra_with_scale, rotate_bgra
-from paper2.render.coordinate_mapper import background_px_to_world, world_to_background_px, world_to_image
+from paper2.render.coordinate_mapper import WorldState, background_px_to_world, world_to_background_px, world_to_image
 from paper2.render.motion_sampler import generate_motion_sequence, sample_mode
 from paper2.render.perturbations import apply_perturbations
 from paper2.render.schema import RenderedFrameRecord
@@ -817,14 +817,17 @@ class Stage2Renderer:
                 prev_valid_scale: float | None = None
                 prev_valid_water: np.ndarray | None = None
                 prev_valid_crop_center: tuple[float, float] | None = None
+                prev_valid_state: WorldState | None = None
                 stage_schedule = self._stage_schedule(frames_per_sequence)
                 # Keep target scale stable per sequence by default (more realistic temporal continuity).
                 fixed_scale_range = target_cfg.get("fixed_scale_range", [0.14, 0.20])
                 seq_target_scale = float(self.rng.uniform(float(fixed_scale_range[0]), float(fixed_scale_range[1])))
                 scale_mode = str(target_cfg.get("scale_mode", "fixed_sequence"))
                 sequence_retry = False
+                seq_rows: list[dict] = []
 
                 for frame_idx, state in enumerate(motion):
+                    frame_state: WorldState = state
                     stage_name = stage_schedule[frame_idx]
                     stage_cfg = dict(stages_cfg[stage_name])
                     gsd = float(stage_cfg["gsd_m_per_px"])
@@ -1310,6 +1313,8 @@ class Stage2Renderer:
                                 distractor_water = water
                         if prev_valid_crop_center is not None:
                             crop_center_x, crop_center_y = prev_valid_crop_center
+                        if prev_valid_state is not None:
+                            frame_state = prev_valid_state
                         obs_valid = True
 
                     if not bool(obs_valid):
@@ -1333,6 +1338,7 @@ class Stage2Renderer:
                         prev_valid_scale = float(target_scale)
                         prev_valid_water = water.copy()
                         prev_valid_crop_center = (float(crop_center_x), float(crop_center_y))
+                        prev_valid_state = frame_state
 
                     prev_target_xy = (tx, ty)
                     prev_crop_center = (crop_center_x, crop_center_y)
@@ -1419,17 +1425,17 @@ class Stage2Renderer:
                             "crop_center_world_x": float(crop_center_x),
                             "crop_center_world_y": float(crop_center_y),
                             "target_state_world": {
-                                "x": float(state.x),
-                                "y": float(state.y),
-                                "vx": float(state.vx),
-                                "vy": float(state.vy),
-                                "heading_deg": float(heading_deg),
+                                "x": float(frame_state.x),
+                                "y": float(frame_state.y),
+                                "vx": float(frame_state.vx),
+                                "vy": float(frame_state.vy),
+                                "heading_deg": float(np.degrees(frame_state.heading)),
                             },
-                            "target_world_x": float(state.x),
-                            "target_world_y": float(state.y),
-                            "target_world_vx": float(state.vx),
-                            "target_world_vy": float(state.vy),
-                            "target_heading_deg": float(heading_deg),
+                            "target_world_x": float(frame_state.x),
+                            "target_world_y": float(frame_state.y),
+                            "target_world_vx": float(frame_state.vx),
+                            "target_world_vy": float(frame_state.vy),
+                            "target_heading_deg": float(np.degrees(frame_state.heading)),
                             "center_x": float(tx),
                             "center_y": float(ty),
                             "bbox_xywh": [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
@@ -1446,11 +1452,13 @@ class Stage2Renderer:
                             "obs_valid": bool(obs_valid),
                         },
                     )
-                    f.write(json.dumps(row.to_dict(), ensure_ascii=False) + "\n")
+                    seq_rows.append(row.to_dict())
 
                 if sequence_retry:
                     continue
 
+                for row_dict in seq_rows:
+                    f.write(json.dumps(row_dict, ensure_ascii=False) + "\n")
                 used_background_ids.update(seq_used_background_ids)
                 used_target_ids.update(seq_used_target_ids)
                 used_distractor_ids.update(seq_used_distractor_ids)

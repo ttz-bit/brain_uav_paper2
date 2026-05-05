@@ -12,7 +12,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--dataset-root", type=str, default="data/rendered/stage2_smoke_v0")
     p.add_argument("--max-center-step-px", type=float, default=20.0)
-    p.add_argument("--max-world-step-m", type=float, default=80.0)
+    p.add_argument("--max-world-step-m", type=float, default=55.0)
+    p.add_argument("--max-port-world-step-m", type=float, default=40.0)
     p.add_argument("--max-scale-change-ratio", type=float, default=0.05)
     p.add_argument("--max-angle-change-deg", type=float, default=12.0)
     p.add_argument("--max-crop-step-px", type=float, default=38.4)
@@ -42,6 +43,13 @@ def _step(a: list[float], b: list[float]) -> float:
     ax, ay = float(a[0]), float(a[1])
     bx, by = float(b[0]), float(b[1])
     return float(np.hypot(bx - ax, by - ay))
+
+
+def _world_step_budget(row: dict, args: argparse.Namespace) -> float:
+    bg_category = str(row.get("meta", {}).get("background_category", "")).strip().lower()
+    if bg_category == "port":
+        return float(args.max_port_world_step_m)
+    return float(args.max_world_step_m)
 
 
 def main() -> None:
@@ -91,6 +99,7 @@ def main() -> None:
             aw = a["meta"]["target_state_world"]
             bw = b["meta"]["target_state_world"]
             w_step = _step([aw["x"], aw["y"]], [bw["x"], bw["y"]])
+            w_budget = _world_step_budget(b, args)
             ac = a["meta"].get("crop_center_world", [0.0, 0.0])
             bc = b["meta"].get("crop_center_world", [0.0, 0.0])
             agsd = float(a.get("gsd_m_per_px", a["meta"].get("gsd", 1.0)))
@@ -114,7 +123,7 @@ def main() -> None:
             crop_steps.append(crop_step_px)
             if (
                 c_step > float(args.max_center_step_px)
-                or w_step > float(args.max_world_step_m)
+                or w_step > w_budget
                 or abs(scale_ratio - 1.0) > float(args.max_scale_change_ratio) + 1e-6
                 or abs(d_ang) > float(args.max_angle_change_deg) + 1e-6
                 or crop_step_px > float(args.max_crop_step_px) + 1e-6
@@ -125,6 +134,7 @@ def main() -> None:
                         "to_frame": str(b["frame_id"]),
                         "center_step_px": c_step,
                         "world_step_m": w_step,
+                        "world_step_budget_m": w_budget,
                         "scale_ratio": scale_ratio,
                         "angle_delta_deg": float(d_ang),
                         "crop_step_px": crop_step_px,
@@ -132,7 +142,7 @@ def main() -> None:
                 )
             if c_step > float(args.max_center_step_px):
                 center_violations += 1
-            if w_step > float(args.max_world_step_m):
+            if w_step > w_budget:
                 world_violations += 1
             if abs(scale_ratio - 1.0) > float(args.max_scale_change_ratio) + 1e-6:
                 scale_change_violations += 1
@@ -184,6 +194,7 @@ def main() -> None:
         "thresholds": {
             "max_center_step_px": float(args.max_center_step_px),
             "max_world_step_m": float(args.max_world_step_m),
+            "max_port_world_step_m": float(args.max_port_world_step_m),
             "max_scale_change_ratio": float(args.max_scale_change_ratio),
             "max_angle_change_deg": float(args.max_angle_change_deg),
             "max_crop_step_px": float(args.max_crop_step_px),
