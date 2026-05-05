@@ -40,6 +40,7 @@ Not finalized yet:
 - final closed-loop bridge implementation;
 - final Stage 2C freeze report after semantic + temporal QC pass;
 - final SNN/CNN vision training on the frozen formal rendered dataset.
+- phase 3 minimal closed-loop suite and paper-2-specific runbook are in `docs/phase3_minimal_closed_loop_runbook.md`.
 
 ## Key Paths
 
