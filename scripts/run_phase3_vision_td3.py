@@ -43,6 +43,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--phase3-target-init", choices=["paper1_goal", "random_water"], default="paper1_goal")
     p.add_argument("--target-z-policy", choices=["keep_current_goal_z"], default="keep_current_goal_z")
     p.add_argument("--capture-radius-km", type=float, default=None)
+    p.add_argument(
+        "--capture-mode",
+        choices=["estimate_goal", "true_target"],
+        default="estimate_goal",
+        help="estimate_goal preserves Paper1 termination; true_target only ends capture when the real moving target is reached.",
+    )
     p.add_argument("--max-vision-samples", type=int, default=None)
     p.add_argument("--disable-estimate-gating", action="store_true")
     p.add_argument("--gate-far-km", type=float, default=300.0)
@@ -61,6 +67,14 @@ def parse_args() -> argparse.Namespace:
         default="kalman",
         help="When --estimate-filter=kalman, optionally bypass KF in terminal range to avoid end-game lag.",
     )
+    p.add_argument(
+        "--terminal-controller",
+        choices=["td3", "pure_pursuit", "blend"],
+        default="td3",
+        help="Optional evaluation-time terminal guidance based on the current target estimate.",
+    )
+    p.add_argument("--terminal-controller-range-km", type=float, default=80.0)
+    p.add_argument("--terminal-controller-blend", type=float, default=0.5)
     p.add_argument("--vision-input-size", type=int, default=0)
     p.add_argument("--out-dir", type=str, default="outputs/phase3_vision_td3/cnn_td3_snn_hard")
     return p.parse_args()
@@ -474,6 +488,50 @@ def _set_goal_from_estimate(bridge: Paper1EnvBridge, estimate: TargetEstimateSta
         bridge.env.last_goal_reached_by_segment = False
 
 
+def _terminal_pursuit_action(bridge: Paper1EnvBridge) -> np.ndarray:
+    env = bridge.env
+    state = np.asarray(env.state, dtype=float).reshape(-1)
+    goal = np.asarray(env.goal, dtype=float).reshape(-1)
+    rel = goal[:3] - state[:3]
+    xy_norm = max(float(np.linalg.norm(rel[:2])), 1.0e-6)
+    desired_gamma = float(math.atan2(float(rel[2]), xy_norm))
+    desired_psi = float(math.atan2(float(rel[1]), float(rel[0])))
+    delta_gamma = desired_gamma - float(state[3])
+    delta_psi = float((desired_psi - float(state[4]) + math.pi) % (2.0 * math.pi) - math.pi)
+    limits = bridge.get_aircraft_state().control_limits or {}
+    delta_gamma_max = float(limits.get("delta_gamma_max", getattr(env.scenario, "delta_gamma_max", 0.14)))
+    delta_psi_max = float(limits.get("delta_psi_max", getattr(env.scenario, "delta_psi_max", 0.2)))
+    return np.array(
+        [
+            float(np.clip(delta_gamma, -delta_gamma_max, delta_gamma_max)),
+            float(np.clip(delta_psi, -delta_psi_max, delta_psi_max)),
+        ],
+        dtype=np.float32,
+    )
+
+
+def _select_planner_action(
+    bridge: Paper1EnvBridge,
+    policy: Paper1TD3Policy,
+    *,
+    stage: str,
+    range_pre: float,
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, str]:
+    td3_action = policy.act(bridge.env._get_obs())
+    if stage != "terminal" or float(range_pre) > float(args.terminal_controller_range_km):
+        return td3_action, "td3"
+    mode = str(args.terminal_controller)
+    if mode == "td3":
+        return td3_action, "td3"
+    pursuit_action = _terminal_pursuit_action(bridge)
+    if mode == "pure_pursuit":
+        return pursuit_action, "pure_pursuit"
+    blend = float(np.clip(args.terminal_controller_blend, 0.0, 1.0))
+    action = (1.0 - blend) * td3_action.astype(float) + blend * pursuit_action.astype(float)
+    return action.astype(np.float32), "blend"
+
+
 def _zone_violation(pos_world: np.ndarray, zones: list[NoFlyZoneState], *, include_safety_margin: bool) -> bool:
     pos = np.asarray(pos_world, dtype=float).reshape(-1)
     if pos.size < 3:
@@ -638,12 +696,28 @@ def main() -> None:
             )
             prev_estimate = estimate
             _set_goal_from_estimate(bridge, estimate, target_z)
-            action = policy.act(bridge.env._get_obs())
+            action, action_source = _select_planner_action(
+                bridge,
+                policy,
+                stage=stage,
+                range_pre=range_pre,
+                args=args,
+            )
             step_result = bridge.step(action)
 
             aircraft_pos = np.asarray(step_result.observation.aircraft_pos_world, dtype=float)
             range_to_target = float(np.linalg.norm(aircraft_pos[:3] - truth_pos[:3]))
             est_error = float(np.linalg.norm(np.asarray(estimate.pos_world_est, dtype=float)[:3] - truth_pos[:3]))
+            done = bool(step_result.done)
+            done_reason = str(step_result.info.reason)
+            true_capture = range_to_target <= float(capture_radius_km)
+            if str(args.capture_mode) == "true_target":
+                if true_capture:
+                    done = True
+                    done_reason = "captured"
+                elif done_reason == "captured":
+                    done = False
+                    done_reason = "estimate_goal_reached"
             violation = _zone_violation(aircraft_pos, zones, include_safety_margin=False)
             safety_violation = _zone_violation(aircraft_pos, zones, include_safety_margin=True)
             row = {
@@ -672,6 +746,7 @@ def main() -> None:
                 "estimate_x": float(estimate.pos_world_est[0]),
                 "estimate_y": float(estimate.pos_world_est[1]),
                 "estimate_z": float(estimate.pos_world_est[2]),
+                "action_source": str(action_source),
                 "action_delta_gamma": float(action[0]),
                 "action_delta_psi": float(action[1]),
                 "range_to_target_km": range_to_target,
@@ -679,13 +754,13 @@ def main() -> None:
                 "vision_error_km": float(vision_error_km),
                 "zone_violation": bool(violation),
                 "safety_margin_violation": bool(safety_violation),
-                "done": bool(step_result.done),
-                "done_reason": str(step_result.info.reason),
+                "done": bool(done),
+                "done_reason": str(done_reason),
                 "reward": float(step_result.reward),
             }
             ep_rows.append(row)
             all_rows.append(row)
-            if step_result.done:
+            if done:
                 break
             truth2d = propagate_phase3_target_truth(
                 truth2d,
@@ -735,6 +810,10 @@ def main() -> None:
         "vision_train_split": str(vision_ckpt.get("train_split", "unknown")),
         "vision_val_split": str(vision_ckpt.get("val_split", "unknown")),
         "phase3_target_init": str(args.phase3_target_init),
+        "capture_mode": str(args.capture_mode),
+        "terminal_controller": str(args.terminal_controller),
+        "terminal_controller_range_km": float(args.terminal_controller_range_km),
+        "terminal_controller_blend": float(args.terminal_controller_blend),
         "paper1_curriculum_level": str(args.paper1_curriculum_level),
         "paper1_curriculum_mix": paper1_curriculum_mix,
         "episodes": int(args.episodes),
