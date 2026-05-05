@@ -258,6 +258,138 @@ def _plot_estimation_errors(runs: list[RunBundle], episode: int, out_path: Path)
     plt.close(fig)
 
 
+def _plot_target_zoom(runs: list[RunBundle], episode: int, out_path: Path) -> None:
+    fig, axes = plt.subplots(1, len(runs), figsize=(5.2 * len(runs), 5.0), constrained_layout=True)
+    if len(runs) == 1:
+        axes = [axes]
+
+    for ax, run in zip(axes, runs):
+        rows = _episode_rows(run.trajectory_rows, episode)
+        if not rows:
+            ax.set_title(f"{run.label} ep{episode:03d} (no rows)")
+            ax.axis("off")
+            continue
+        target_xy = np.array([[float(r["target_x"]), float(r["target_y"])] for r in rows], dtype=float)
+        origin = target_xy[0].copy()
+        delta = target_xy - origin
+        ax.plot(delta[:, 0], delta[:, 1], linewidth=2.0, label="target")
+        ax.scatter(delta[0, 0], delta[0, 1], s=28, marker="o", label="start")
+        ax.scatter(delta[-1, 0], delta[-1, 1], s=36, marker="x", label="end")
+        ax.set_title(run.label)
+        ax.set_xlabel("target_dx_km")
+        ax.set_ylabel("target_dy_km")
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=7, loc="best")
+
+    fig.suptitle(f"Episode {episode:03d} Target Motion Zoom")
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def _plot_estimate_tracks(runs: list[RunBundle], episode: int, out_path: Path) -> None:
+    fig, axes = plt.subplots(1, len(runs), figsize=(5.2 * len(runs), 5.0), constrained_layout=True)
+    if len(runs) == 1:
+        axes = [axes]
+
+    for ax, run in zip(axes, runs):
+        rows = _episode_rows(run.trajectory_rows, episode)
+        if not rows:
+            ax.set_title(f"{run.label} ep{episode:03d} (no rows)")
+            ax.axis("off")
+            continue
+        target_xy = np.array([[float(r["target_x"]), float(r["target_y"])] for r in rows], dtype=float)
+        estimate_xy = np.array([[float(r["estimate_x"]), float(r["estimate_y"])] for r in rows], dtype=float)
+        ax.plot(target_xy[:, 0], target_xy[:, 1], linewidth=2.0, label="target")
+        if np.isfinite(estimate_xy).all():
+            ax.plot(estimate_xy[:, 0], estimate_xy[:, 1], linewidth=1.5, alpha=0.85, label="estimate")
+        ax.scatter(target_xy[0, 0], target_xy[0, 1], s=28, marker="o", label="target start")
+        ax.scatter(target_xy[-1, 0], target_xy[-1, 1], s=36, marker="x", label="target end")
+        points = target_xy
+        if np.isfinite(estimate_xy).all():
+            points = np.vstack([target_xy, estimate_xy])
+        center = np.nanmedian(points, axis=0)
+        radius = float(np.nanpercentile(np.linalg.norm(points - center, axis=1), 90)) if len(points) else 10.0
+        radius = max(radius, 30.0)
+        ax.set_xlim(center[0] - radius * 1.25, center[0] + radius * 1.25)
+        ax.set_ylim(center[1] - radius * 1.25, center[1] + radius * 1.25)
+        ax.set_title(run.label)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=7, loc="best")
+
+    fig.suptitle(f"Episode {episode:03d} Target And Estimate Tracks")
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def _stage_to_value(stage: str) -> int:
+    if stage == "terminal":
+        return 0
+    if stage == "mid":
+        return 1
+    if stage == "far":
+        return 2
+    return -1
+
+
+def _stage_to_gsd(stage: str) -> float:
+    if stage == "terminal":
+        return 0.2
+    if stage == "mid":
+        return 1.0
+    if stage == "far":
+        return 2.5
+    return float("nan")
+
+
+def _plot_stage_usage(runs: list[RunBundle], episode: int, out_path: Path, csv_path: Path) -> None:
+    fig, axes = plt.subplots(2, 1, figsize=(11, 6.5), constrained_layout=True, sharex=True)
+    summary_rows: list[dict[str, Any]] = []
+    for run in runs:
+        rows = _episode_rows(run.trajectory_rows, episode)
+        if not rows:
+            continue
+        steps = np.array([int(r["step"]) for r in rows], dtype=int)
+        stages = [str(r.get("vision_stage", "")) for r in rows]
+        stage_values = np.array([_stage_to_value(s) for s in stages], dtype=float)
+        gsds = np.array([_stage_to_gsd(s) for s in stages], dtype=float)
+        axes[0].plot(steps, stage_values, linewidth=1.6, label=run.label)
+        axes[1].plot(steps, gsds, linewidth=1.6, label=run.label)
+        for stage in ("far", "mid", "terminal"):
+            count = sum(1 for s in stages if s == stage)
+            summary_rows.append(
+                {
+                    "label": run.label,
+                    "episode": int(episode),
+                    "stage": stage,
+                    "steps": int(count),
+                    "ratio": float(count / max(1, len(stages))),
+                    "gsd_km_per_px": _stage_to_gsd(stage),
+                    "image_rate_hz": 1.0,
+                }
+            )
+
+    axes[0].set_yticks([0, 1, 2])
+    axes[0].set_yticklabels(["terminal", "mid", "far"])
+    axes[0].set_ylabel("stage")
+    axes[0].set_title(f"Episode {episode:03d} Perception Stage Schedule")
+    axes[0].grid(alpha=0.25)
+    axes[0].legend(loc="best")
+    axes[1].set_xlabel("step")
+    axes[1].set_ylabel("gsd_km_per_px")
+    axes[1].grid(alpha=0.25)
+    axes[1].legend(loc="best")
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+    if summary_rows:
+        with csv_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(summary_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(summary_rows)
+
+
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -296,6 +428,14 @@ def main() -> None:
     _plot_trajectories(runs, int(args.episode), output_dir / f"trajectories_ep{int(args.episode):03d}.png")
     _plot_ranges(runs, int(args.episode), output_dir / f"ranges_ep{int(args.episode):03d}.png")
     _plot_estimation_errors(runs, int(args.episode), output_dir / f"errors_ep{int(args.episode):03d}.png")
+    _plot_target_zoom(runs, int(args.episode), output_dir / f"target_zoom_ep{int(args.episode):03d}.png")
+    _plot_estimate_tracks(runs, int(args.episode), output_dir / f"estimate_tracks_ep{int(args.episode):03d}.png")
+    _plot_stage_usage(
+        runs,
+        int(args.episode),
+        output_dir / f"stage_usage_ep{int(args.episode):03d}.png",
+        output_dir / f"stage_usage_ep{int(args.episode):03d}.csv",
+    )
 
     print(json.dumps({"output_dir": str(output_dir), "runs": comparison_rows}, ensure_ascii=False, indent=2))
 
