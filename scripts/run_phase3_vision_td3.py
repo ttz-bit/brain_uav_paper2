@@ -140,6 +140,82 @@ def _target_truth_to_world_state(truth: TargetTruthState) -> WorldState:
     )
 
 
+def _live_frame_to_phase3_row(
+    *,
+    live_frame: Any,
+    truth: TargetTruthState,
+    stage: str,
+    stage_cfg: dict[str, Any],
+    image_path: str,
+    sequence_id: str,
+    frame_id: str,
+) -> dict[str, Any]:
+    """Expose live-rendered pixels with Phase3 km-based observation geometry."""
+    target_xy = np.asarray(truth.pos_world, dtype=float).reshape(-1)[:2]
+    target_vel = np.asarray(truth.vel_world, dtype=float).reshape(-1)
+    target_center_px = np.asarray(live_frame.target_center_px, dtype=float).reshape(2)
+    image_size = int(stage_cfg.get("image_size", 256))
+    half = float(image_size) * 0.5
+    gsd_km_per_px = float(stage_cfg[str(stage)]["gsd_km_per_px"])
+    crop_center_xy = np.array(
+        [
+            float(target_xy[0]) - (float(target_center_px[0]) - half) * gsd_km_per_px,
+            float(target_xy[1]) - (half - float(target_center_px[1])) * gsd_km_per_px,
+        ],
+        dtype=float,
+    )
+
+    meta = dict(live_frame.meta)
+    meta.update(
+        {
+            "source": "live_render_phase3_geometry",
+            "render_geometry_unit": "renderer_local",
+            "observation_geometry_unit": "km",
+            "crop_center_world": [float(crop_center_xy[0]), float(crop_center_xy[1])],
+            "crop_center_world_x": float(crop_center_xy[0]),
+            "crop_center_world_y": float(crop_center_xy[1]),
+            "target_state_world": {
+                "x": float(target_xy[0]),
+                "y": float(target_xy[1]),
+                "vx": float(target_vel[0]) if target_vel.size > 0 else 0.0,
+                "vy": float(target_vel[1]) if target_vel.size > 1 else 0.0,
+                "heading_deg": float(np.degrees(float(truth.heading))),
+            },
+            "target_world_x": float(target_xy[0]),
+            "target_world_y": float(target_xy[1]),
+            "target_center_px": [float(target_center_px[0]), float(target_center_px[1])],
+            "center_x": float(target_center_px[0]),
+            "center_y": float(target_center_px[1]),
+            "gsd": float(gsd_km_per_px),
+            "gsd_km_per_px": float(gsd_km_per_px),
+            "render_gsd_m_per_px": float(live_frame.gsd_m_per_px),
+        }
+    )
+
+    return {
+        "image_path": str(image_path),
+        "sequence_id": str(sequence_id),
+        "frame_id": str(frame_id),
+        "stage": str(live_frame.stage),
+        "vision_source": "live_render",
+        "render_mode": "live_render",
+        "background_asset_id": str(live_frame.background_asset_id),
+        "target_asset_id": str(live_frame.target_asset_id),
+        "distractor_asset_ids": list(live_frame.distractor_asset_ids),
+        "render_background_asset_id": str(live_frame.background_asset_id),
+        "render_target_asset_id": str(live_frame.target_asset_id),
+        "render_distractor_asset_ids": list(live_frame.distractor_asset_ids),
+        "render_obs_valid": bool(live_frame.obs_valid),
+        "render_visibility": float(live_frame.visibility),
+        "render_land_overlap_ratio": float(live_frame.land_overlap_ratio),
+        "render_shore_buffer_overlap_ratio": float(live_frame.shore_buffer_overlap_ratio),
+        "gsd_km_per_px": float(gsd_km_per_px),
+        "render_gsd_m_per_px": float(live_frame.gsd_m_per_px),
+        "target_center_px": [float(target_center_px[0]), float(target_center_px[1])],
+        "meta": meta,
+    }
+
+
 def _make_cnn_model(nn: Any):
     class _SmallCNN(nn.Module):
         def __init__(self):
@@ -715,26 +791,15 @@ def main() -> None:
                     raise RuntimeError("Live renderer was not initialized.")
                 live_state = _target_truth_to_world_state(truth2d)
                 live_frame = live_renderer.render_live_frame(live_scene, live_state, stage)
-                sample_row = {
-                    "image_path": f"live_render/ep{ep:03d}_step{step_idx:04d}.png",
-                    "sequence_id": f"live_{ep:04d}",
-                    "frame_id": f"{step_idx:04d}",
-                    "stage": live_frame.stage,
-                    "vision_source": "live_render",
-                    "render_mode": "live_render",
-                    "background_asset_id": str(live_frame.background_asset_id),
-                    "target_asset_id": str(live_frame.target_asset_id),
-                    "distractor_asset_ids": list(live_frame.distractor_asset_ids),
-                    "render_background_asset_id": str(live_frame.background_asset_id),
-                    "render_target_asset_id": str(live_frame.target_asset_id),
-                    "render_distractor_asset_ids": list(live_frame.distractor_asset_ids),
-                    "render_obs_valid": bool(live_frame.obs_valid),
-                    "render_visibility": float(live_frame.visibility),
-                    "render_land_overlap_ratio": float(live_frame.land_overlap_ratio),
-                    "render_shore_buffer_overlap_ratio": float(live_frame.shore_buffer_overlap_ratio),
-                    "gsd_km_per_px": float(live_frame.gsd_m_per_px),
-                    "meta": dict(live_frame.meta),
-                }
+                sample_row = _live_frame_to_phase3_row(
+                    live_frame=live_frame,
+                    truth=truth2d,
+                    stage=stage,
+                    stage_cfg=stage_cfg,
+                    image_path=f"live_render/ep{ep:03d}_step{step_idx:04d}.png",
+                    sequence_id=f"live_{ep:04d}",
+                    frame_id=f"{step_idx:04d}",
+                )
                 image = live_frame.image_bgr
 
             pred_x, pred_y, pred_conf = _predict_vision(
