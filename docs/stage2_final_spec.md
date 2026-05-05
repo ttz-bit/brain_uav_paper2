@@ -29,7 +29,7 @@ All three stages keep the same visual viewpoint family (`top` / `near-top`) and 
 | observation_source | `external_cue` | `onboard_midrange` | `onboard_terminal` |
 | image size | 256x256 | 256x256 | 256x256 |
 | heatmap size | 64x64 | 64x64 | 64x64 |
-| GSD (m/px) | 20-30 | 10-20 | 4-10 |
+| GSD (m/px) | 25 | 25 | 10 |
 | target long side (px) | 10-24 | 24-64 | 64-140 |
 | center offset range (px) | 20-70 | 10-40 | 0-20 |
 | update period (s) | 1.0 | 1.0 | 0.5 |
@@ -95,7 +95,7 @@ Recommended values:
 Required pass conditions:
 
 - `land_overlap_violations == 0`
-- `shore_overlap_violations == 0` (or strict policy threshold <= 0.01)
+- `shore_overlap_violations == 0` with `max_shore_overlap <= 0.01`
 - `truncation_violations == 0`
 - `obs_invalid_count == 0`
 - `split_asset_leakage.background == 0`
@@ -107,7 +107,7 @@ Required pass conditions:
 Required pass conditions:
 
 - `center_step_violations == 0`
-- `world_step_violations == 0`
+- `world_step_violations == 0` with non-port `max_world_step_m = 55` and port `max_port_world_step_m = 40`
 - `scale_change_violations == 0`
 - `angle_change_violations == 0`
 - `crop_step_violations == 0`
@@ -147,6 +147,29 @@ Stage 2C full dataset generation is allowed only when:
 3. SNN baseline converges on 2B
 4. per-stage (`far/mid/terminal`) metrics are reported and stable
 
+## 7.1 Current formal run policy
+
+The current formal Stage 2C renderer is allowed to retry an impossible sequence start.
+If the first valid frame cannot be placed after all hard-constrained retries, the renderer discards the current sequence candidate and resamples background / target / motion until the sequence becomes feasible or the retry budget is exhausted.
+
+Operationally:
+
+- render first;
+- then run semantic QC;
+- then run temporal QC;
+- do not couple QC into the main render job.
+
+The formal render pipeline should use the latest renderer implementation with:
+
+- buffered per-sequence label writes, so failed retry attempts leave no stale JSONL rows;
+- synchronized hard-fail fallback state, so reused pixels and `target_state_world` stay aligned;
+- final world-step hard guard;
+- cached per-frame semantic masks;
+- PNG compression level 1 for faster writes;
+- per-frame `water_mask_crop_path`;
+- per-frame `distractor_bboxes_xywh`;
+- detailed temporal violation locator for debugging only.
+
 ---
 
 ## 8. Execution Checklist
@@ -160,7 +183,8 @@ After rendering:
 
 - [ ] run `check_stage2_rendered.py`
 - [ ] run `check_stage2_temporal_continuity.py`
+- [ ] confirm water-mask metadata before water-logit or land-penalty training
+- [ ] confirm distractor bbox metadata before distractor-repel training
 - [ ] run scale distribution inspection
 - [ ] generate contact sheets (with overlays)
 - [ ] archive reports and config snapshot under dataset `meta/reports`
-
