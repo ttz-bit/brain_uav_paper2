@@ -1,0 +1,88 @@
+phase3_paper1:
+  world:
+    unit_name: "km"
+    paper1_world_xy_km: 1312.5
+    paper2_render_world_size_km: 2625.0
+    paper1_origin: "centered_xy_ground_z0"
+    paper2_origin: "render_bottom_left_xy"
+    xy_transform: "paper2_xy_km = paper1_xy_km + [world_size_km / 2, world_size_km / 2]"
+  aircraft:
+    state_order: ["x", "y", "z", "gamma", "psi"]
+    action_type: "delta_gamma_delta_psi"
+    speed_km_s: 2.5
+    dt_s: 1.0
+    max_steps: 1000
+    max_range_km: 2500.0
+    gamma_max: 0.6
+    delta_gamma_max: 0.14
+    delta_psi_max: 0.2
+  target:
+    goal_policy: "static_goal_until_vision_estimate_is_connected"
+    vision_estimate_z_policy: "keep_current_goal_z"
+  no_fly_zone:
+    geometry: "hemisphere"
+    center_z: 0.0
+    safety_margin_source: "paper1.warning_distance"
+
+phase3_target_motion:
+  seed: 20260429
+  dt: 1.0
+  frames_per_sequence: 40
+  default_sequences: 64
+  unit_name: "km"
+  area:
+    x_min: 0.0
+    x_max: 2625.0
+    y_min: 0.0
+    y_max: 2625.0
+  init_margin: 250.0
+  boundary_margin: 80.0
+  mode_probs:
+    cv: 0.35
+    turn: 0.25
+    piecewise: 0.25
+    evasive: 0.15
+  speed_range:
+    min: 0.005
+    max: 0.03
+  turn_rate_range:
+    min: -0.08
+    max: 0.08
+  switch_interval_range:
+    min: 8
+    max: 24
+  piecewise_heading_delta_range:
+    min: -0.75
+    max: 0.75
+  evasive:
+    trigger_distance: 120.0
+    heading_gain: 0.35
+    random_jitter_range:
+      min: -0.25
+      max: 0.25
+  continuity:
+    max_step_distance_factor: 1.05
+  water_constraint:
+    mode: "all_water"
+    max_resample_attempts: 16
+
+phase3_task_stages:
+  unit_name: "km"
+  image_size: 256
+  aircraft_altitude_km: 12.0
+  crop_jitter_px:
+    far: 12.0
+    mid: 24.0
+    terminal: 40.0
+  far:
+    range_min_km: 1500.0
+    range_max_km: 2000.0
+    gsd_km_per_px: 2.5
+  mid:
+    range_min_km: 600.0
+    range_max_km: 1500.0
+    gsd_km_per_px: 1.0
+  terminal:
+    range_min_km: 50.0
+    range_max_km: 600.0
+    gsd_km_per_px: 0.2
