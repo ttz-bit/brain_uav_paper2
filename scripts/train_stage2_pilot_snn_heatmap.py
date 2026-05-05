@@ -62,8 +62,19 @@ def parse_args() -> argparse.Namespace:
         "--selection-metric",
         type=str,
         default="val_pixel_error",
-        choices=["val_loss", "val_pixel_error", "val_argmax_pixel_error", "val_softargmax_pixel_error", "val_center_improve"],
+        choices=[
+            "val_loss",
+            "val_pixel_error",
+            "val_argmax_pixel_error",
+            "val_softargmax_pixel_error",
+            "val_center_improve",
+            "val_far_pixel_error",
+            "val_mid_pixel_error",
+            "val_terminal_pixel_error",
+        ],
     )
+    p.add_argument("--train-only-stage", type=str, default="", choices=["", "far", "mid", "terminal"])
+    p.add_argument("--val-only-stage", type=str, default="", choices=["", "far", "mid", "terminal"])
     p.add_argument("--train-eval-max-samples", type=int, default=2048)
     p.add_argument("--val-eval-max-samples", type=int, default=0)
     p.add_argument("--num-workers", type=int, default=0)
@@ -375,6 +386,7 @@ def main() -> None:
         split=args.train_split,
         project_root=project_root,
         max_samples=args.max_train_samples,
+        only_stage=str(args.train_only_stage) or None,
         load_water_mask=load_water_mask,
     )
     val_ds = build_stage2_rendered_dataset(
@@ -382,6 +394,7 @@ def main() -> None:
         split=args.val_split,
         project_root=project_root,
         max_samples=args.max_val_samples,
+        only_stage=str(args.val_only_stage) or None,
         load_water_mask=load_water_mask,
     )
 
@@ -504,6 +517,14 @@ def main() -> None:
     train_eval_loader = _loader(_RenderedTorchDataset(train_ds, train_eval_indices), batch_size=int(args.eval_batch_size), shuffle=False)
     val_eval_loader = _loader(_RenderedTorchDataset(val_ds, val_eval_indices), batch_size=int(args.eval_batch_size), shuffle=False)
 
+    def _rows_for_eval_loader(eval_loader) -> list[dict]:
+        wrapped = eval_loader.dataset
+        rows = list(getattr(wrapped.ds, "_rows", []))
+        indices = getattr(wrapped, "indices", None)
+        if indices is not None:
+            rows = [rows[int(i)] for i in list(indices)]
+        return rows
+
     def _eval_loader(eval_loader) -> dict[str, float]:
         model.eval()
         total = 0.0
@@ -550,6 +571,11 @@ def main() -> None:
         px_errors = softargmax_px_errors if str(args.decode_method) == "softargmax" else argmax_px_errors
         px_mean = float(np.mean(px_errors)) if px_errors else 0.0
         center_mean = float(np.mean(center_errors)) if center_errors else 0.0
+        per_stage: dict[str, list[float]] = {"far": [], "mid": [], "terminal": []}
+        for row, err in zip(_rows_for_eval_loader(eval_loader), px_errors):
+            stage = str((row.get("meta") or {}).get("perception_stage", row.get("stage", "")))
+            if stage in per_stage:
+                per_stage[stage].append(float(err))
         rounded_unique = {(int(round(x)), int(round(y))) for x, y in zip(pred_x_px, pred_y_px)}
         return {
             "loss": total / max(1, count),
@@ -564,10 +590,17 @@ def main() -> None:
             "pred_x_std_px": float(np.std(pred_x_px)) if pred_x_px else 0.0,
             "pred_y_std_px": float(np.std(pred_y_px)) if pred_y_px else 0.0,
             "rounded_unique_pred_xy": int(len(rounded_unique)),
+            "stage_pixel_error_mean": {k: float(np.mean(v)) if v else 0.0 for k, v in per_stage.items()},
+            "stage_counts": {k: int(len(v)) for k, v in per_stage.items()},
         }
 
     def _selection_score(metrics: dict[str, float]) -> float:
         metric = str(args.selection_metric)
+        def _stage_score(stage: str) -> float:
+            if int(metrics.get("stage_counts", {}).get(stage, 0)) <= 0:
+                return float("inf")
+            return float(metrics["stage_pixel_error_mean"][stage])
+
         if metric == "val_loss":
             return float(metrics["loss"])
         if metric == "val_argmax_pixel_error":
@@ -576,6 +609,12 @@ def main() -> None:
             return float(metrics["softargmax_pixel_error_mean"])
         if metric == "val_center_improve":
             return -float(metrics["center_baseline_improve_ratio"])
+        if metric == "val_far_pixel_error":
+            return _stage_score("far")
+        if metric == "val_mid_pixel_error":
+            return _stage_score("mid")
+        if metric == "val_terminal_pixel_error":
+            return _stage_score("terminal")
         return float(metrics["pixel_error_mean"])
 
     with torch.inference_mode():
@@ -654,6 +693,8 @@ def main() -> None:
                     "dataset_root": str(dataset_root),
                     "train_split": str(args.train_split),
                     "val_split": str(args.val_split),
+                    "train_only_stage": str(args.train_only_stage),
+                    "val_only_stage": str(args.val_only_stage),
                     "num_train": int(len(train_ds)),
                     "num_val": int(len(val_ds)),
                     "input_size": int(args.input_size),
@@ -697,6 +738,8 @@ def main() -> None:
                     "dataset_root": str(dataset_root),
                     "train_split": str(args.train_split),
                     "val_split": str(args.val_split),
+                    "train_only_stage": str(args.train_only_stage),
+                    "val_only_stage": str(args.val_only_stage),
                     "num_train": int(len(train_ds)),
                     "num_val": int(len(val_ds)),
                     "input_size": int(args.input_size),
@@ -750,6 +793,8 @@ def main() -> None:
             "dataset_root": str(dataset_root),
             "train_split": str(args.train_split),
             "val_split": str(args.val_split),
+            "train_only_stage": str(args.train_only_stage),
+            "val_only_stage": str(args.val_only_stage),
             "num_train": int(len(train_ds)),
             "num_val": int(len(val_ds)),
             "input_size": int(args.input_size),
@@ -835,6 +880,8 @@ def main() -> None:
             "root": str(dataset_root),
             "train_split": str(args.train_split),
             "val_split": str(args.val_split),
+            "train_only_stage": str(args.train_only_stage),
+            "val_only_stage": str(args.val_only_stage),
             "num_train": int(len(train_ds)),
             "num_val": int(len(val_ds)),
         },
