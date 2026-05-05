@@ -35,7 +35,7 @@ def vision_observation_to_target_estimate(
     *,
     image_size: Sequence[int] = (256, 256),
     default_cov_m2: float = 1.0e4,
-    pixel_sigma: float = 8.0,
+    pixel_sigma: float | None = None,
     z_value: float | None = None,
 ) -> TargetEstimateState:
     if not obs.detected or obs.center_px is None or obs.crop_center_world is None or obs.gsd is None:
@@ -48,7 +48,7 @@ def vision_observation_to_target_estimate(
             cov=np.eye(dim * 2, dtype=float) * float(default_cov_m2),
             obs_conf=0.0,
             obs_age=0.0,
-            meta={"source": "vision_observation", "valid": False},
+            meta={"source": "vision_observation", "valid": False, **dict(obs.meta or {})},
         )
 
     xy = image_point_to_world_xy(
@@ -62,8 +62,12 @@ def vision_observation_to_target_estimate(
     else:
         pos = np.array([xy[0], xy[1], float(z_value)], dtype=float)
     dim = int(pos.size)
-    sigma_m = max(float(obs.gsd) * float(pixel_sigma), 1e-6)
+    sigma_px = _measurement_sigma_px(obs, pixel_sigma=pixel_sigma)
+    sigma_m = max(float(obs.gsd) * float(sigma_px), 1e-6)
     cov = np.eye(dim * 2, dtype=float) * (sigma_m * sigma_m)
+    meta = {"source": "vision_observation", "valid": True, "pixel_sigma": float(sigma_px)}
+    if obs.meta:
+        meta.update(dict(obs.meta))
     return TargetEstimateState(
         t=float(obs.t),
         pos_world_est=pos,
@@ -71,8 +75,25 @@ def vision_observation_to_target_estimate(
         cov=cov,
         obs_conf=float(obs.score),
         obs_age=0.0,
-        meta={"source": "vision_observation", "valid": True, "pixel_sigma": float(pixel_sigma)},
+        meta=meta,
     )
+
+
+def _measurement_sigma_px(obs: VisionObservation, *, pixel_sigma: float | None) -> float:
+    meta = dict(obs.meta or {})
+    override = meta.get("measurement_sigma_px")
+    if override is not None:
+        return max(float(override), 1.0e-6)
+    if pixel_sigma is not None:
+        return max(float(pixel_sigma), 1.0e-6)
+    stage = str(meta.get("perception_stage", "")).strip().lower()
+    if stage == "far":
+        return 48.0
+    if stage == "mid":
+        return 32.0
+    if stage == "terminal":
+        return 24.0
+    return 32.0
 
 
 def oracle_target_estimate(

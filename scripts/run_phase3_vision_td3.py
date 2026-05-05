@@ -249,6 +249,7 @@ def _init_phase3_dynamic_target(
 def _vision_estimate_from_row(
     *,
     row: dict[str, Any],
+    stage: str,
     pred_center_px: tuple[float, float],
     pred_conf: float,
     current_target_xy: np.ndarray,
@@ -280,12 +281,17 @@ def _vision_estimate_from_row(
         crop_path=str(row.get("image_path")),
         crop_center_world=(float(crop_center_for_current_target[0]), float(crop_center_for_current_target[1])),
         gsd=float(gsd),
-        meta={"source": "cnn_dataset_error_replay", "row_sequence_id": row.get("sequence_id")},
+        meta={
+            "source": "cnn_dataset_error_replay",
+            "row_sequence_id": row.get("sequence_id"),
+            "perception_stage": str(stage),
+            "measurement_sigma_px": _vision_measurement_sigma_px(stage, pred_conf),
+        },
     )
     est = vision_observation_to_target_estimate(
         obs,
         image_size=(256, 256),
-        pixel_sigma=8.0,
+        pixel_sigma=None,
         z_value=float(current_target_z),
     )
     return est, error_km
@@ -305,6 +311,18 @@ def _stage_update_gain(stage: str, args: argparse.Namespace) -> float:
     if stage == "mid":
         return float(np.clip(args.gain_mid, 0.0, 1.0))
     return float(np.clip(args.gain_far, 0.0, 1.0))
+
+
+def _vision_measurement_sigma_px(stage: str, pred_conf: float) -> float:
+    stage = str(stage)
+    if stage == "terminal":
+        base = 24.0
+    elif stage == "mid":
+        base = 32.0
+    else:
+        base = 48.0
+    conf = float(np.clip(pred_conf, 0.35, 1.0))
+    return float(base / conf)
 
 
 def _gate_and_smooth_estimate(
@@ -587,6 +605,7 @@ def main() -> None:
             )
             raw_estimate, vision_error_km = _vision_estimate_from_row(
                 row=sample_row,
+                stage=stage,
                 pred_center_px=(pred_x, pred_y),
                 pred_conf=pred_conf,
                 current_target_xy=np.asarray(truth2d.pos_world, dtype=float).reshape(2),

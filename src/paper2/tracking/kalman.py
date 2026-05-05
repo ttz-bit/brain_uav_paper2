@@ -13,6 +13,8 @@ class KalmanUpdateInfo:
     initialized: bool
     innovation_norm: float
     gate_threshold: float | None
+    innovation_nis: float | None = None
+    reinitialized: bool = False
 
 
 class ConstantVelocityKalmanFilter:
@@ -25,6 +27,9 @@ class ConstantVelocityKalmanFilter:
         process_accel_std: float = 1.0,
         initial_position_var: float = 1.0e4,
         initial_velocity_var: float = 1.0e4,
+        max_reject_streak: int = 3,
+        nis_gate_threshold: float = 11.83,
+        max_obs_age_before_reinit: float = 20.0,
     ) -> None:
         self.dim = int(dim)
         if self.dim <= 0:
@@ -32,12 +37,16 @@ class ConstantVelocityKalmanFilter:
         self.process_accel_std = float(process_accel_std)
         self.initial_position_var = float(initial_position_var)
         self.initial_velocity_var = float(initial_velocity_var)
+        self.max_reject_streak = int(max_reject_streak)
+        self.nis_gate_threshold = float(nis_gate_threshold)
+        self.max_obs_age_before_reinit = float(max_obs_age_before_reinit)
         self.x: np.ndarray | None = None
         self.P: np.ndarray | None = None
         self.t: float | None = None
         self.obs_conf = 0.0
         self.obs_age = 0.0
         self.meta: dict = {}
+        self.reject_streak = 0
 
     @property
     def initialized(self) -> bool:
@@ -50,6 +59,7 @@ class ConstantVelocityKalmanFilter:
         self.obs_conf = 0.0
         self.obs_age = 0.0
         self.meta = {}
+        self.reject_streak = 0
 
     def reset_from_estimate(self, estimate: TargetEstimateState) -> None:
         pos = _as_dim(estimate.pos_world_est, self.dim, fill=0.0)
@@ -66,6 +76,7 @@ class ConstantVelocityKalmanFilter:
         self.obs_conf = float(estimate.obs_conf)
         self.obs_age = float(estimate.obs_age)
         self.meta = dict(estimate.meta or {})
+        self.reject_streak = 0
 
     def predict(self, t: float) -> TargetEstimateState:
         if not self.initialized:
@@ -92,7 +103,7 @@ class ConstantVelocityKalmanFilter:
             if not self.initialized:
                 raise ValueError("Cannot initialize Kalman filter from non-finite measurement.")
             pred = self.predict(float(measurement.t))
-            return pred, KalmanUpdateInfo(False, False, float("inf"), gate_threshold)
+            return pred, KalmanUpdateInfo(False, False, float("inf"), gate_threshold, None, False)
 
         if not self.initialized:
             self.reset_from_estimate(measurement)
@@ -102,10 +113,11 @@ class ConstantVelocityKalmanFilter:
                     "kalman_initialized": True,
                     "kalman_accepted": True,
                     "kalman_innovation_norm": 0.0,
+                    "kalman_innovation_nis": 0.0,
                     "kalman_gate_threshold": gate_threshold,
                 }
             )
-            return est, KalmanUpdateInfo(True, True, 0.0, gate_threshold)
+            return est, KalmanUpdateInfo(True, True, 0.0, gate_threshold, 0.0, False)
 
         self.predict(float(measurement.t))
         assert self.x is not None and self.P is not None
@@ -117,20 +129,49 @@ class ConstantVelocityKalmanFilter:
         r = _measurement_position_cov(measurement.cov, z_dim)
         innovation = z - h @ self.x
         innovation_norm = float(np.linalg.norm(innovation[: min(2, z_dim)]))
-        if gate_threshold is not None and innovation_norm > float(gate_threshold):
-            self.P = self.P * 1.25
+        innovation_xy = innovation[: min(2, z_dim)]
+        h_xy = h[: min(2, z_dim), :]
+        r_xy = r[: min(2, z_dim), : min(2, z_dim)]
+        s_xy = h_xy @ self.P @ h_xy.T + r_xy
+        nis = float(innovation_xy.T @ np.linalg.pinv(s_xy) @ innovation_xy)
+        hard_gate = float(gate_threshold) if gate_threshold is not None else None
+        accepted = nis <= self.nis_gate_threshold
+        if hard_gate is not None:
+            accepted = accepted or innovation_norm <= hard_gate
+
+        if not accepted:
+            self.reject_streak += 1
+            reject_streak = int(self.reject_streak)
+            self.P = self.P * 1.5
             self.obs_conf = min(self.obs_conf, float(measurement.obs_conf)) * 0.5
             self.meta = dict(self.meta)
+            if reject_streak >= self.max_reject_streak or self.obs_age >= self.max_obs_age_before_reinit:
+                self.reset_from_estimate(measurement)
+                est = self.to_estimate(
+                    meta_extra={
+                        "source": "kalman_update",
+                        "kalman_accepted": True,
+                        "kalman_reinitialized": True,
+                        "kalman_reject_streak": reject_streak,
+                        "kalman_innovation_norm": innovation_norm,
+                        "kalman_innovation_nis": nis,
+                        "kalman_gate_threshold": hard_gate,
+                        "raw_measurement_pos_world": z_full.tolist(),
+                    }
+                )
+                return est, KalmanUpdateInfo(True, True, innovation_norm, gate_threshold, nis, True)
             est = self.to_estimate(
                 meta_extra={
                     "source": "kalman_update",
                     "kalman_accepted": False,
+                    "kalman_reject_streak": int(self.reject_streak),
                     "kalman_innovation_norm": innovation_norm,
-                    "kalman_gate_threshold": float(gate_threshold),
+                    "kalman_innovation_nis": nis,
+                    "kalman_gate_threshold": hard_gate,
                     "raw_measurement_pos_world": z_full.tolist(),
                 }
             )
-            return est, KalmanUpdateInfo(False, False, innovation_norm, gate_threshold)
+            return est, KalmanUpdateInfo(False, False, innovation_norm, gate_threshold, nis, False)
 
         s = h @ self.P @ h.T + r
         k = self.P @ h.T @ np.linalg.pinv(s)
@@ -142,16 +183,18 @@ class ConstantVelocityKalmanFilter:
         self.obs_conf = float(measurement.obs_conf)
         self.obs_age = 0.0
         self.meta = dict(measurement.meta or {})
+        self.reject_streak = 0
         est = self.to_estimate(
             meta_extra={
                 "source": "kalman_update",
                 "kalman_accepted": True,
                 "kalman_innovation_norm": innovation_norm,
+                "kalman_innovation_nis": nis,
                 "kalman_gate_threshold": gate_threshold,
                 "raw_measurement_pos_world": z_full.tolist(),
             }
         )
-        return est, KalmanUpdateInfo(True, False, innovation_norm, gate_threshold)
+        return est, KalmanUpdateInfo(True, False, innovation_norm, gate_threshold, nis, False)
 
     def to_estimate(self, *, meta_extra: dict | None = None) -> TargetEstimateState:
         if not self.initialized:
