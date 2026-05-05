@@ -30,6 +30,8 @@ The first two are the key comparison. The KF variants are ablations.
 
 Use `tmux`.
 
+Note: the model files under `outputs/` are local artifacts and are not pushed by Git. Make sure the server already has the same files at the same paths, or copy them there before you start.
+
 ```bash
 cd ~/projects/brain_uav_paper2
 git pull
