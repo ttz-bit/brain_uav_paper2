@@ -12,6 +12,7 @@ import numpy as np
 from paper2.common.config import load_yaml
 from paper2.render.phase3_task_sampler import Phase3TaskFrame, sample_phase3_task_sequence
 from paper2.render.compositor import alpha_blend_center, read_bgra, rotate_bgra, trim_bgra_to_alpha_bbox
+from paper2.render.phase3_map_renderer import Phase3MapRenderer
 from paper2.render.physical_scale import target_dimensions_px_from_km, target_size_km
 
 
@@ -904,15 +905,25 @@ def _label_row(
             "target_width_px": float(target_width_px),
             "obs_valid": bool(visibility > 0.0),
             "asset_mode": str((asset_meta or {}).get("asset_mode", "procedural")),
+            "render_mode": (asset_meta or {}).get("render_mode"),
+            "map_scene_id": (asset_meta or {}).get("map_scene_id"),
             "background_category": str((asset_meta or {}).get("background_category", "unknown")),
             "background_path": (asset_meta or {}).get("background_path"),
             "water_mask_path": (asset_meta or {}).get("water_mask_path"),
+            "water_mask_crop_path": (asset_meta or {}).get("water_mask_crop_path"),
             "background_size_px": (asset_meta or {}).get("background_size_px"),
             "crop_origin_bg_px": (asset_meta or {}).get("crop_origin_bg_px"),
             "crop_origin_xy": (asset_meta or {}).get("crop_origin_bg_px"),
             "crop_bg_xy": (asset_meta or {}).get("crop_origin_bg_px"),
             "crop_top_left": (asset_meta or {}).get("crop_origin_bg_px"),
             "target_bg_center_px": (asset_meta or {}).get("target_bg_center_px"),
+            "crop_center_bg_px": (asset_meta or {}).get("crop_center_bg_px"),
+            "crop_box_bg_xyxy": (asset_meta or {}).get("crop_box_bg_xyxy"),
+            "origin_world_km": (asset_meta or {}).get("origin_world_km"),
+            "anchor_bg_px": (asset_meta or {}).get("anchor_bg_px"),
+            "km_per_bg_px": (asset_meta or {}).get("km_per_bg_px"),
+            "map_width_km": (asset_meta or {}).get("map_width_km"),
+            "map_height_km": (asset_meta or {}).get("map_height_km"),
             "target_asset_path": (asset_meta or {}).get("target_asset_path"),
             "target_water_ratio": float((asset_meta or {}).get("target_water_ratio", 1.0)),
             "distractor_asset_paths": (asset_meta or {}).get("distractor_asset_paths", []),
@@ -934,6 +945,12 @@ def main() -> None:
     parser.add_argument("--frames", type=int, default=40)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--asset-mode", choices=["procedural", "real"], default="procedural")
+    parser.add_argument(
+        "--real-render-mode",
+        choices=["map", "placement"],
+        default="map",
+        help="For real assets, map keeps each sequence on one continuous background map; placement preserves legacy per-frame placement.",
+    )
     parser.add_argument("--assets-root", type=str, default="data/assets/source_stage2")
     parser.add_argument("--target-assets-root", type=str, default="data/assets/source_stage2_v2")
     parser.add_argument("--distractor-assets-root", type=str, default=None)
@@ -945,6 +962,7 @@ def main() -> None:
     parser.add_argument("--placement-attempts", type=int, default=160)
     parser.add_argument("--points-per-background", type=int, default=64)
     parser.add_argument("--sequence-placement-attempts", type=int, default=24)
+    parser.add_argument("--local-map-size-km", type=float, default=12.0)
     parser.add_argument("--distractor-count-min", type=int, default=0)
     parser.add_argument("--distractor-count-max", type=int, default=DISTRACTOR_COUNT_MAX_LIMIT)
     parser.add_argument("--min-distractor-target-distance-px", type=float, default=48.0)
@@ -1054,12 +1072,32 @@ def main() -> None:
                 f"water_mask_root={water_mask_root}"
             )
 
+    map_renderer: Phase3MapRenderer | None = None
+    if args.asset_mode == "real" and args.real_render_mode == "map":
+        map_renderer = Phase3MapRenderer(
+            stage_cfg=stage_cfg,
+            backgrounds_by_split=backgrounds_by_split,
+            targets_by_split=targets_by_split,
+            distractors_by_split=distractors_by_split,
+            rng=np.random.default_rng(base_seed + 900001),
+            local_map_size_km=float(args.local_map_size_km),
+            min_target_water_ratio=float(args.min_target_water_ratio),
+            min_target_visibility=float(args.min_target_visibility),
+            distractor_count_min=int(args.distractor_count_min),
+            distractor_count_max=int(args.distractor_count_max),
+            distractor_scale_min=float(args.distractor_scale_min),
+            distractor_scale_max=float(args.distractor_scale_max),
+            min_distractor_target_distance_px=float(args.min_distractor_target_distance_px),
+            scene_attempts=int(args.sequence_placement_attempts) * 4,
+        )
+
     out_root = Path(args.out_root)
     images_dir = out_root / "images"
+    water_masks_dir = out_root / "water_masks"
     labels_dir = out_root / "labels"
     meta_dir = out_root / "meta"
     reports_dir = out_root / "reports"
-    for path in (images_dir, labels_dir, meta_dir, reports_dir):
+    for path in (images_dir, water_masks_dir, labels_dir, meta_dir, reports_dir):
         path.mkdir(parents=True, exist_ok=True)
 
     label_files = {split: (labels_dir / f"{split}.jsonl").open("w", encoding="utf-8") for split in ("train", "val", "test")}
@@ -1078,7 +1116,7 @@ def main() -> None:
                     seed=base_seed + seq_idx,
                     frames=int(args.frames),
                 )
-                rendered_sequence: list[tuple[Phase3TaskFrame, np.ndarray, list[float], float, dict]] = []
+                rendered_sequence: list[tuple[Phase3TaskFrame, np.ndarray, list[float], float, dict, np.ndarray | None]] = []
                 last_error: Exception | None = None
                 sequence_attempts = max(1, int(args.sequence_placement_attempts))
                 for seq_attempt in range(sequence_attempts):
@@ -1086,7 +1124,7 @@ def main() -> None:
                     seq_background: dict | None = None
                     seq_target: Path | None = None
                     sequence_state: dict = {}
-                    if args.asset_mode == "real":
+                    if args.asset_mode == "real" and args.real_render_mode == "placement":
                         seq_rng = np.random.default_rng(base_seed + seq_idx * 1000003 + seq_attempt * 10007)
                         bg_pool = backgrounds_by_split.get(split, [])
                         target_pool = targets_by_split.get(split, [])
@@ -1095,40 +1133,61 @@ def main() -> None:
                         seq_background = bg_pool[int(seq_rng.integers(0, len(bg_pool)))]
                         seq_target = target_pool[int(seq_rng.integers(0, len(target_pool)))]
                     try:
-                        for frame in rows:
-                            rng = np.random.default_rng(
-                                base_seed + seq_idx * 100000 + int(frame.frame_id) + seq_attempt * 10000019
+                        if args.asset_mode == "real" and args.real_render_mode == "map":
+                            if map_renderer is None:
+                                raise RuntimeError("Phase3 map renderer was not initialized.")
+                            map_renderer.rng = np.random.default_rng(
+                                base_seed + seq_idx * 1000003 + seq_attempt * 10007
                             )
-                            asset_meta: dict | None = None
-                            if args.asset_mode == "real":
-                                canvas, bbox, visibility, asset_meta = _render_real_asset_frame(
-                                    frame,
-                                    stage_cfg=stage_cfg,
-                                    split=split,
-                                    backgrounds_by_split=backgrounds_by_split,
-                                    targets_by_split=targets_by_split,
-                                    distractors_by_split=distractors_by_split,
-                                    image_size=image_size,
-                                    rng=rng,
-                                    min_target_water_ratio=float(args.min_target_water_ratio),
-                                    min_target_visibility=float(args.min_target_visibility),
-                                    placement_attempts=int(args.placement_attempts),
-                                    points_per_background=int(args.points_per_background),
-                                    distractor_count_min=int(args.distractor_count_min),
-                                    distractor_count_max=int(args.distractor_count_max),
-                                    min_distractor_target_distance_px=float(args.min_distractor_target_distance_px),
-                                    distractor_scale_min=float(args.distractor_scale_min),
-                                    distractor_scale_max=float(args.distractor_scale_max),
-                                    fixed_background=seq_background,
-                                    fixed_target=seq_target,
-                                    sequence_state=sequence_state,
-                                    allow_relaxed_water_ratio=bool(args.allow_relaxed_water_ratio),
+                            scene = map_renderer.create_scene(split=split, sequence_id=rows[0].sequence_id, frames=rows)
+                            for frame in rows:
+                                result = map_renderer.render_frame(scene, frame)
+                                rendered_sequence.append(
+                                    (
+                                        frame,
+                                        result.image_bgr,
+                                        result.bbox_xywh,
+                                        float(result.visibility),
+                                        dict(result.meta),
+                                        result.water_mask_crop,
+                                    )
                                 )
-                            else:
-                                canvas = _make_ocean_background(image_size, rng)
-                                bbox, visibility = _draw_target(canvas, frame, rng, stage_cfg)
-                                asset_meta = {"asset_mode": "procedural"}
-                            rendered_sequence.append((frame, canvas, bbox, float(visibility), dict(asset_meta or {})))
+                        else:
+                            for frame in rows:
+                                rng = np.random.default_rng(
+                                    base_seed + seq_idx * 100000 + int(frame.frame_id) + seq_attempt * 10000019
+                                )
+                                asset_meta: dict | None = None
+                                water_mask_crop: np.ndarray | None = None
+                                if args.asset_mode == "real":
+                                    canvas, bbox, visibility, asset_meta = _render_real_asset_frame(
+                                        frame,
+                                        stage_cfg=stage_cfg,
+                                        split=split,
+                                        backgrounds_by_split=backgrounds_by_split,
+                                        targets_by_split=targets_by_split,
+                                        distractors_by_split=distractors_by_split,
+                                        image_size=image_size,
+                                        rng=rng,
+                                        min_target_water_ratio=float(args.min_target_water_ratio),
+                                        min_target_visibility=float(args.min_target_visibility),
+                                        placement_attempts=int(args.placement_attempts),
+                                        points_per_background=int(args.points_per_background),
+                                        distractor_count_min=int(args.distractor_count_min),
+                                        distractor_count_max=int(args.distractor_count_max),
+                                        min_distractor_target_distance_px=float(args.min_distractor_target_distance_px),
+                                        distractor_scale_min=float(args.distractor_scale_min),
+                                        distractor_scale_max=float(args.distractor_scale_max),
+                                        fixed_background=seq_background,
+                                        fixed_target=seq_target,
+                                        sequence_state=sequence_state,
+                                        allow_relaxed_water_ratio=bool(args.allow_relaxed_water_ratio),
+                                    )
+                                else:
+                                    canvas = _make_ocean_background(image_size, rng)
+                                    bbox, visibility = _draw_target(canvas, frame, rng, stage_cfg)
+                                    asset_meta = {"asset_mode": "procedural"}
+                                rendered_sequence.append((frame, canvas, bbox, float(visibility), dict(asset_meta or {}), water_mask_crop))
                     except RuntimeError as exc:
                         last_error = exc
                         continue
@@ -1139,10 +1198,18 @@ def main() -> None:
                         f"attempts={sequence_attempts}. last_error={last_error}"
                     )
 
-                for frame, canvas, bbox, visibility, asset_meta in rendered_sequence:
+                for frame, canvas, bbox, visibility, asset_meta, water_mask_crop in rendered_sequence:
                     image_path = images_dir / split / frame.sequence_id / f"{int(frame.frame_id):04d}.png"
                     image_path.parent.mkdir(parents=True, exist_ok=True)
                     cv2.imwrite(str(image_path), canvas)
+                    if water_mask_crop is not None:
+                        mask_path = water_masks_dir / split / frame.sequence_id / f"{int(frame.frame_id):04d}.png"
+                        mask_path.parent.mkdir(parents=True, exist_ok=True)
+                        cv2.imwrite(str(mask_path), water_mask_crop)
+                        try:
+                            asset_meta["water_mask_crop_path"] = mask_path.resolve().relative_to(project_root).as_posix()
+                        except ValueError:
+                            asset_meta["water_mask_crop_path"] = str(mask_path.resolve())
 
                     label = _label_row(
                         frame,
@@ -1176,6 +1243,8 @@ def main() -> None:
         "image_size": image_size,
         "unit": "km",
         "asset_mode": str(args.asset_mode),
+        "real_render_mode": str(args.real_render_mode) if args.asset_mode == "real" else None,
+        "local_map_size_km": float(args.local_map_size_km) if args.asset_mode == "real" else None,
         "assets_root": str(assets_root) if args.asset_mode == "real" else None,
         "target_assets_root": str(target_assets_root) if args.asset_mode == "real" else None,
         "distractor_assets_root": str(distractor_assets_root) if args.asset_mode == "real" else None,
@@ -1198,6 +1267,7 @@ def main() -> None:
         "sequence_policy": {
             "fixed_background_per_sequence": bool(args.asset_mode == "real"),
             "fixed_target_template_per_sequence": bool(args.asset_mode == "real"),
+            "continuous_map_per_sequence": bool(args.asset_mode == "real" and args.real_render_mode == "map"),
             "allow_relaxed_water_ratio": bool(args.allow_relaxed_water_ratio),
             "min_target_water_ratio": float(args.min_target_water_ratio),
             "distractor_count_min": int(args.distractor_count_min),

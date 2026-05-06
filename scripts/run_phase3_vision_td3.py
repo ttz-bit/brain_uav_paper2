@@ -20,18 +20,26 @@ from paper2.render.asset_registry import AssetRegistry, load_asset_inventory
 from paper2.render.coordinate_mapper import WorldState
 from paper2.models.cnn_heatmap import HeatmapCNN
 from paper2.models.snn_heatmap import HeatmapSNN, peak_argmax_2d, soft_argmax_2d
+from paper2.render.phase3_map_renderer import Phase3MapRenderer
 from paper2.render.renderer_stage2 import Stage2Renderer
 from paper2.planning.paper1_td3_policy import Paper1TD3Policy
 from paper2.tracking.kalman import ConstantVelocityKalmanFilter
 from paper2.tracking.vision_to_estimate import image_point_to_world_xy, vision_observation_to_target_estimate
+from scripts.render_phase3_task_dataset import _collect_backgrounds, _collect_distractors, _collect_targets
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=str, default="configs/env.yaml")
     p.add_argument("--dataset-root", type=str, required=True)
-    p.add_argument("--vision-source", choices=["replay_dataset", "live_render"], default="replay_dataset")
+    p.add_argument(
+        "--vision-source",
+        choices=["replay_dataset", "phase3_map_live", "stage2_live_render", "live_render"],
+        default="replay_dataset",
+    )
     p.add_argument("--render-config", type=str, default="configs/render_stage2_c_v1.yaml")
+    p.add_argument("--phase3-live-generation-config", type=str, default="")
+    p.add_argument("--phase3-live-local-map-size-km", type=float, default=0.0)
     p.add_argument("--render-split", choices=["train", "val", "test"], default="test")
     p.add_argument("--eval-split", choices=["train", "val", "test"], default="test")
     p.add_argument("--vision-weights", type=str, required=True)
@@ -139,6 +147,84 @@ def _target_truth_to_world_state(truth: TargetTruthState) -> WorldState:
         vy=float(vel[1]) if vel.size > 1 else 0.0,
         heading=float(truth.heading),
     )
+
+
+def _phase3_map_frame_to_row(
+    *,
+    result: Any,
+    truth: TargetTruthState,
+    stage: str,
+    stage_cfg: dict[str, Any],
+    image_path: str,
+    sequence_id: str,
+    frame_id: str,
+) -> dict[str, Any]:
+    target_xy = np.asarray(truth.pos_world, dtype=float).reshape(-1)[:2]
+    target_vel = np.asarray(truth.vel_world, dtype=float).reshape(-1)
+    meta = dict(result.meta)
+    target_center_px = np.asarray(meta["target_bg_center_px"], dtype=float).reshape(2)
+    crop_bg = np.asarray(meta["crop_center_bg_px"], dtype=float).reshape(2)
+    crop_box = np.asarray(meta["crop_box_bg_xyxy"], dtype=float).reshape(4)
+    crop_size_bg = max(float(crop_box[2] - crop_box[0]), 1e-9)
+    image_size = int(stage_cfg.get("image_size", 256))
+    target_center_px = np.array(
+        [
+            0.5 * image_size + (target_center_px[0] - crop_bg[0]) * float(image_size) / crop_size_bg,
+            0.5 * image_size + (target_center_px[1] - crop_bg[1]) * float(image_size) / crop_size_bg,
+        ],
+        dtype=float,
+    )
+    gsd_km_per_px = float(stage_cfg[str(stage)]["gsd_km_per_px"])
+    half = float(image_size) * 0.5
+    crop_center_xy = np.array(
+        [
+            float(target_xy[0]) - (float(target_center_px[0]) - half) * gsd_km_per_px,
+            float(target_xy[1]) - (half - float(target_center_px[1])) * gsd_km_per_px,
+        ],
+        dtype=float,
+    )
+    meta.update(
+        {
+            "source": "phase3_map_live",
+            "observation_geometry_unit": "km",
+            "crop_center_world": [float(crop_center_xy[0]), float(crop_center_xy[1])],
+            "crop_center_world_x": float(crop_center_xy[0]),
+            "crop_center_world_y": float(crop_center_xy[1]),
+            "target_state_world": {
+                "x": float(target_xy[0]),
+                "y": float(target_xy[1]),
+                "vx": float(target_vel[0]) if target_vel.size > 0 else 0.0,
+                "vy": float(target_vel[1]) if target_vel.size > 1 else 0.0,
+                "heading": float(truth.heading),
+                "motion_mode": str(truth.motion_mode),
+                "unit": "km",
+            },
+            "target_world_x": float(target_xy[0]),
+            "target_world_y": float(target_xy[1]),
+            "target_center_px": [float(target_center_px[0]), float(target_center_px[1])],
+            "center_x": float(target_center_px[0]),
+            "center_y": float(target_center_px[1]),
+            "gsd": float(gsd_km_per_px),
+            "gsd_km_per_px": float(gsd_km_per_px),
+        }
+    )
+    return {
+        "image_path": str(image_path),
+        "sequence_id": str(sequence_id),
+        "frame_id": str(frame_id),
+        "stage": str(stage),
+        "vision_source": "phase3_map_live",
+        "render_mode": "phase3_map",
+        "background_asset_id": Path(str(meta.get("background_path", "phase3_map"))).stem,
+        "target_asset_id": Path(str(meta.get("target_asset_path", "phase3_target"))).stem,
+        "distractor_asset_ids": [Path(str(p)).stem for p in meta.get("distractor_asset_paths", [])],
+        "gsd_km_per_px": float(gsd_km_per_px),
+        "target_center_px": [float(target_center_px[0]), float(target_center_px[1])],
+        "bbox_xywh": list(result.bbox_xywh),
+        "visibility": float(result.visibility),
+        "obs_valid": bool(result.visibility > 0.0),
+        "meta": meta,
+    }
 
 
 def _live_frame_to_phase3_row(
@@ -745,15 +831,18 @@ def main() -> None:
         if decode_method == "heatmap_argmax":
             decode_method = "argmax"
 
-    replay_mode = str(args.vision_source) == "replay_dataset"
+    vision_source = str(args.vision_source)
+    replay_mode = vision_source == "replay_dataset"
+    stage2_live_mode = vision_source in {"live_render", "stage2_live_render"}
     rows: list[dict[str, Any]] = []
     grouped: dict[str, list[dict[str, Any]]] = {"far": [], "mid": [], "terminal": []}
     live_renderer: Stage2Renderer | None = None
+    phase3_live_renderer: Phase3MapRenderer | None = None
     if replay_mode:
         label_path = dataset_root / "labels" / f"{args.eval_split}.jsonl"
         rows = _read_jsonl(label_path, max_rows=args.max_vision_samples)
         grouped = _group_rows_by_stage(rows)
-    else:
+    elif stage2_live_mode:
         render_cfg = load_yaml(args.render_config)
         inventory_csv = Path(render_cfg["assets"]["inventory_csv"]).expanduser().resolve()
         if not inventory_csv.is_absolute():
@@ -768,6 +857,57 @@ def main() -> None:
             project_root=Path(__file__).resolve().parents[1],
             output_root=live_assets_dir,
             rng=np.random.default_rng(int(args.seed)),
+        )
+    else:
+        generation_config_path = (
+            Path(args.phase3_live_generation_config).resolve()
+            if str(args.phase3_live_generation_config).strip()
+            else (dataset_root / "meta" / "generation_config.json").resolve()
+        )
+        if not generation_config_path.exists():
+            raise FileNotFoundError(
+                f"Phase3 map live render needs a generation config: {generation_config_path}. "
+                "Pass --phase3-live-generation-config or use a Phase3 rendered dataset root."
+            )
+        gen_cfg = json.loads(generation_config_path.read_text(encoding="utf-8"))
+        assets_root = Path(str(gen_cfg["assets_root"])).resolve()
+        target_assets_root = Path(str(gen_cfg.get("target_assets_root") or gen_cfg["assets_root"])).resolve()
+        distractor_assets_root = Path(str(gen_cfg.get("distractor_assets_root") or gen_cfg["assets_root"])).resolve()
+        water_mask_root = Path(str(gen_cfg.get("water_mask_root") or (assets_root / "water_masks_auto"))).resolve()
+        target_filter = dict(gen_cfg.get("target_template_filter") or {})
+        distractor_filter = dict(gen_cfg.get("distractor_template_filter") or {})
+        backgrounds_by_split = _collect_backgrounds(assets_root, water_mask_root, skip_review=True)
+        targets_by_split = _collect_targets(
+            target_assets_root,
+            allow_keywords=tuple(target_filter.get("allow_keywords") or ()),
+            reject_keywords=tuple(target_filter.get("reject_keywords") or ()),
+        )
+        distractors_by_split = _collect_distractors(
+            distractor_assets_root,
+            allow_keywords=tuple(distractor_filter.get("allow_keywords") or ()),
+            reject_keywords=tuple(distractor_filter.get("reject_keywords") or ()),
+        )
+        policy_cfg = dict(gen_cfg.get("sequence_policy") or {})
+        local_map_size_km = float(args.phase3_live_local_map_size_km)
+        if local_map_size_km <= 0.0:
+            far_crop_km = float(stage_cfg["far"]["gsd_km_per_px"]) * float(stage_cfg.get("image_size", 256))
+            motion_budget_km = float(target_cfg["speed_range"]["max"]) * float(args.steps) * 2.5
+            local_map_size_km = max(float(gen_cfg.get("local_map_size_km") or 24.0), far_crop_km + motion_budget_km)
+        phase3_live_renderer = Phase3MapRenderer(
+            stage_cfg=stage_cfg,
+            backgrounds_by_split=backgrounds_by_split,
+            targets_by_split=targets_by_split,
+            distractors_by_split=distractors_by_split,
+            rng=np.random.default_rng(int(args.seed)),
+            local_map_size_km=local_map_size_km,
+            min_target_water_ratio=float(policy_cfg.get("min_target_water_ratio", 0.98)),
+            min_target_visibility=0.35,
+            distractor_count_min=int(policy_cfg.get("distractor_count_min", 0)),
+            distractor_count_max=int(policy_cfg.get("distractor_count_max", 0)),
+            distractor_scale_min=float(policy_cfg.get("distractor_scale_min", 0.45)),
+            distractor_scale_max=float(policy_cfg.get("distractor_scale_max", 0.85)),
+            min_distractor_target_distance_px=float(policy_cfg.get("min_distractor_target_distance_px", 48.0)),
+            scene_attempts=128,
         )
     paper1_curriculum_mix = parse_curriculum_mix(
         args.paper1_curriculum_mix,
@@ -806,6 +946,15 @@ def main() -> None:
             ep_rng,
             str(args.phase3_target_init),
         )
+        phase3_live_scene = (
+            phase3_live_renderer.create_live_scene(
+                split=str(args.render_split),
+                sequence_id=f"phase3_live_{ep:04d}",
+                target_world_xy=np.asarray(truth2d.pos_world, dtype=float).reshape(-1)[:2],
+            )
+            if phase3_live_renderer is not None
+            else None
+        )
         zones = bridge.get_no_fly_zones()
         ep_rows: list[dict[str, Any]] = []
         capture_radius_km = (
@@ -831,7 +980,7 @@ def main() -> None:
                 image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
                 if image is None:
                     raise FileNotFoundError(f"Could not read vision sample image: {image_path}")
-            else:
+            elif stage2_live_mode:
                 if live_renderer is None or live_scene is None:
                     raise RuntimeError("Live renderer was not initialized.")
                 live_state = _target_truth_to_world_state(truth2d)
@@ -846,6 +995,26 @@ def main() -> None:
                     frame_id=f"{step_idx:04d}",
                 )
                 image = live_frame.image_bgr
+            else:
+                if phase3_live_renderer is None or phase3_live_scene is None:
+                    raise RuntimeError("Phase3 map live renderer was not initialized.")
+                phase3_live_renderer.rng = np.random.default_rng(ep_seed * 1000003 + step_idx)
+                live_result = phase3_live_renderer.render_truth(
+                    phase3_live_scene,
+                    truth=truth2d,
+                    stage=stage,
+                    frame_id=step_idx,
+                )
+                sample_row = _phase3_map_frame_to_row(
+                    result=live_result,
+                    truth=truth2d,
+                    stage=stage,
+                    stage_cfg=stage_cfg,
+                    image_path=f"phase3_map_live/ep{ep:03d}_step{step_idx:04d}.png",
+                    sequence_id=f"phase3_map_live_{ep:04d}",
+                    frame_id=f"{step_idx:04d}",
+                )
+                image = live_result.image_bgr
 
             pred_x, pred_y, pred_conf = _predict_vision(
                 vision_model,
@@ -917,7 +1086,7 @@ def main() -> None:
                 "episode": int(ep),
                 "step": int(step_idx),
                 "t": float(aircraft.t),
-                "vision_source": "replay_dataset" if replay_mode else "live_render",
+                "vision_source": vision_source,
                 "observer": str(vision_model_type),
                 "estimate_filter": str(args.estimate_filter),
                 "planner": f"paper1_{args.model}_td3",
@@ -1000,7 +1169,7 @@ def main() -> None:
         "purpose": "vision_observer_closed_loop_eval",
         "config": str(args.config),
         "env_source": env_source,
-        "vision_source": str(args.vision_source),
+        "vision_source": vision_source,
         "planner": f"paper1_{args.model}_td3",
         "observer": str(vision_model_type),
         "estimate_filter": str(args.estimate_filter),
@@ -1063,7 +1232,7 @@ def main() -> None:
             "checkpoint_loaded": bool(policy is not None and not policy.random_init),
             "no_zone_violations": bool((violation_counts.sum() if violation_counts.size else 0) == 0),
             "finite_ranges": bool(np.isfinite(min_ranges).all() and np.isfinite(final_ranges).all()),
-            "vision_source_valid": bool(replay_mode or live_renderer is not None),
+            "vision_source_valid": bool(replay_mode or live_renderer is not None or phase3_live_renderer is not None),
         },
         "artifacts": {
             "report_path": str(out_dir / "report.json"),

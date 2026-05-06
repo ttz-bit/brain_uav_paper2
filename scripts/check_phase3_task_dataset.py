@@ -59,6 +59,8 @@ def main() -> None:
     sequence_range_monotonic_violations = 0
     sequence_motion_mode_violations = 0
     sequence_distractor_count_violations = 0
+    sequence_map_continuity_violations = 0
+    sequence_map_metadata_violations = 0
     target_motion_step_violations = 0
     crop_origin_missing = 0
     water_mask_missing = 0
@@ -108,12 +110,26 @@ def main() -> None:
             meta = dict(row.get("meta", {}))
             asset_mode = str(meta.get("asset_mode", "")).lower()
             water_mask_path_raw = meta.get("water_mask_path")
+            water_mask_crop_path_raw = meta.get("water_mask_crop_path")
             crop_origin = _crop_origin_from_meta(meta)
-            if asset_mode == "real":
+            if asset_mode.startswith("real"):
                 if not water_mask_path_raw:
                     water_mask_missing += 1
-                if crop_origin is None:
+                if crop_origin is None and not water_mask_crop_path_raw:
                     crop_origin_missing += 1
+            if water_mask_crop_path_raw:
+                crop_path = Path(str(water_mask_crop_path_raw))
+                if not crop_path.is_absolute():
+                    crop_path = Path.cwd() / crop_path
+                crop = cv2.imread(str(crop_path), cv2.IMREAD_GRAYSCALE)
+                if crop is None or crop.shape[:2] != (h, w):
+                    water_mask_crop_violations += 1
+                else:
+                    mx = min(max(int(round(cx)), 0), crop.shape[1] - 1)
+                    my = min(max(int(round(cy)), 0), crop.shape[0] - 1)
+                    if crop[my, mx] <= 0:
+                        water_mask_target_center_violations += 1
+                water_mask_path_raw = None
             if water_mask_path_raw:
                 if not isinstance(crop_origin, (list, tuple)) or len(crop_origin) < 2:
                     crop_origin_missing += 1
@@ -204,6 +220,31 @@ def main() -> None:
         if len(set(seq_distractor_counts)) > 1:
             sequence_distractor_count_violations += 1
 
+        map_rows = [row for row in seq_rows if str(dict(row.get("meta", {})).get("render_mode", "")) == "phase3_map"]
+        if map_rows:
+            map_scene_ids = {str(dict(row.get("meta", {})).get("map_scene_id", "")) for row in map_rows}
+            if len(map_scene_ids) != 1:
+                sequence_map_metadata_violations += 1
+            prev_bg_xy = None
+            for row in map_rows:
+                meta = dict(row.get("meta", {}))
+                if "target_bg_center_px" not in meta or "crop_center_bg_px" not in meta or "km_per_bg_px" not in meta:
+                    sequence_map_metadata_violations += 1
+                    continue
+                bg_xy = np.asarray(meta["target_bg_center_px"], dtype=float).reshape(2)
+                if prev_bg_xy is not None:
+                    step_px = float(np.linalg.norm(bg_xy - prev_bg_xy))
+                    km_per_bg_px = float(meta.get("km_per_bg_px", 0.0))
+                    target_state = dict(meta.get("target_state_world", {}))
+                    # Allow a little tolerance above the physical motion step.
+                    vx = float(target_state.get("vx", 0.0))
+                    vy = float(target_state.get("vy", 0.0))
+                    expected_px = float(np.hypot(vx, vy)) / max(km_per_bg_px, 1e-12)
+                    if step_px > max(2.0, expected_px * 2.5 + 1.0):
+                        sequence_map_continuity_violations += 1
+                        break
+                prev_bg_xy = bg_xy
+
         prev_xy = None
         for row in seq_rows:
             target_state = dict(dict(row.get("meta", {})).get("target_state_world", {}))
@@ -261,6 +302,8 @@ def main() -> None:
         "sequence_range_monotonic_violations": int(sequence_range_monotonic_violations),
         "sequence_motion_mode_violations": int(sequence_motion_mode_violations),
         "sequence_distractor_count_violations": int(sequence_distractor_count_violations),
+        "sequence_map_continuity_violations": int(sequence_map_continuity_violations),
+        "sequence_map_metadata_violations": int(sequence_map_metadata_violations),
         "target_motion_step_violations": int(target_motion_step_violations),
         "crop_origin_missing": int(crop_origin_missing),
         "water_mask_missing": int(water_mask_missing),
@@ -287,6 +330,8 @@ def main() -> None:
             and sequence_range_monotonic_violations == 0
             and sequence_motion_mode_violations == 0
             and sequence_distractor_count_violations == 0
+            and sequence_map_continuity_violations == 0
+            and sequence_map_metadata_violations == 0
             and target_motion_step_violations == 0
             and crop_origin_missing == 0
             and water_mask_missing == 0
