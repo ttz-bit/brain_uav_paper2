@@ -27,6 +27,7 @@ class Phase3MapScene:
     km_per_bg_px: float
     map_width_km: float
     map_height_km: float
+    distractor_count_requested: int
     distractor_tracks: list["Phase3MapDistractorTrack"]
     prev_crop_center_world: np.ndarray | None = None
 
@@ -139,6 +140,7 @@ class Phase3MapRenderer:
                 km_per_bg_px=float(km_per_bg_px),
                 map_width_km=float(map_width_km),
                 map_height_km=float(map_height_km),
+                distractor_count_requested=0,
                 distractor_tracks=[],
             )
             scene.distractor_tracks = self._init_distractors(scene)
@@ -195,7 +197,8 @@ class Phase3MapRenderer:
         distractor_bboxes: list[list[float]] = []
         distractor_water_ratios: list[float] = []
         distractor_visibilities: list[float] = []
-        for track in scene.distractor_tracks:
+        rendered_tracks: list[Phase3MapDistractorTrack] = []
+        for track in list(scene.distractor_tracks):
             self._advance_distractor(track, scene)
             rendered = self._render_distractor(canvas, water_crop, scene, track, crop_bg, crop_size_bg, target_center, stage)
             if rendered is not None:
@@ -204,6 +207,44 @@ class Phase3MapRenderer:
                 distractor_bboxes.append(bbox_d)
                 distractor_visibilities.append(float(vis_d))
                 distractor_water_ratios.append(float(wr_d))
+                rendered_tracks.append(track)
+
+        desired_distractors = int(scene.distractor_count_requested)
+        desired_distractors = min(max(desired_distractors, self.distractor_count_min), self.distractor_count_max)
+        for _ in range(max(0, desired_distractors - len(distractor_bboxes))):
+            track = self._sample_visible_distractor(
+                scene=scene,
+                water_crop=water_crop,
+                crop_bg=crop_bg,
+                crop_size_bg=crop_size_bg,
+                target_center=target_center,
+                stage=stage,
+                existing_bboxes=distractor_bboxes,
+            )
+            if track is None:
+                break
+            rendered = self._render_distractor(canvas, water_crop, scene, track, crop_bg, crop_size_bg, target_center, stage)
+            if rendered is None:
+                continue
+            bbox_d, vis_d, wr_d = rendered
+            scene.distractor_tracks.append(track)
+            rendered_tracks.append(track)
+            distractor_asset_paths.append(track.asset_path)
+            distractor_bboxes.append(bbox_d)
+            distractor_visibilities.append(float(vis_d))
+            distractor_water_ratios.append(float(wr_d))
+
+        if len(distractor_bboxes) < self.distractor_count_min:
+            raise RuntimeError(
+                f"Phase3 map visible distractor shortfall: visible={len(distractor_bboxes)}, "
+                f"required_min={self.distractor_count_min}, sequence={scene.scene_id}, frame={frame.frame_id}"
+            )
+
+        if scene.distractor_tracks:
+            rendered_ids = {id(track) for track in rendered_tracks}
+            carryover = [track for track in scene.distractor_tracks if id(track) not in rendered_ids]
+            max_keep = max(desired_distractors, self.distractor_count_min)
+            scene.distractor_tracks = (rendered_tracks + carryover)[:max_keep]
 
         target_water_ratio = _alpha_water_ratio(water_crop, target, target_center[0], target_center[1])
         bbox_tuple, visibility = alpha_blend_center(canvas, target, target_center[0], target_center[1])
@@ -248,8 +289,9 @@ class Phase3MapRenderer:
             "distractor_bboxes_xywh": distractor_bboxes,
             "distractor_water_ratios": distractor_water_ratios,
             "distractor_visibilities": distractor_visibilities,
-            "distractor_count_requested": int(len(scene.distractor_tracks)),
-            "distractor_count": int(len(scene.distractor_tracks)),
+            "distractor_count_requested": int(desired_distractors),
+            "distractor_count": int(len(distractor_bboxes)),
+            "distractor_track_count": int(len(scene.distractor_tracks)),
         }
         return Phase3MapRenderResult(
             image_bgr=canvas,
@@ -318,6 +360,17 @@ class Phase3MapRenderer:
             dtype=float,
         )
 
+    @staticmethod
+    def image_to_bg(image_xy: np.ndarray, crop_bg_xy: np.ndarray, crop_size_bg: float, image_size: int) -> np.ndarray:
+        scale = float(image_size) / max(float(crop_size_bg), 1e-12)
+        return np.array(
+            [
+                float(float(crop_bg_xy[0]) + (float(image_xy[0]) - 0.5 * image_size) / max(scale, 1e-12)),
+                float(float(crop_bg_xy[1]) + (float(image_xy[1]) - 0.5 * image_size) / max(scale, 1e-12)),
+            ],
+            dtype=float,
+        )
+
     def _sample_anchor(self, mask: np.ndarray, frames: list[Any], km_per_bg_px: float) -> tuple[float, float] | None:
         image_size = int(self.stage_cfg.get("image_size", 256))
         h, w = mask.shape[:2]
@@ -363,8 +416,10 @@ class Phase3MapRenderer:
         count_max = self.distractor_count_max
         pool = self.distractors_by_split.get(scene.split, [])
         if count_max <= 0 or not pool:
+            scene.distractor_count_requested = 0
             return []
         desired = int(self.rng.integers(self.distractor_count_min, count_max + 1))
+        scene.distractor_count_requested = int(desired)
         if desired <= 0:
             return []
         water = scene.water_mask > 0
@@ -401,6 +456,82 @@ class Phase3MapRenderer:
                 )
                 break
         return tracks
+
+    def _sample_visible_distractor(
+        self,
+        *,
+        scene: Phase3MapScene,
+        water_crop: np.ndarray,
+        crop_bg: np.ndarray,
+        crop_size_bg: float,
+        target_center: np.ndarray,
+        stage: str,
+        existing_bboxes: list[list[float]],
+    ) -> Phase3MapDistractorTrack | None:
+        pool = self.distractors_by_split.get(scene.split, [])
+        if not pool:
+            return None
+        image_size = int(self.stage_cfg.get("image_size", 256))
+        water = water_crop > 0
+        yy, xx = np.where(water)
+        if len(xx) <= 0:
+            return None
+        existing_centers = [
+            np.array([float(box[0]) + 0.5 * float(box[2]), float(box[1]) + 0.5 * float(box[3])], dtype=float)
+            for box in existing_bboxes
+            if len(box) >= 4
+        ]
+        for _ in range(192):
+            path = pool[int(self.rng.integers(0, len(pool)))]
+            scale_factor = float(self.rng.uniform(self.distractor_scale_min, self.distractor_scale_max))
+            scale_by_stage = {}
+            for stage_name in ("far", "mid", "terminal"):
+                gsd = float(self.stage_cfg[stage_name]["gsd_km_per_px"])
+                target_len, _ = target_dimensions_px_from_km(
+                    gsd_km_per_px=gsd,
+                    stage_cfg=self.stage_cfg,
+                    image_size=image_size,
+                )
+                scale_by_stage[stage_name] = float(target_len * scale_factor)
+            scale_px = float(scale_by_stage[str(stage)])
+            try:
+                distractor = trim_bgra_to_alpha_bbox(read_bgra(path))
+            except Exception:
+                continue
+            distractor = _resize_bgra_to_long_side(distractor, scale_px, image_size)
+            distractor = rotate_bgra(distractor, float(self.rng.uniform(0.0, 360.0)))
+            distractor = trim_bgra_to_alpha_bbox(distractor)
+            dh, dw = distractor.shape[:2]
+            radius = max(2.0, 0.5 * float(max(dh, dw)))
+
+            idx = int(self.rng.integers(0, len(xx)))
+            center = np.array([float(xx[idx]), float(yy[idx])], dtype=float)
+            if center[0] - radius < 0.0 or center[1] - radius < 0.0:
+                continue
+            if center[0] + radius >= image_size or center[1] + radius >= image_size:
+                continue
+            if float(np.linalg.norm(center - np.asarray(target_center, dtype=float).reshape(2))) < self.min_distractor_target_distance_px:
+                continue
+            if any(float(np.linalg.norm(center - other)) < self.min_distractor_target_distance_px for other in existing_centers):
+                continue
+            if _alpha_water_ratio(water_crop, distractor, center[0], center[1]) < 0.98:
+                continue
+            bg_xy = self.image_to_bg(center, crop_bg, crop_size_bg, image_size)
+            h, w = scene.water_mask.shape[:2]
+            ix = int(round(float(bg_xy[0])))
+            iy = int(round(float(bg_xy[1])))
+            if ix < 0 or iy < 0 or ix >= w or iy >= h or scene.water_mask[iy, ix] <= 0:
+                continue
+            return Phase3MapDistractorTrack(
+                asset_path=str(path),
+                bg_px=bg_xy,
+                heading=float(self.rng.uniform(-np.pi, np.pi)),
+                speed_bg_px=float(self.rng.uniform(0.15, 0.65)),
+                scale_px_by_stage=scale_by_stage,
+                radius_bg_px=float(radius * crop_size_bg / max(float(image_size), 1e-12)),
+                count_requested=int(scene.distractor_count_requested),
+            )
+        return None
 
     def _advance_distractor(self, track: Phase3MapDistractorTrack, scene: Phase3MapScene) -> None:
         step = np.array([np.cos(track.heading), -np.sin(track.heading)], dtype=float) * float(track.speed_bg_px)

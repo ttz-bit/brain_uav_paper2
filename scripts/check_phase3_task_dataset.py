@@ -171,8 +171,8 @@ def main() -> None:
             target_water_ratios.append(target_water_ratio)
             if target_water_ratio < 0.98:
                 target_water_ratio_violations += 1
-            distractor_ids = list(row.get("distractor_asset_ids", []))
-            distractor_count = int(meta.get("distractor_count", len(distractor_ids)))
+            distractor_bboxes = list(meta.get("distractor_bboxes_xywh", []))
+            distractor_count = len(distractor_bboxes)
             distractor_count_requested = int(meta.get("distractor_count_requested", 0))
             distractor_counts.append(distractor_count)
             if distractor_count < distractor_count_requested:
@@ -216,7 +216,7 @@ def main() -> None:
             mode = next(iter(seq_modes))
             motion_mode_sequence_counts[mode] = motion_mode_sequence_counts.get(mode, 0) + 1
 
-        seq_distractor_counts = [int(dict(row.get("meta", {})).get("distractor_count", 0)) for row in seq_rows]
+        seq_distractor_counts = [len(list(dict(row.get("meta", {})).get("distractor_bboxes_xywh", []))) for row in seq_rows]
         if len(set(seq_distractor_counts)) > 1:
             sequence_distractor_count_violations += 1
 
