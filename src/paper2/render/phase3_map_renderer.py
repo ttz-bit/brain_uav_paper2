@@ -234,10 +234,10 @@ class Phase3MapRenderer:
             distractor_visibilities.append(float(vis_d))
             distractor_water_ratios.append(float(wr_d))
 
-        if len(distractor_bboxes) < self.distractor_count_min:
+        if len(distractor_bboxes) < desired_distractors:
             raise RuntimeError(
                 f"Phase3 map visible distractor shortfall: visible={len(distractor_bboxes)}, "
-                f"required_min={self.distractor_count_min}, sequence={scene.scene_id}, frame={frame.frame_id}"
+                f"required={desired_distractors}, sequence={scene.scene_id}, frame={frame.frame_id}"
             )
 
         if scene.distractor_tracks:
@@ -481,7 +481,7 @@ class Phase3MapRenderer:
             for box in existing_bboxes
             if len(box) >= 4
         ]
-        for _ in range(192):
+        for _ in range(512):
             path = pool[int(self.rng.integers(0, len(pool)))]
             scale_factor = float(self.rng.uniform(self.distractor_scale_min, self.distractor_scale_max))
             scale_by_stage = {}
@@ -571,7 +571,7 @@ class Phase3MapRenderer:
         distractor = rotate_bgra(distractor, float(np.degrees(track.heading)))
         distractor = trim_bgra_to_alpha_bbox(distractor)
         water_ratio = _alpha_water_ratio(water_crop, distractor, center[0], center[1])
-        if water_ratio < 0.85:
+        if water_ratio < 0.98:
             return None
         bbox_tuple, visibility = alpha_blend_center(canvas, distractor, center[0], center[1])
         if visibility <= 0.0:
