@@ -335,11 +335,11 @@ def _stage_to_value(stage: str) -> int:
 
 def _stage_to_gsd(stage: str) -> float:
     if stage == "terminal":
-        return 0.2
+        return 0.005
     if stage == "mid":
-        return 1.0
+        return 0.010
     if stage == "far":
-        return 2.5
+        return 0.020
     return float("nan")
 
 

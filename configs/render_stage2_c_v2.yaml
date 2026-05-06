@@ -21,22 +21,22 @@ splits:
 
 stages:
   far:
-    gsd_m_per_px: 25.0
+    gsd_m_per_px: 20.0
     perception_dt: 1.0
     observation_source: external_cue
-    center_jitter_px: 12.0
+    center_jitter_px: 40.0
     target_scale_range: [0.06, 0.12]
   mid:
-    gsd_m_per_px: 25.0
+    gsd_m_per_px: 10.0
     perception_dt: 1.0
     observation_source: onboard_midrange
-    center_jitter_px: 24.0
+    center_jitter_px: 35.0
     target_scale_range: [0.09, 0.16]
   terminal:
-    gsd_m_per_px: 10.0
+    gsd_m_per_px: 5.0
     perception_dt: 0.5
     observation_source: onboard_terminal
-    center_jitter_px: 40.0
+    center_jitter_px: 30.0
     target_scale_range: [0.14, 0.24]
 
 motion_modes:
@@ -63,7 +63,10 @@ perturbations:
   compression_prob: 0.15
 
 target:
-  scale_mode: stage_progressive
+  scale_mode: physical_gsd
+  physical_size_m:
+    length_m: 200.0
+    width_m: 40.0
   fixed_scale_range: [0.10, 0.14]
   max_step_px: 5.0
   allowed_categories: ["boat_top"]

@@ -12,13 +12,9 @@ import numpy as np
 from paper2.common.config import load_yaml
 from paper2.render.phase3_task_sampler import Phase3TaskFrame, sample_phase3_task_sequence
 from paper2.render.compositor import alpha_blend_center, read_bgra, rotate_bgra, trim_bgra_to_alpha_bbox
+from paper2.render.physical_scale import target_dimensions_px_from_km, target_size_km
 
 
-STAGE_SCALE_PX = {
-    "far": 10.0,
-    "mid": 18.0,
-    "terminal": 32.0,
-}
 DISTRACTOR_SCALE_RANGE = (0.45, 0.85)
 DISTRACTOR_MOTION_MODES = ("cv", "turn", "piecewise")
 DISTRACTOR_COUNT_MAX_LIMIT = 3
@@ -34,6 +30,14 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 DEFAULT_TARGET_ALLOW_KEYWORDS = ("top", "overhead", "aerial", "bird", "vertical")
 DEFAULT_TARGET_REJECT_KEYWORDS = ("side", "oblique", "profile", "tilt", "perspective", "front", "rear")
 DEFAULT_DISTRACTOR_REJECT_KEYWORDS = DEFAULT_TARGET_REJECT_KEYWORDS
+
+
+def _target_dimensions_px(frame: Phase3TaskFrame, stage_cfg: dict) -> tuple[float, float]:
+    return target_dimensions_px_from_km(
+        gsd_km_per_px=float(frame.gsd_km_per_px),
+        stage_cfg=stage_cfg,
+        image_size=int(stage_cfg.get("image_size", 256)),
+    )
 
 
 def _split_for_sequence(seq_idx: int, total: int) -> str:
@@ -300,6 +304,7 @@ def _sample_distractor_track(
     target_clearance_px: float,
     rng: np.random.Generator,
     stage: str,
+    stage_cfg: dict,
     image_size: int,
     count_requested: int,
     scale_range: tuple[float, float],
@@ -320,7 +325,13 @@ def _sample_distractor_track(
     for _ in range(96):
         path = distractor_pool[int(rng.integers(0, len(distractor_pool)))]
         distractor = trim_bgra_to_alpha_bbox(read_bgra(path))
-        scale_px = float(STAGE_SCALE_PX.get(stage, 18.0)) * float(rng.uniform(scale_min, scale_max))
+        stage_gsd = float(stage_cfg[str(stage)]["gsd_km_per_px"])
+        target_length_px, _ = target_dimensions_px_from_km(
+            gsd_km_per_px=stage_gsd,
+            stage_cfg=stage_cfg,
+            image_size=image_size,
+        )
+        scale_px = float(target_length_px) * float(rng.uniform(scale_min, scale_max))
         distractor = _resize_bgra_to_long_side(distractor, scale_px, image_size)
         distractor = rotate_bgra(distractor, float(rng.uniform(0.0, 360.0)))
         distractor = trim_bgra_to_alpha_bbox(distractor)
@@ -479,6 +490,7 @@ def _render_distractor_track(
 def _render_real_asset_frame(
     frame: Phase3TaskFrame,
     *,
+    stage_cfg: dict,
     split: str,
     backgrounds_by_split: dict[str, list[dict]],
     targets_by_split: dict[str, list[Path]],
@@ -529,7 +541,8 @@ def _render_real_asset_frame(
         target_path = Path(fixed_target) if fixed_target is not None else target_pool[int(rng.integers(0, len(target_pool)))]
         target = read_bgra(target_path)
         target = trim_bgra_to_alpha_bbox(target)
-        target = _resize_bgra_to_long_side(target, STAGE_SCALE_PX.get(frame.stage, 18.0), image_size)
+        target_length_px, target_width_px = _target_dimensions_px(frame, stage_cfg)
+        target = _resize_bgra_to_long_side(target, target_length_px, image_size)
         angle_deg = -float(np.degrees(frame.target_state_world["heading"]))
         target = rotate_bgra(target, angle_deg)
         target = trim_bgra_to_alpha_bbox(target)
@@ -585,6 +598,7 @@ def _render_real_asset_frame(
                             target_clearance_px=float(target_clearance_px),
                             rng=rng,
                             stage=frame.stage,
+                            stage_cfg=stage_cfg,
                             image_size=image_size,
                             count_requested=desired,
                             scale_range=(float(distractor_scale_min), float(distractor_scale_max)),
@@ -653,6 +667,8 @@ def _render_real_asset_frame(
                 "target_bg_center_px": [float(target_bg_x), float(target_bg_y)],
                 "background_category": _infer_background_category_from_path(bg_path),
                 "target_asset_path": str(target_path),
+                "target_length_px": float(target_length_px),
+                "target_width_px": float(target_width_px),
                 "target_water_ratio": float(ratio),
                 "distractor_asset_paths": [d["asset_path"] for d in distractor_meta],
                 "distractor_bboxes_xywh": [d["bbox_xywh"] for d in distractor_meta],
@@ -719,9 +735,7 @@ def _place_distractors(
             path = distractor_pool[int(rng.integers(0, len(distractor_pool)))]
             distractor = read_bgra(path)
             distractor = trim_bgra_to_alpha_bbox(distractor)
-            scale = float(STAGE_SCALE_PX.get(stage, 18.0)) * float(
-                rng.uniform(scale_min, scale_max)
-            )
+            scale = target_long * float(rng.uniform(scale_min, scale_max))
             distractor = _resize_bgra_to_long_side(distractor, scale, image_w)
             distractor = rotate_bgra(distractor, float(rng.uniform(0.0, 360.0)))
             distractor = trim_bgra_to_alpha_bbox(distractor)
@@ -765,12 +779,16 @@ def _place_distractors(
     return placed, True
 
 
-def _draw_target(canvas: np.ndarray, frame: Phase3TaskFrame, rng: np.random.Generator) -> tuple[list[float], float]:
+def _draw_target(
+    canvas: np.ndarray,
+    frame: Phase3TaskFrame,
+    rng: np.random.Generator,
+    stage_cfg: dict,
+) -> tuple[list[float], float]:
     cx, cy = float(frame.center_px[0]), float(frame.center_px[1])
-    scale = float(STAGE_SCALE_PX.get(frame.stage, 18.0))
+    length, width = _target_dimensions_px(frame, stage_cfg)
     heading = float(frame.target_state_world["heading"])
-    length = scale
-    width = max(4.0, scale * 0.45)
+    width = max(1.0, width)
 
     direction = np.array([np.cos(heading), -np.sin(heading)], dtype=float)
     side = np.array([-direction[1], direction[0]], dtype=float)
@@ -809,6 +827,7 @@ def _label_row(
     seq_idx: int,
     bbox: list[float],
     visibility: float,
+    stage_cfg: dict,
     asset_meta: dict | None = None,
 ) -> dict:
     try:
@@ -816,6 +835,8 @@ def _label_row(
     except ValueError:
         rel_image = str(image_path)
     target = frame.target_state_world
+    target_length_km, target_width_km = target_size_km(stage_cfg)
+    target_length_px, target_width_px = _target_dimensions_px(frame, stage_cfg)
     row = {
         "image_path": rel_image,
         "split": split,
@@ -837,7 +858,11 @@ def _label_row(
         "motion_mode": frame.motion_mode,
         "land_overlap_ratio": 0.0,
         "shore_buffer_overlap_ratio": 0.0,
-        "scale_px": float(STAGE_SCALE_PX.get(frame.stage, 18.0)),
+        "scale_px": float(target_length_px),
+        "target_length_km": float(target_length_km),
+        "target_width_km": float(target_width_km),
+        "target_length_px": float(target_length_px),
+        "target_width_px": float(target_width_px),
         "angle_deg": float(np.degrees(target["heading"])),
         "obs_valid": bool(visibility > 0.0),
         "meta": {
@@ -872,7 +897,11 @@ def _label_row(
             "target_on_water": bool(frame.target_on_water),
             "land_overlap_ratio": 0.0,
             "shore_buffer_overlap_ratio": 0.0,
-            "scale_px": float(STAGE_SCALE_PX.get(frame.stage, 18.0)),
+            "scale_px": float(target_length_px),
+            "target_length_km": float(target_length_km),
+            "target_width_km": float(target_width_km),
+            "target_length_px": float(target_length_px),
+            "target_width_px": float(target_width_px),
             "obs_valid": bool(visibility > 0.0),
             "asset_mode": str((asset_meta or {}).get("asset_mode", "procedural")),
             "background_category": str((asset_meta or {}).get("background_category", "unknown")),
@@ -1074,6 +1103,7 @@ def main() -> None:
                             if args.asset_mode == "real":
                                 canvas, bbox, visibility, asset_meta = _render_real_asset_frame(
                                     frame,
+                                    stage_cfg=stage_cfg,
                                     split=split,
                                     backgrounds_by_split=backgrounds_by_split,
                                     targets_by_split=targets_by_split,
@@ -1096,7 +1126,7 @@ def main() -> None:
                                 )
                             else:
                                 canvas = _make_ocean_background(image_size, rng)
-                                bbox, visibility = _draw_target(canvas, frame, rng)
+                                bbox, visibility = _draw_target(canvas, frame, rng, stage_cfg)
                                 asset_meta = {"asset_mode": "procedural"}
                             rendered_sequence.append((frame, canvas, bbox, float(visibility), dict(asset_meta or {})))
                     except RuntimeError as exc:
@@ -1123,6 +1153,7 @@ def main() -> None:
                         seq_idx,
                         bbox,
                         visibility,
+                        stage_cfg,
                         asset_meta,
                     )
                     line = json.dumps(label, ensure_ascii=False)

@@ -42,8 +42,66 @@ Not finalized yet:
 - final SNN/CNN vision training on the frozen formal rendered dataset.
 - phase 3 minimal closed-loop suite and paper-2-specific runbook are in `docs/phase3_minimal_closed_loop_runbook.md`.
 
+## Phase3 Task Dataset (v1.0.3)
+
+The formal Phase3 main-experiment dataset uses a unified physical-scale rendering pipeline.
+All target pixel sizes are derived from a single physical formula rather than hand-tuned constants.
+
+### Design
+
+- **World**: 2625 km × 2625 km (Paper1/Paper2 coordinate bridge)
+- **Image**: 256 × 256 px local observation crops
+- **Target size**: length=0.2 km, width=0.04 km (ship-scale)
+- **Target pixels**: `target_px = target_length_km / gsd_km_per_px`
+
+### Stages
+
+| Stage | Range (km) | GSD (km/px) | GSD (m/px) | FOV (km) | Target px |
+|-------|-----------|-------------|------------|----------|-----------|
+| far | 800–2500 | 0.020 | 20 | 5.12 | 10 |
+| mid | 100–800 | 0.010 | 10 | 2.56 | 20 |
+| terminal | 0–100 | 0.005 | 5 | 1.28 | 40 |
+
+Config: `configs/env_phase3_task_v1.0.2.yaml` (also synced to `configs/env.yaml`).
+
+All `render_stage2*.yaml` configs use matching GSD (20/10/5 m/px) and `scale_mode: physical_gsd`.
+
+### Physical scale module
+
+`src/paper2/render/physical_scale.py` — single source of truth for `target_px = length / gsd`:
+- `target_size_km()` / `target_dimensions_px_from_km()` — Phase3 dataset renderer
+- `target_dimensions_px_from_m()` / `target_scale_fraction_from_m()` — Stage2 live renderer
+
+### Quick Start
+
+```bash
+# Dev dataset (24 seq × 40 frames = 960 frames)
+python scripts/render_phase3_task_dataset.py \
+  --config configs/env_phase3_task_v1.0.2.yaml \
+  --out-root data/rendered/paper2_task_v1.0.3_dev \
+  --sequences 24 --frames 40 \
+  --asset-mode real \
+  --assets-root data/assets/source_stage2 \
+  --target-assets-root data/assets/source_stage2_v2 \
+  --distractor-assets-root data/assets/source_stage2 \
+  --water-mask-root data/assets/source_stage2/water_masks_auto \
+  --distractor-count-min 0 --distractor-count-max 2 \
+  --seed 20260506
+
+# QC
+python scripts/check_phase3_task_dataset.py \
+  --dataset-root data/rendered/paper2_task_v1.0.3_dev
+```
+
 ## Key Paths
 
+- `scripts/render_phase3_task_dataset.py`: Phase3 main-experiment dataset rendering.
+- `scripts/check_phase3_task_dataset.py`: Phase3 dataset QC gate.
+- `configs/env_phase3_task_v1.0.2.yaml`: Phase3 task stages + target motion config.
+- `src/paper2/render/physical_scale.py`: unified target-pixel-size module.
+- `src/paper2/render/phase3_task_sampler.py`: task-frame sampler (stage plan, approach geometry).
+- `scripts/run_phase3_vision_td3.py`: Phase3 closed-loop vision-TD3 evaluation.
+- `scripts/plot_phase3_closed_loop_results.py`: Phase3 closed-loop result plots.
 - `scripts/prepare_seadronessee.py`: convert raw SeaDronesSee to processed crops + manifests.
 - `scripts/check_phase1b_seadronessee.py`: phase 1B acceptance checks.
 - `scripts/train_public_vision.py`: baseline public vision training entry.

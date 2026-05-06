@@ -7,6 +7,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from paper2.common.config import load_yaml
+
 
 def _read_jsonl(path: Path) -> list[dict]:
     rows = []
@@ -29,9 +31,11 @@ def _crop_origin_from_meta(meta: dict) -> list[float] | None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-root", type=str, default="data/rendered/paper2_task_v1.0.0_smoke")
+    parser.add_argument("--config", type=str, default="configs/env.yaml")
     args = parser.parse_args()
 
     root = Path(args.dataset_root).resolve()
+    stage_cfg = load_yaml(args.config)["phase3_task_stages"]
     labels_dir = root / "labels"
     reports_dir = root / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -168,11 +172,10 @@ def main() -> None:
                 not_water += 1
             r = float(meta.get("range_xy_km", -1.0))
             ranges.append(r)
-            if stage == "far" and not (1500.0 <= r <= 2000.0):
+            expected_stage = stage_cfg.get(stage)
+            if not expected_stage:
                 invalid_stage += 1
-            elif stage == "mid" and not (600.0 <= r <= 1500.0):
-                invalid_stage += 1
-            elif stage == "terminal" and not (50.0 <= r <= 600.0):
+            elif not (float(expected_stage["range_min_km"]) <= r <= float(expected_stage["range_max_km"])):
                 invalid_stage += 1
             offcenter.append(float(np.hypot(cx - 0.5 * w, cy - 0.5 * h)))
 

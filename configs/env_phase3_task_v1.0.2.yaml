@@ -70,19 +70,22 @@ phase3_task_stages:
   unit_name: "km"
   image_size: 256
   aircraft_altitude_km: 12.0
+  target_size:
+    length_km: 0.2
+    width_km: 0.04
   crop_jitter_px:
-    far: 12.0
-    mid: 24.0
-    terminal: 40.0
+    far: 40.0
+    mid: 35.0
+    terminal: 30.0
   far:
-    range_min_km: 1500.0
-    range_max_km: 2000.0
-    gsd_km_per_px: 2.5
+    range_min_km: 800.0
+    range_max_km: 2500.0
+    gsd_km_per_px: 0.020
   mid:
-    range_min_km: 600.0
-    range_max_km: 1500.0
-    gsd_km_per_px: 1.0
+    range_min_km: 100.0
+    range_max_km: 800.0
+    gsd_km_per_px: 0.010
   terminal:
-    range_min_km: 50.0
-    range_max_km: 600.0
-    gsd_km_per_px: 0.2
+    range_min_km: 0.0
+    range_max_km: 100.0
+    gsd_km_per_px: 0.005

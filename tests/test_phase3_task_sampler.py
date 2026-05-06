@@ -19,9 +19,9 @@ def _cfg() -> dict:
 
 def test_classify_phase3_stage_uses_range_thresholds():
     stage_cfg = _cfg()["phase3_task_stages"]
-    assert classify_phase3_stage(1700.0, stage_cfg) == "far"
-    assert classify_phase3_stage(900.0, stage_cfg) == "mid"
-    assert classify_phase3_stage(100.0, stage_cfg) == "terminal"
+    assert classify_phase3_stage(1200.0, stage_cfg) == "far"
+    assert classify_phase3_stage(400.0, stage_cfg) == "mid"
+    assert classify_phase3_stage(50.0, stage_cfg) == "terminal"
 
 
 def test_phase3_task_sampler_outputs_valid_frames():

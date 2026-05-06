@@ -8,14 +8,14 @@ from paper2.common.types import TargetEstimateState
 
 def test_stage_for_range_uses_phase3_thresholds():
     cfg = {
-        "far": {"range_min_km": 1500.0, "range_max_km": 2000.0},
-        "mid": {"range_min_km": 600.0, "range_max_km": 1500.0},
-        "terminal": {"range_min_km": 50.0, "range_max_km": 600.0},
+        "far": {"range_min_km": 800.0, "range_max_km": 2500.0},
+        "mid": {"range_min_km": 100.0, "range_max_km": 800.0},
+        "terminal": {"range_min_km": 0.0, "range_max_km": 100.0},
     }
 
-    assert _stage_for_range(1800.0, cfg) == "far"
-    assert _stage_for_range(900.0, cfg) == "mid"
-    assert _stage_for_range(120.0, cfg) == "terminal"
+    assert _stage_for_range(1200.0, cfg) == "far"
+    assert _stage_for_range(400.0, cfg) == "mid"
+    assert _stage_for_range(50.0, cfg) == "terminal"
     assert _stage_for_range(10.0, cfg) == "terminal"
 
 

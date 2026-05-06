@@ -13,6 +13,7 @@ from paper2.render.compositor import alpha_blend_center, read_bgra, resize_bgra_
 from paper2.render.coordinate_mapper import WorldState, background_px_to_world, world_to_background_px, world_to_image
 from paper2.render.motion_sampler import generate_motion_sequence, sample_mode
 from paper2.render.perturbations import apply_perturbations
+from paper2.render.physical_scale import target_dimensions_px_from_m, target_scale_fraction_from_m
 from paper2.render.schema import RenderedFrameRecord
 
 PNG_WRITE_PARAMS = [cv2.IMWRITE_PNG_COMPRESSION, 1]
@@ -857,17 +858,28 @@ class Stage2Renderer:
             water = water.astype(np.uint8)
 
         tx, ty = world_to_image(state.x, state.y, crop_center_x, crop_center_y, gsd, image_size)
-        if scene.scale_mode == "stage_progressive":
+        if scene.scale_mode == "physical_gsd":
+            target_scale = target_scale_fraction_from_m(
+                gsd_m_per_px=gsd,
+                target_cfg=target_cfg,
+                image_size=image_size,
+            )
+        elif scene.scale_mode == "stage_progressive":
             scale_min, scale_max = stage_cfg["target_scale_range"]
             target_scale = float(self.rng.uniform(float(scale_min), float(scale_max)))
         else:
             target_scale = float(scene.target_scale)
-        if scene.prev_valid_scale is not None:
+        if scene.scale_mode != "physical_gsd" and scene.prev_valid_scale is not None:
             s_lo = float(scene.prev_valid_scale) * (1.0 - float(self.cfg.get("continuity", {}).get("max_scale_change_ratio", 0.05)))
             s_hi = float(scene.prev_valid_scale) * (1.0 + float(self.cfg.get("continuity", {}).get("max_scale_change_ratio", 0.05)))
             target_scale = float(np.clip(target_scale, s_lo, s_hi))
 
         target_patch = resize_bgra_with_scale(target_bgra, target_scale, image_size=image_size)
+        target_length_px, target_width_px = target_dimensions_px_from_m(
+            gsd_m_per_px=gsd,
+            target_cfg=target_cfg,
+            image_size=image_size,
+        )
         heading_deg = float(np.degrees(np.arctan2(state.vy, state.vx)))
         angle_noise_deg = float(target_cfg.get("heading_noise_deg", 10.0))
         angle_deg = heading_deg + float(self.rng.uniform(-angle_noise_deg, angle_noise_deg))
@@ -1047,6 +1059,10 @@ class Stage2Renderer:
             "visibility": float(vis),
             "gsd": float(gsd),
             "perception_stage": str(stage_name),
+            "target_length_m": float(target_cfg.get("physical_size_m", {}).get("length_m", 200.0)),
+            "target_width_m": float(target_cfg.get("physical_size_m", {}).get("width_m", 40.0)),
+            "target_length_px": float(target_length_px),
+            "target_width_px": float(target_width_px),
             "land_overlap_ratio": float(land_overlap_ratio),
             "shore_buffer_overlap_ratio": float(shore_overlap_ratio),
             "scale_px": float(max(target_patch.shape[0], target_patch.shape[1])),
@@ -1265,17 +1281,28 @@ class Stage2Renderer:
                         water = water.astype(np.uint8)
 
                     tx, ty = world_to_image(state.x, state.y, crop_center_x, crop_center_y, gsd, image_size)
-                    if scale_mode == "stage_progressive":
+                    if scale_mode == "physical_gsd":
+                        target_scale = target_scale_fraction_from_m(
+                            gsd_m_per_px=gsd,
+                            target_cfg=target_cfg,
+                            image_size=image_size,
+                        )
+                    elif scale_mode == "stage_progressive":
                         scale_min, scale_max = stage_cfg["target_scale_range"]
                         target_scale = float(self.rng.uniform(float(scale_min), float(scale_max)))
                     else:
                         target_scale = seq_target_scale
-                    if prev_scale is not None:
+                    if scale_mode != "physical_gsd" and prev_scale is not None:
                         s_lo = prev_scale * (1.0 - max_scale_change_ratio)
                         s_hi = prev_scale * (1.0 + max_scale_change_ratio)
                         target_scale = float(np.clip(target_scale, s_lo, s_hi))
                     target_scale = float(max(0.01, target_scale))
                     target_patch = resize_bgra_with_scale(target_bgra, target_scale, image_size=image_size)
+                    target_length_px, target_width_px = target_dimensions_px_from_m(
+                        gsd_m_per_px=gsd,
+                        target_cfg=target_cfg,
+                        image_size=image_size,
+                    )
                     heading_deg = float(np.degrees(np.arctan2(state.vy, state.vx)))
                     angle_deg = heading_deg + float(self.rng.uniform(-heading_noise_deg, heading_noise_deg))
                     if prev_angle_deg is not None:
@@ -1554,7 +1581,10 @@ class Stage2Renderer:
                             tries=1024,
                         )
                         if fallback is None:
-                            scale_min, scale_max = [float(x) for x in stage_cfg["target_scale_range"]]
+                            if scale_mode == "physical_gsd":
+                                scale_min = max(0.01, float(target_scale) * 0.75)
+                            else:
+                                scale_min = float(stage_cfg["target_scale_range"][0])
                             scale_candidates = [
                                 float(target_scale),
                                 float(max(scale_min, target_scale * 0.9)),
@@ -1832,6 +1862,10 @@ class Stage2Renderer:
                             "visibility": float(vis),
                             "gsd": float(gsd),
                             "perception_stage": str(stage_name),
+                            "target_length_m": float(target_cfg.get("physical_size_m", {}).get("length_m", 200.0)),
+                            "target_width_m": float(target_cfg.get("physical_size_m", {}).get("width_m", 40.0)),
+                            "target_length_px": float(target_length_px),
+                            "target_width_px": float(target_width_px),
                             "land_overlap_ratio": float(land_overlap_ratio),
                             "shore_buffer_overlap_ratio": float(shore_overlap_ratio),
                             "scale_px": float(max(target_patch.shape[0], target_patch.shape[1])),
