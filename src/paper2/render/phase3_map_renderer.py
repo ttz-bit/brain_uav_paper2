@@ -376,7 +376,7 @@ class Phase3MapRenderer:
             for _attempt in range(96):
                 idx = int(self.rng.integers(0, len(xx)))
                 bg_xy = np.array([float(xx[idx]), float(yy[idx])], dtype=float)
-                if float(np.hypot(bg_xy[0] - scene.anchor_bg_px[0], bg_xy[1] - scene.anchor_bg_px[1])) < 64.0:
+                if float(np.hypot(bg_xy[0] - scene.anchor_bg_px[0], bg_xy[1] - scene.anchor_bg_px[1])) < 12.0:
                     continue
                 path = pool[int(self.rng.integers(0, len(pool)))]
                 scale_by_stage: dict[str, float] = {}
