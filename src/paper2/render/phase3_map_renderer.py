@@ -191,9 +191,19 @@ class Phase3MapRenderer:
         target = rotate_bgra(target, -float(np.degrees(frame.target_state_world["heading"])))
         target = trim_bgra_to_alpha_bbox(target)
 
+        distractor_asset_paths: list[str] = []
+        distractor_bboxes: list[list[float]] = []
+        distractor_water_ratios: list[float] = []
+        distractor_visibilities: list[float] = []
         for track in scene.distractor_tracks:
             self._advance_distractor(track, scene)
-            self._render_distractor(canvas, water_crop, scene, track, crop_bg, crop_size_bg, target_center, stage)
+            rendered = self._render_distractor(canvas, water_crop, scene, track, crop_bg, crop_size_bg, target_center, stage)
+            if rendered is not None:
+                bbox_d, vis_d, wr_d = rendered
+                distractor_asset_paths.append(track.asset_path)
+                distractor_bboxes.append(bbox_d)
+                distractor_visibilities.append(float(vis_d))
+                distractor_water_ratios.append(float(wr_d))
 
         target_water_ratio = _alpha_water_ratio(water_crop, target, target_center[0], target_center[1])
         bbox_tuple, visibility = alpha_blend_center(canvas, target, target_center[0], target_center[1])
@@ -216,6 +226,10 @@ class Phase3MapRenderer:
             "background_size_px": [int(scene.background_bgr.shape[1]), int(scene.background_bgr.shape[0])],
             "target_bg_center_px": [float(target_bg[0]), float(target_bg[1])],
             "crop_center_bg_px": [float(crop_bg[0]), float(crop_bg[1])],
+            "crop_origin_bg_px": [
+                float(crop_bg[0] - crop_half),
+                float(crop_bg[1] - crop_half),
+            ],
             "crop_box_bg_xyxy": [
                 float(crop_bg[0] - crop_half),
                 float(crop_bg[1] - crop_half),
@@ -230,10 +244,10 @@ class Phase3MapRenderer:
             "target_water_ratio": float(target_water_ratio),
             "target_length_px": float(target_length_px),
             "target_width_px": float(target_width_px),
-            "distractor_asset_paths": [],
-            "distractor_bboxes_xywh": [],
-            "distractor_water_ratios": [],
-            "distractor_visibilities": [],
+            "distractor_asset_paths": distractor_asset_paths,
+            "distractor_bboxes_xywh": distractor_bboxes,
+            "distractor_water_ratios": distractor_water_ratios,
+            "distractor_visibilities": distractor_visibilities,
             "distractor_count_requested": int(len(scene.distractor_tracks)),
             "distractor_count": int(len(scene.distractor_tracks)),
         }
@@ -410,24 +424,28 @@ class Phase3MapRenderer:
         crop_size_bg: float,
         target_center: np.ndarray,
         stage: str,
-    ) -> None:
+    ) -> tuple[list[float], float, float] | None:
         image_size = int(canvas.shape[0])
         center = self.bg_to_image(track.bg_px, crop_bg, crop_size_bg, image_size)
         if center[0] < 0.0 or center[1] < 0.0 or center[0] >= image_size or center[1] >= image_size:
-            return
+            return None
         if float(np.hypot(center[0] - target_center[0], center[1] - target_center[1])) < self.min_distractor_target_distance_px:
-            return
+            return None
         try:
             distractor = trim_bgra_to_alpha_bbox(read_bgra(track.asset_path))
         except Exception:
-            return
+            return None
         scale_px = float(track.scale_px_by_stage.get(stage, max(track.scale_px_by_stage.values())))
         distractor = _resize_bgra_to_long_side(distractor, scale_px, image_size)
         distractor = rotate_bgra(distractor, float(np.degrees(track.heading)))
         distractor = trim_bgra_to_alpha_bbox(distractor)
-        if _alpha_water_ratio(water_crop, distractor, center[0], center[1]) < 0.85:
-            return
-        alpha_blend_center(canvas, distractor, center[0], center[1])
+        water_ratio = _alpha_water_ratio(water_crop, distractor, center[0], center[1])
+        if water_ratio < 0.85:
+            return None
+        bbox_tuple, visibility = alpha_blend_center(canvas, distractor, center[0], center[1])
+        if visibility <= 0.0:
+            return None
+        return [float(v) for v in bbox_tuple], float(visibility), float(water_ratio)
 
 
 def _extract_resized_patch(
