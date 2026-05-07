@@ -6,14 +6,14 @@ from paper2.common.types import TargetEstimateState
 from paper2.tracking.kalman import ConstantVelocityKalmanFilter
 
 
-def _estimate(pos, *, t=0.0, conf=1.0):
+def _estimate(pos, *, t=0.0, conf=1.0, cov_scale=1.0):
     pos = np.asarray(pos, dtype=float)
     dim = int(pos.size)
     return TargetEstimateState(
         t=float(t),
         pos_world_est=pos,
         vel_world_est=np.zeros(dim, dtype=float),
-        cov=np.eye(dim * 2, dtype=float),
+        cov=np.eye(dim * 2, dtype=float) * float(cov_scale),
         obs_conf=float(conf),
         obs_age=0.0,
         meta={"source": "test"},
@@ -39,3 +39,12 @@ def test_kalman_gate_rejects_large_jump():
     assert info.accepted is False
     assert info.innovation_norm > 10.0
     assert np.allclose(est.pos_world_est, [0.0, 0.0, 0.0], atol=1e-6)
+
+
+def test_kalman_hard_gate_rejects_large_jump_even_with_loose_covariance():
+    kf = ConstantVelocityKalmanFilter(dim=3, process_accel_std=0.1)
+    kf.update(_estimate([0.0, 0.0, 0.0], t=0.0, cov_scale=1.0e6))
+    est, info = kf.update(_estimate([20.0, 0.0, 0.0], t=1.0, cov_scale=1.0e6), gate_threshold=5.0)
+    assert info.accepted is False
+    assert info.innovation_norm > 5.0
+    assert np.allclose(est.pos_world_est[:2], [0.0, 0.0], atol=1e-6)

@@ -65,16 +65,22 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--max-vision-samples", type=int, default=None)
     p.add_argument("--disable-estimate-gating", action="store_true")
-    p.add_argument("--gate-far-km", type=float, default=300.0)
-    p.add_argument("--gate-mid-km", type=float, default=120.0)
-    p.add_argument("--gate-terminal-km", type=float, default=25.0)
-    p.add_argument("--gain-far", type=float, default=0.25)
-    p.add_argument("--gain-mid", type=float, default=0.50)
+    p.add_argument("--gate-far-km", type=float, default=5.0)
+    p.add_argument("--gate-mid-km", type=float, default=2.0)
+    p.add_argument("--gate-terminal-km", type=float, default=0.5)
+    p.add_argument("--gain-far", type=float, default=0.05)
+    p.add_argument("--gain-mid", type=float, default=0.25)
     p.add_argument("--gain-terminal", type=float, default=0.80)
     p.add_argument("--kf-process-accel-std", type=float, default=2.0)
-    p.add_argument("--kf-gate-far-km", type=float, default=300.0)
-    p.add_argument("--kf-gate-mid-km", type=float, default=120.0)
-    p.add_argument("--kf-gate-terminal-km", type=float, default=25.0)
+    p.add_argument("--kf-gate-far-km", type=float, default=5.0)
+    p.add_argument("--kf-gate-mid-km", type=float, default=2.0)
+    p.add_argument("--kf-gate-terminal-km", type=float, default=0.5)
+    p.add_argument("--kf-max-reject-streak", type=int, default=100)
+    p.add_argument("--kf-max-obs-age-before-reinit", type=float, default=120.0)
+    p.add_argument("--kf-nis-gate-threshold", type=float, default=11.83)
+    p.add_argument("--bootstrap-estimate-from-goal", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--initial-goal-position-std-km", type=float, default=5.0)
+    p.add_argument("--initial-goal-velocity-std-km-s", type=float, default=2.0)
     p.add_argument(
         "--kf-terminal-mode",
         choices=["kalman", "raw"],
@@ -563,9 +569,38 @@ def _vision_measurement_sigma_px(stage: str, pred_conf: float) -> float:
     elif stage == "mid":
         base = 32.0
     else:
-        base = 48.0
+        base = 80.0
     conf = float(np.clip(pred_conf, 0.35, 1.0))
     return float(base / conf)
+
+
+def _initial_goal_prior_estimate(
+    *,
+    truth: TargetTruthState,
+    target_z_km: float,
+    position_std_km: float,
+    velocity_std_km_s: float,
+) -> TargetEstimateState:
+    pos_xy = np.asarray(truth.pos_world, dtype=float).reshape(-1)[:2]
+    pos = np.array([float(pos_xy[0]), float(pos_xy[1]), float(target_z_km)], dtype=float)
+    vel = np.zeros(3, dtype=float)
+    pos_var = max(float(position_std_km), 1.0e-6) ** 2
+    vel_var = max(float(velocity_std_km_s), 1.0e-6) ** 2
+    cov = np.diag([pos_var, pos_var, pos_var, vel_var, vel_var, vel_var]).astype(float)
+    return TargetEstimateState(
+        t=float(truth.t),
+        pos_world_est=pos,
+        vel_world_est=vel,
+        cov=cov,
+        obs_conf=1.0,
+        obs_age=0.0,
+        meta={
+            "source": "initial_goal_prior",
+            "valid": True,
+            "position_std_km": float(position_std_km),
+            "velocity_std_km_s": float(velocity_std_km_s),
+        },
+    )
 
 
 def _gate_and_smooth_estimate(
@@ -962,10 +997,26 @@ def main() -> None:
             if args.capture_radius_km is not None
             else float(getattr(bridge.env.scenario, "goal_radius", 5.0))
         )
+        initial_target_z = float(np.asarray(bridge.env.goal, dtype=float).reshape(-1)[2])
         prev_estimate: TargetEstimateState | None = None
+        if bool(args.bootstrap_estimate_from_goal) and str(args.phase3_target_init) == "paper1_goal":
+            prev_estimate = _initial_goal_prior_estimate(
+                truth=truth2d,
+                target_z_km=initial_target_z,
+                position_std_km=float(args.initial_goal_position_std_km),
+                velocity_std_km_s=float(args.initial_goal_velocity_std_km_s),
+            )
         kf: ConstantVelocityKalmanFilter | None = None
         if str(args.estimate_filter) == "kalman":
-            kf = ConstantVelocityKalmanFilter(dim=3, process_accel_std=float(args.kf_process_accel_std))
+            kf = ConstantVelocityKalmanFilter(
+                dim=3,
+                process_accel_std=float(args.kf_process_accel_std),
+                max_reject_streak=int(args.kf_max_reject_streak),
+                nis_gate_threshold=float(args.kf_nis_gate_threshold),
+                max_obs_age_before_reinit=float(args.kf_max_obs_age_before_reinit),
+            )
+            if prev_estimate is not None:
+                kf.reset_from_estimate(prev_estimate)
 
         for step_idx in range(int(args.steps)):
             aircraft = bridge.get_aircraft_state()
@@ -1204,6 +1255,15 @@ def main() -> None:
             "gain_mid": float(args.gain_mid),
             "gain_terminal": float(args.gain_terminal),
             "kf_terminal_mode": str(args.kf_terminal_mode),
+            "kf_gate_far_km": float(args.kf_gate_far_km),
+            "kf_gate_mid_km": float(args.kf_gate_mid_km),
+            "kf_gate_terminal_km": float(args.kf_gate_terminal_km),
+            "kf_max_reject_streak": int(args.kf_max_reject_streak),
+            "kf_max_obs_age_before_reinit": float(args.kf_max_obs_age_before_reinit),
+            "kf_nis_gate_threshold": float(args.kf_nis_gate_threshold),
+            "bootstrap_estimate_from_goal": bool(args.bootstrap_estimate_from_goal),
+            "initial_goal_position_std_km": float(args.initial_goal_position_std_km),
+            "initial_goal_velocity_std_km_s": float(args.initial_goal_velocity_std_km_s),
         },
         "policy_diagnostics": policy_diag,
         "metrics": {

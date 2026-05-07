@@ -137,7 +137,7 @@ class ConstantVelocityKalmanFilter:
         hard_gate = float(gate_threshold) if gate_threshold is not None else None
         accepted = nis <= self.nis_gate_threshold
         if hard_gate is not None:
-            accepted = accepted or innovation_norm <= hard_gate
+            accepted = accepted and innovation_norm <= hard_gate
 
         if not accepted:
             self.reject_streak += 1
@@ -145,7 +145,11 @@ class ConstantVelocityKalmanFilter:
             self.P = self.P * 1.5
             self.obs_conf = min(self.obs_conf, float(measurement.obs_conf)) * 0.5
             self.meta = dict(self.meta)
-            if reject_streak >= self.max_reject_streak or self.obs_age >= self.max_obs_age_before_reinit:
+            should_reinit = (
+                (self.max_reject_streak > 0 and reject_streak >= self.max_reject_streak)
+                or (self.max_obs_age_before_reinit > 0.0 and self.obs_age >= self.max_obs_age_before_reinit)
+            )
+            if should_reinit:
                 self.reset_from_estimate(measurement)
                 est = self.to_estimate(
                     meta_extra={
