@@ -389,13 +389,17 @@ def _load_vision_model(weights: Path, device: str, requested: str = "auto"):
     if model_type == "cnn_coord":
         model = _make_cnn_model(nn).to(device)
     elif model_type == "cnn_heatmap":
-        model = HeatmapCNN(width=int(ckpt.get("width", 32))).to(device)
+        model = HeatmapCNN(
+            width=int(ckpt.get("width", 32)),
+            arch=str(ckpt.get("cnn_arch", ckpt.get("arch", "enhanced"))),
+        ).to(device)
     elif model_type == "snn_heatmap":
         model = HeatmapSNN(
             beta=float(ckpt.get("beta", 0.95)),
             num_steps=int(ckpt.get("num_steps", 12)),
             train_encoding=str(ckpt.get("train_encoding", "direct")),
             eval_encoding=str(ckpt.get("eval_encoding", "direct")),
+            arch=str(ckpt.get("snn_arch", ckpt.get("arch", "enhanced"))),
         ).to(device)
     else:
         raise RuntimeError(f"Unsupported vision model_type={model_type}")
@@ -514,7 +518,7 @@ def _init_phase3_dynamic_target(
 def _vision_estimate_from_row(
     *,
     row: dict[str, Any],
-    stage: str,
+    stage: str = "mid",
     pred_center_px: tuple[float, float],
     pred_conf: float,
     current_target_xy: np.ndarray,
@@ -1276,6 +1280,12 @@ def main() -> None:
         "vision_source": vision_source,
         "planner": f"paper1_{args.model}_td3",
         "observer": str(vision_model_type),
+        "observer_arch": str(
+            vision_ckpt.get(
+                "cnn_arch" if vision_model_type == "cnn_heatmap" else "snn_arch",
+                vision_ckpt.get("arch", "unknown"),
+            )
+        ),
         "estimate_filter": str(args.estimate_filter),
         "dataset_root": str(dataset_root),
         "eval_split": str(args.eval_split),

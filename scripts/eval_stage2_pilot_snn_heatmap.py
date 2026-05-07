@@ -350,7 +350,10 @@ def main() -> None:
     decode_method = ckpt_decode_method if args.decode_method == "auto" else str(args.decode_method)
 
     if ckpt_model_type == "cnn_heatmap":
-        model = HeatmapCNN(width=int(ckpt.get("width", 32))).to(device)
+        model = HeatmapCNN(
+            width=int(ckpt.get("width", 32)),
+            arch=str(ckpt.get("cnn_arch", ckpt.get("arch", "enhanced"))),
+        ).to(device)
     else:
         snn_arch = str(ckpt.get("snn_arch", ckpt.get("arch", "legacy")))
         model = HeatmapSNN(
@@ -594,6 +597,7 @@ def main() -> None:
             "loss_kind": str(ckpt.get("loss_kind", "unknown")),
             "checkpoint_model_type": str(ckpt_model_type),
             "checkpoint_snn_arch": str(ckpt.get("snn_arch", ckpt.get("arch", ""))),
+            "checkpoint_cnn_arch": str(ckpt.get("cnn_arch", ckpt.get("arch", ""))),
         },
         "metrics": {
             "eval_loss_mean": _mean(losses),

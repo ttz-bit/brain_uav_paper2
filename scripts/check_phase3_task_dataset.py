@@ -32,6 +32,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-root", type=str, default="data/rendered/paper2_task_v1.0.0_smoke")
     parser.add_argument("--config", type=str, default="configs/env.yaml")
+    parser.add_argument(
+        "--forbid-background-keywords",
+        type=str,
+        default="",
+        help="Comma-separated keywords that must not appear in background metadata/path, e.g. port.",
+    )
+    parser.add_argument(
+        "--expect-distractor-count",
+        type=int,
+        default=None,
+        help="If set, require every frame to have exactly this many visible and requested distractors.",
+    )
     args = parser.parse_args()
 
     root = Path(args.dataset_root).resolve()
@@ -66,6 +78,8 @@ def main() -> None:
     water_mask_missing = 0
     water_mask_crop_violations = 0
     water_mask_target_center_violations = 0
+    forbidden_background_keyword_violations = 0
+    expected_distractor_count_violations = 0
     ranges = []
     offcenter = []
     center_bbox_deltas = []
@@ -78,6 +92,11 @@ def main() -> None:
     rows_by_sequence: dict[str, list[dict]] = {}
     motion_mode_sequence_counts: dict[str, int] = {}
     water_mask_cache: dict[str, np.ndarray | None] = {}
+    forbidden_background_keywords = tuple(
+        x.strip().lower()
+        for x in str(args.forbid_background_keywords).split(",")
+        if x.strip()
+    )
 
     for split in ("train", "val", "test"):
         label_path = labels_dir / f"{split}.jsonl"
@@ -156,6 +175,15 @@ def main() -> None:
             seq_id = str(row["sequence_id"])
             rows_by_sequence.setdefault(seq_id, []).append(row)
             bg_path = str(meta.get("background_path", row.get("background_asset_id", "")))
+            bg_text = " ".join(
+                [
+                    str(bg_path),
+                    str(row.get("background_asset_id", "")),
+                    str(meta.get("background_category", "")),
+                ]
+            ).lower().replace("\\", "/")
+            if any(keyword in bg_text for keyword in forbidden_background_keywords):
+                forbidden_background_keyword_violations += 1
             target_path = str(meta.get("target_asset_path", row.get("target_asset_id", "")))
             prev_bg = sequence_backgrounds.setdefault(seq_id, bg_path)
             if bg_path != prev_bg:
@@ -175,6 +203,10 @@ def main() -> None:
             distractor_count = len(distractor_bboxes)
             distractor_count_requested = int(meta.get("distractor_count_requested", 0))
             distractor_counts.append(distractor_count)
+            if args.expect_distractor_count is not None:
+                expected = int(args.expect_distractor_count)
+                if distractor_count != expected or distractor_count_requested != expected:
+                    expected_distractor_count_violations += 1
             if distractor_count < distractor_count_requested:
                 distractor_count_shortfalls += 1
             if distractor_count > 3 or distractor_count_requested > 3:
@@ -309,6 +341,12 @@ def main() -> None:
         "water_mask_missing": int(water_mask_missing),
         "water_mask_crop_violations": int(water_mask_crop_violations),
         "water_mask_target_center_violations": int(water_mask_target_center_violations),
+        "forbidden_background_keywords": list(forbidden_background_keywords),
+        "forbidden_background_keyword_violations": int(forbidden_background_keyword_violations),
+        "expected_distractor_count": (
+            None if args.expect_distractor_count is None else int(args.expect_distractor_count)
+        ),
+        "expected_distractor_count_violations": int(expected_distractor_count_violations),
         "target_not_water": int(not_water),
         "invalid_stage_ranges": int(invalid_stage),
         "errors": errors[:100],
@@ -337,6 +375,8 @@ def main() -> None:
             and water_mask_missing == 0
             and water_mask_crop_violations == 0
             and water_mask_target_center_violations == 0
+            and forbidden_background_keyword_violations == 0
+            and expected_distractor_count_violations == 0
             and motion_mode_coverage_ok
             and not_water == 0
             and invalid_stage == 0

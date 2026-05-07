@@ -247,6 +247,10 @@ class Phase3MapRenderer:
             scene.distractor_tracks = (rendered_tracks + carryover)[:max_keep]
 
         target_water_ratio = _alpha_water_ratio(water_crop, target, target_center[0], target_center[1])
+        if target_water_ratio < self.min_target_water_ratio:
+            target_center, target_water_ratio = _snap_target_to_water(
+                water_crop, target, target_center, self.min_target_water_ratio
+            )
         bbox_tuple, visibility = alpha_blend_center(canvas, target, target_center[0], target_center[1])
         if visibility < self.min_target_visibility:
             raise RuntimeError(f"Phase3 map target visibility too low: sequence={scene.scene_id}, frame={frame.frame_id}")
@@ -632,6 +636,42 @@ def _infer_background_category_from_path(path: Path) -> str:
     if "/port" in low:
         return "port"
     return "unknown"
+
+
+def _snap_target_to_water(
+    water_crop: np.ndarray,
+    target_bgra: np.ndarray,
+    current_center: np.ndarray,
+    min_ratio: float,
+    *,
+    search_radius: int = 24,
+    tries: int = 48,
+) -> tuple[np.ndarray, float]:
+    """If the target at current_center has water ratio below min_ratio,
+    search nearby water pixels for a better placement."""
+    cx, cy = float(current_center[0]), float(current_center[1])
+    h, w = water_crop.shape[:2]
+    best_xy = np.array([cx, cy], dtype=float)
+    best_ratio = _alpha_water_ratio(water_crop, target_bgra, cx, cy)
+    if best_ratio >= min_ratio:
+        return best_xy, best_ratio
+
+    water = water_crop > 0
+    ys, xs = np.where(water)
+    if len(xs) <= 0:
+        return best_xy, best_ratio
+
+    dist2 = (xs - cx) ** 2 + (ys - cy) ** 2
+    order = np.argsort(dist2)
+    for i in order[:tries]:
+        nx, ny = float(xs[i]), float(ys[i])
+        ratio = _alpha_water_ratio(water_crop, target_bgra, nx, ny)
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_xy = np.array([nx, ny], dtype=float)
+        if ratio >= min_ratio:
+            return best_xy, ratio
+    return best_xy, best_ratio
 
 
 def _alpha_water_ratio(mask_u8: np.ndarray, overlay_bgra: np.ndarray, center_x: float, center_y: float) -> float:
