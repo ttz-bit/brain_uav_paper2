@@ -1210,9 +1210,14 @@ def main() -> None:
             violation = _zone_violation(aircraft_pos, zones, include_safety_margin=False)
             safety_violation = _zone_violation(aircraft_pos, zones, include_safety_margin=True)
             vision_audit_path = ""
-            vision_pixel_error_px = float("nan")
+            gt_center = _sample_gt_center_px(sample_row)
+            vision_pixel_error_px = (
+                float(np.hypot(float(pred_x) - float(gt_center[0]), float(pred_y) - float(gt_center[1])))
+                if gt_center is not None
+                else float("nan")
+            )
             if int(args.visual_audit_count) > 0 and visual_audit_saved < int(args.visual_audit_count):
-                vision_audit_path, vision_pixel_error_px = _write_vision_audit_image(
+                vision_audit_path, _audit_pixel_error_px = _write_vision_audit_image(
                     image_bgr=image,
                     row=sample_row,
                     pred_center_px=(pred_x, pred_y),
@@ -1223,7 +1228,6 @@ def main() -> None:
                 )
                 if vision_audit_path:
                     visual_audit_saved += 1
-            gt_center = _sample_gt_center_px(sample_row)
             row = {
                 "episode": int(ep),
                 "step": int(step_idx),
