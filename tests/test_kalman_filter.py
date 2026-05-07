@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from paper2.common.types import TargetEstimateState
+from paper2.common.types import TargetEstimateState, VisionObservation
 from paper2.tracking.kalman import ConstantVelocityKalmanFilter
+from paper2.tracking.vision_to_estimate import vision_observation_to_target_estimate
 
 
 def _estimate(pos, *, t=0.0, conf=1.0, cov_scale=1.0):
@@ -48,3 +49,21 @@ def test_kalman_hard_gate_rejects_large_jump_even_with_loose_covariance():
     assert info.accepted is False
     assert info.innovation_norm > 5.0
     assert np.allclose(est.pos_world_est[:2], [0.0, 0.0], atol=1e-6)
+
+
+def test_vision_measurement_keeps_velocity_covariance_broad():
+    obs = VisionObservation(
+        t=0.0,
+        detected=True,
+        center_px=(128.0, 128.0),
+        bbox_xywh=None,
+        score=1.0,
+        crop_path=None,
+        crop_center_world=(10.0, 20.0),
+        gsd=0.005,
+        meta={"measurement_sigma_px": 4.0},
+    )
+    est = vision_observation_to_target_estimate(obs, z_value=12.0, default_cov_m2=25.0)
+
+    assert np.allclose(np.diag(est.cov)[:3], [0.0004, 0.0004, 0.0004])
+    assert np.allclose(np.diag(est.cov)[3:], [25.0, 25.0, 25.0])

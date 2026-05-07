@@ -73,7 +73,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gain-far", type=float, default=0.05)
     p.add_argument("--gain-mid", type=float, default=0.25)
     p.add_argument("--gain-terminal", type=float, default=0.80)
-    p.add_argument("--kf-process-accel-std", type=float, default=2.0)
+    p.add_argument("--kf-process-accel-std", type=float, default=0.08)
+    p.add_argument("--kf-process-accel-std-far", type=float, default=0.04)
+    p.add_argument("--kf-process-accel-std-mid", type=float, default=0.08)
+    p.add_argument("--kf-process-accel-std-terminal", type=float, default=0.15)
     p.add_argument("--kf-gate-far-km", type=float, default=5.0)
     p.add_argument("--kf-gate-mid-km", type=float, default=2.0)
     p.add_argument("--kf-gate-terminal-km", type=float, default=0.5)
@@ -83,10 +86,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bootstrap-estimate-from-goal", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--initial-goal-position-std-km", type=float, default=5.0)
     p.add_argument("--initial-goal-velocity-std-km-s", type=float, default=2.0)
+    p.add_argument("--meas-sigma-far-px", type=float, default=80.0)
+    p.add_argument("--meas-sigma-mid-px", type=float, default=32.0)
+    p.add_argument("--meas-sigma-terminal-px", type=float, default=24.0)
     p.add_argument(
         "--kf-terminal-mode",
         choices=["kalman", "raw"],
-        default="kalman",
+        default="raw",
         help="When --estimate-filter=kalman, optionally bypass KF in terminal range to avoid end-game lag.",
     )
     p.add_argument(
@@ -524,6 +530,7 @@ def _vision_estimate_from_row(
     current_target_xy: np.ndarray,
     current_target_z: float,
     t: float,
+    args: argparse.Namespace | None = None,
 ) -> tuple[TargetEstimateState, float]:
     meta = dict(row.get("meta", {}))
     label_crop_center = np.asarray(meta["crop_center_world"], dtype=float).reshape(2)
@@ -554,7 +561,7 @@ def _vision_estimate_from_row(
             "source": "cnn_dataset_error_replay",
             "row_sequence_id": row.get("sequence_id"),
             "perception_stage": str(stage),
-            "measurement_sigma_px": _vision_measurement_sigma_px(stage, pred_conf),
+            "measurement_sigma_px": _vision_measurement_sigma_px(stage, pred_conf, args=args),
         },
     )
     est = vision_observation_to_target_estimate(
@@ -582,14 +589,19 @@ def _stage_update_gain(stage: str, args: argparse.Namespace) -> float:
     return float(np.clip(args.gain_far, 0.0, 1.0))
 
 
-def _vision_measurement_sigma_px(stage: str, pred_conf: float) -> float:
+def _vision_measurement_sigma_px(
+    stage: str,
+    pred_conf: float,
+    *,
+    args: argparse.Namespace | None = None,
+) -> float:
     stage = str(stage)
     if stage == "terminal":
-        base = 24.0
+        base = float(getattr(args, "meas_sigma_terminal_px", 24.0))
     elif stage == "mid":
-        base = 32.0
+        base = float(getattr(args, "meas_sigma_mid_px", 32.0))
     else:
-        base = 80.0
+        base = float(getattr(args, "meas_sigma_far_px", 80.0))
     conf = float(np.clip(pred_conf, 0.35, 1.0))
     return float(base / conf)
 
@@ -740,10 +752,12 @@ def _apply_estimate_filter(
             }
         )
         candidate.meta = meta
+        kf.reset_from_estimate(candidate)
         return candidate, True, 0.0, 1.0
+    kf.process_accel_std = _kf_stage_process_accel_std(stage, args)
     gate = _kf_stage_threshold(stage, args)
     estimate, info = kf.update(candidate, gate_threshold=float(gate))
-    return estimate, bool(info.accepted), float(info.innovation_norm), float(info.gate_threshold or gate)
+    return estimate, bool(info.accepted), float(info.innovation_norm), 1.0 if bool(info.accepted) else 0.0
 
 
 def _kf_stage_threshold(stage: str, args: argparse.Namespace) -> float:
@@ -752,6 +766,20 @@ def _kf_stage_threshold(stage: str, args: argparse.Namespace) -> float:
     if stage == "mid":
         return float(args.kf_gate_mid_km)
     return float(args.kf_gate_far_km)
+
+
+def _kf_stage_process_accel_std(stage: str, args: argparse.Namespace) -> float:
+    if stage == "terminal":
+        return float(getattr(args, "kf_process_accel_std_terminal", args.kf_process_accel_std))
+    if stage == "mid":
+        return float(getattr(args, "kf_process_accel_std_mid", args.kf_process_accel_std))
+    return float(getattr(args, "kf_process_accel_std_far", args.kf_process_accel_std))
+
+
+def _active_gate_threshold(stage: str, args: argparse.Namespace) -> float:
+    if str(args.estimate_filter) == "kalman":
+        return _kf_stage_threshold(stage, args)
+    return _stage_gate_threshold(stage, args)
 
 
 def _set_goal_from_estimate(bridge: Paper1EnvBridge, estimate: TargetEstimateState, target_z_km: float) -> None:
@@ -1139,6 +1167,7 @@ def main() -> None:
                 current_target_xy=np.asarray(truth2d.pos_world, dtype=float).reshape(2),
                 current_target_z=target_z,
                 t=float(aircraft.t),
+                args=args,
             )
             estimate, gate_accepted, gate_innovation_km, gate_gain = _apply_estimate_filter(
                 raw_estimate,
@@ -1209,7 +1238,7 @@ def main() -> None:
                 "vision_gate_accepted": bool(gate_accepted),
                 "vision_gate_innovation_km": float(gate_innovation_km),
                 "vision_gate_gain": float(gate_gain),
-                "vision_gate_threshold_km": float(_stage_gate_threshold(stage, args)),
+                "vision_gate_threshold_km": float(_active_gate_threshold(stage, args)),
                 "aircraft_x": float(aircraft_pos[0]),
                 "aircraft_y": float(aircraft_pos[1]),
                 "aircraft_z": float(aircraft_pos[2]),
@@ -1320,12 +1349,18 @@ def main() -> None:
             "gain_mid": float(args.gain_mid),
             "gain_terminal": float(args.gain_terminal),
             "kf_terminal_mode": str(args.kf_terminal_mode),
+            "kf_process_accel_std_far": float(args.kf_process_accel_std_far),
+            "kf_process_accel_std_mid": float(args.kf_process_accel_std_mid),
+            "kf_process_accel_std_terminal": float(args.kf_process_accel_std_terminal),
             "kf_gate_far_km": float(args.kf_gate_far_km),
             "kf_gate_mid_km": float(args.kf_gate_mid_km),
             "kf_gate_terminal_km": float(args.kf_gate_terminal_km),
             "kf_max_reject_streak": int(args.kf_max_reject_streak),
             "kf_max_obs_age_before_reinit": float(args.kf_max_obs_age_before_reinit),
             "kf_nis_gate_threshold": float(args.kf_nis_gate_threshold),
+            "meas_sigma_far_px": float(args.meas_sigma_far_px),
+            "meas_sigma_mid_px": float(args.meas_sigma_mid_px),
+            "meas_sigma_terminal_px": float(args.meas_sigma_terminal_px),
             "bootstrap_estimate_from_goal": bool(args.bootstrap_estimate_from_goal),
             "initial_goal_position_std_km": float(args.initial_goal_position_std_km),
             "initial_goal_velocity_std_km_s": float(args.initial_goal_velocity_std_km_s),

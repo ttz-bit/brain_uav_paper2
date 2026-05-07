@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from scripts.run_phase3_vision_td3 import _gate_and_smooth_estimate, _stage_for_range, _vision_estimate_from_row
+from scripts.run_phase3_vision_td3 import (
+    _gate_and_smooth_estimate,
+    _stage_for_range,
+    _vision_estimate_from_row,
+    _vision_measurement_sigma_px,
+)
 from paper2.common.types import TargetEstimateState
 
 
@@ -53,6 +58,9 @@ class _Args:
     gain_far = 0.25
     gain_mid = 0.50
     gain_terminal = 0.80
+    meas_sigma_far_px = 60.0
+    meas_sigma_mid_px = 20.0
+    meas_sigma_terminal_px = 8.0
 
 
 def _estimate(pos, *, t=0.0):
@@ -91,3 +99,9 @@ def test_estimate_gate_smooths_plausible_terminal_update():
     assert np.isclose(gain, 0.80)
     assert np.allclose(estimate.pos_world_est, [108.0, 100.0, 12.0])
     assert estimate.meta["gate_accepted"] is True
+
+
+def test_vision_measurement_sigma_uses_stage_overrides_and_confidence():
+    assert np.isclose(_vision_measurement_sigma_px("far", 1.0, args=_Args()), 60.0)
+    assert np.isclose(_vision_measurement_sigma_px("mid", 0.5, args=_Args()), 40.0)
+    assert np.isclose(_vision_measurement_sigma_px("terminal", 0.25, args=_Args()), 8.0 / 0.35)

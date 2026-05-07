@@ -64,7 +64,11 @@ def vision_observation_to_target_estimate(
     dim = int(pos.size)
     sigma_px = _measurement_sigma_px(obs, pixel_sigma=pixel_sigma)
     sigma_m = max(float(obs.gsd) * float(sigma_px), 1e-6)
-    cov = np.eye(dim * 2, dtype=float) * (sigma_m * sigma_m)
+    pos_var = sigma_m * sigma_m
+    # A single visual detection observes position only. Keep velocity uncertainty broad so
+    # KF initialization/reinitialization does not become overconfident in zero velocity.
+    vel_var = max(float(default_cov_m2), pos_var)
+    cov = np.diag([pos_var] * dim + [vel_var] * dim).astype(float)
     meta = {"source": "vision_observation", "valid": True, "pixel_sigma": float(sigma_px)}
     if obs.meta:
         meta.update(dict(obs.meta))
