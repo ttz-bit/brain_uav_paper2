@@ -380,7 +380,10 @@ def main() -> None:
     if args.strict_no_leak and has_leak:
         raise RuntimeError(f"Asset leakage detected: {leak}")
 
-    water_constraint = bool(args.water_logit_constraint) or float(args.land_penalty_weight) > 0.0
+    distractor_supervision = float(args.distractor_repel_weight) > 0.0
+    land_supervision = float(args.land_penalty_weight) > 0.0
+    water_constraint = bool(args.water_logit_constraint) or bool(land_supervision)
+    water_supervision = bool(water_constraint)
     load_water_mask = bool(water_constraint)
     train_ds = build_stage2_rendered_dataset(
         root=dataset_root,
@@ -407,7 +410,7 @@ def main() -> None:
             f"train_missing={train_meta['water_mask_missing']}, val_missing={val_meta['water_mask_missing']}. "
             "Re-render the dataset with water_mask_crop_path populated, or with crop_origin_bg_px / water_mask_path populated."
         )
-    if float(args.distractor_repel_weight) > 0.0 and (
+    if distractor_supervision and (
         train_meta["distractor_bbox_rows"] <= 0 or val_meta["distractor_bbox_rows"] <= 0
     ):
         raise RuntimeError(
@@ -429,17 +432,27 @@ def main() -> None:
             sample = self.ds[src_idx]
             x = _to_tensor_image(sample.image, input_size=int(args.input_size))
             y = _target_from_sample(sample)
-            d_xy, d_mask = _distractors_from_sample(sample, max_distractors=int(args.max_distractors))
-            land = _land_mask_from_sample(
-                sample,
-                input_size=int(args.input_size),
-                dilate_px=int(args.land_penalty_dilate_px),
-            )
-            water = _water_mask_from_sample(
-                sample,
-                input_size=int(args.input_size),
-                interior_erode_px=_water_interior_erode_px_for_sample(sample, args),
-            )
+            if distractor_supervision:
+                d_xy, d_mask = _distractors_from_sample(sample, max_distractors=int(args.max_distractors))
+            else:
+                d_xy = np.zeros((int(args.max_distractors), 2), dtype=np.float32)
+                d_mask = np.zeros((int(args.max_distractors),), dtype=np.float32)
+            if land_supervision:
+                land = _land_mask_from_sample(
+                    sample,
+                    input_size=int(args.input_size),
+                    dilate_px=int(args.land_penalty_dilate_px),
+                )
+            else:
+                land = np.zeros((1, 1, 1), dtype=np.float32)
+            if water_supervision:
+                water = _water_mask_from_sample(
+                    sample,
+                    input_size=int(args.input_size),
+                    interior_erode_px=_water_interior_erode_px_for_sample(sample, args),
+                )
+            else:
+                water = np.ones((1, 1, 1), dtype=np.float32)
             return (
                 torch.from_numpy(x),
                 torch.from_numpy(y),
@@ -945,6 +958,9 @@ def main() -> None:
             "eval_batch_size": int(eval_batch_size),
             "train_eval_max_samples": int(train_eval_count),
             "val_eval_max_samples": int(val_eval_count),
+            "distractor_supervision": bool(distractor_supervision),
+            "land_supervision": bool(land_supervision),
+            "water_supervision": bool(water_supervision),
             "num_workers": int(num_workers),
             "prefetch_factor": int(args.prefetch_factor),
             "persistent_workers": bool(args.persistent_workers),
