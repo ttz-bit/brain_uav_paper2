@@ -37,6 +37,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--softargmax-temperature", type=float, default=20.0)
     p.add_argument("--decode-method", type=str, default="softargmax", choices=["argmax", "softargmax"])
     p.add_argument("--width", type=int, default=32)
+    p.add_argument("--cnn-arch", type=str, default="enhanced", choices=["legacy", "enhanced"])
+    p.add_argument("--init-weights", type=str, default="")
     p.add_argument("--eval-interval", type=int, default=1)
     p.add_argument("--eval-batch-size", type=int, default=256)
     p.add_argument(
@@ -225,7 +227,18 @@ def main() -> None:
     train_eval_loader = _loader(train_eval_ds, batch_size=int(args.eval_batch_size), shuffle=False)
     val_eval_loader = _loader(val_eval_ds, batch_size=int(args.eval_batch_size), shuffle=False)
 
-    model = HeatmapCNN(width=int(args.width)).to(device)
+    model = HeatmapCNN(width=int(args.width), arch=str(args.cnn_arch)).to(device)
+    init_weights = str(args.init_weights or "").strip()
+    if init_weights:
+        init_path = Path(init_weights).resolve()
+        if not init_path.exists():
+            raise FileNotFoundError(f"Missing init weights: {init_path}")
+        init_ckpt = torch.load(init_path, map_location=device)
+        if init_ckpt.get("model_type") == "cnn_heatmap":
+            state_dict = init_ckpt.get("state_dict", init_ckpt)
+            model.load_state_dict(state_dict, strict=True)
+        else:
+            raise RuntimeError(f"Expected cnn_heatmap checkpoint, got {init_ckpt.get('model_type', 'unknown')}")
     if bool(args.channels_last) and device == "cuda":
         model = model.to(memory_format=torch.channels_last)
     optimizer = torch.optim.Adam(model.parameters(), lr=float(args.learning_rate), weight_decay=float(args.weight_decay))
@@ -385,7 +398,7 @@ def main() -> None:
             "num_val": int(len(val_ds)),
         },
         "device": str(device),
-        "model": {"type": "cnn_heatmap", "width": int(args.width), "output": "heatmap + confidence"},
+        "model": {"type": "cnn_heatmap", "arch": str(args.cnn_arch), "width": int(args.width), "output": "heatmap + confidence"},
         "hyperparams": {
             "batch_size": int(args.batch_size),
             "epochs": int(max(1, int(args.epochs))),
@@ -478,6 +491,8 @@ def _save_checkpoint(
             "softargmax_temperature": float(args.softargmax_temperature),
             "decode_method": str(args.decode_method),
             "width": int(args.width),
+            "cnn_arch": str(args.cnn_arch),
+            "init_weights": init_weights,
             "epoch": int(epoch),
             "selection_metric": str(args.selection_metric),
             "best_selection_score": float(best_score),
