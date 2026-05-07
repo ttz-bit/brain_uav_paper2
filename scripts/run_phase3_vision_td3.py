@@ -40,6 +40,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--render-config", type=str, default="configs/render_stage2_c_v1.yaml")
     p.add_argument("--phase3-live-generation-config", type=str, default="")
     p.add_argument("--phase3-live-local-map-size-km", type=float, default=0.0)
+    p.add_argument("--phase3-live-render-retries", type=int, default=4)
+    p.add_argument("--phase3-live-render-reanchor-on-failure", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--render-split", choices=["train", "val", "test"], default="test")
     p.add_argument("--eval-split", choices=["train", "val", "test"], default="test")
     p.add_argument("--vision-weights", type=str, required=True)
@@ -451,6 +453,20 @@ def _stage_for_range(range_km: float, stage_cfg: dict[str, Any]) -> str:
     if r < float(stage_cfg["terminal"]["range_min_km"]):
         return "terminal"
     return "far"
+
+
+def _create_phase3_live_scene(
+    renderer: Phase3MapRenderer,
+    *,
+    split: str,
+    sequence_id: str,
+    target_xy: np.ndarray,
+) -> Any:
+    return renderer.create_live_scene(
+        split=str(split),
+        sequence_id=str(sequence_id),
+        target_world_xy=np.asarray(target_xy, dtype=float).reshape(-1)[:2],
+    )
 
 
 def _group_rows_by_stage(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -953,6 +969,8 @@ def main() -> None:
     summaries: list[dict[str, Any]] = []
     visual_audit_dir = out_dir / "visuals" / "vision_audit"
     visual_audit_saved = 0
+    live_render_failure_count = 0
+    live_render_reanchor_count = 0
     policy: Paper1TD3Policy | None = None
     policy_diag: dict[str, Any] = {}
     env_source = "unknown"
@@ -982,10 +1000,11 @@ def main() -> None:
             str(args.phase3_target_init),
         )
         phase3_live_scene = (
-            phase3_live_renderer.create_live_scene(
+            _create_phase3_live_scene(
+                phase3_live_renderer,
                 split=str(args.render_split),
                 sequence_id=f"phase3_live_{ep:04d}",
-                target_world_xy=np.asarray(truth2d.pos_world, dtype=float).reshape(-1)[:2],
+                target_xy=np.asarray(truth2d.pos_world, dtype=float).reshape(-1)[:2],
             )
             if phase3_live_renderer is not None
             else None
@@ -1019,6 +1038,7 @@ def main() -> None:
                 kf.reset_from_estimate(prev_estimate)
 
         for step_idx in range(int(args.steps)):
+            live_render_retry_count = 0
             aircraft = bridge.get_aircraft_state()
             target_z = float(np.asarray(bridge.env.goal, dtype=float).reshape(-1)[2])
             truth_pos = np.array([truth2d.pos_world[0], truth2d.pos_world[1], target_z], dtype=float)
@@ -1049,13 +1069,42 @@ def main() -> None:
             else:
                 if phase3_live_renderer is None or phase3_live_scene is None:
                     raise RuntimeError("Phase3 map live renderer was not initialized.")
-                phase3_live_renderer.rng = np.random.default_rng(ep_seed * 1000003 + step_idx)
-                live_result = phase3_live_renderer.render_truth(
-                    phase3_live_scene,
-                    truth=truth2d,
-                    stage=stage,
-                    frame_id=step_idx,
-                )
+                max_retries = max(0, int(args.phase3_live_render_retries))
+                last_render_error: RuntimeError | None = None
+                live_result = None
+                for attempt in range(max_retries + 1):
+                    phase3_live_renderer.rng = np.random.default_rng(
+                        ep_seed * 1000003 + step_idx + attempt * 9176
+                    )
+                    try:
+                        live_result = phase3_live_renderer.render_truth(
+                            phase3_live_scene,
+                            truth=truth2d,
+                            stage=stage,
+                            frame_id=step_idx,
+                        )
+                        live_render_retry_count = int(attempt)
+                        break
+                    except RuntimeError as exc:
+                        last_render_error = exc
+                        live_render_failure_count += 1
+                        if (not bool(args.phase3_live_render_reanchor_on_failure)) or attempt >= max_retries:
+                            raise RuntimeError(
+                                f"Phase3 map live render failed after {attempt + 1} attempt(s), "
+                                f"episode={ep}, step={step_idx}, stage={stage}. last_error={exc}"
+                            ) from exc
+                        live_render_reanchor_count += 1
+                        phase3_live_scene = _create_phase3_live_scene(
+                            phase3_live_renderer,
+                            split=str(args.render_split),
+                            sequence_id=f"phase3_live_{ep:04d}_reanchor_{step_idx:04d}_{attempt + 1}",
+                            target_xy=np.asarray(truth2d.pos_world, dtype=float).reshape(-1)[:2],
+                        )
+                if live_result is None:
+                    raise RuntimeError(
+                        f"Phase3 map live render failed unexpectedly, episode={ep}, "
+                        f"step={step_idx}, stage={stage}. last_error={last_render_error}"
+                    )
                 sample_row = _phase3_map_frame_to_row(
                     result=live_result,
                     truth=truth2d,
@@ -1065,6 +1114,8 @@ def main() -> None:
                     sequence_id=f"phase3_map_live_{ep:04d}",
                     frame_id=f"{step_idx:04d}",
                 )
+                sample_row.setdefault("meta", {})["live_render_retry_count"] = int(live_render_retry_count)
+                sample_row["meta"]["live_render_reanchor_count_total"] = int(live_render_reanchor_count)
                 image = live_result.image_bgr
 
             pred_x, pred_y, pred_conf = _predict_vision(
@@ -1176,6 +1227,8 @@ def main() -> None:
                 "done_reason": str(done_reason),
                 "reward": float(step_result.reward),
                 "vision_audit_image_path": str(vision_audit_path),
+                "live_render_retry_count": int(live_render_retry_count),
+                "live_render_reanchor_count_total": int(live_render_reanchor_count),
             }
             ep_rows.append(row)
             all_rows.append(row)
@@ -1246,6 +1299,8 @@ def main() -> None:
         "capture_radius_km": float(args.capture_radius_km if args.capture_radius_km is not None else 5.0),
         "vision_sample_counts": {k: int(len(v)) for k, v in grouped.items()} if replay_mode else {},
         "live_render_enabled": bool(not replay_mode),
+        "phase3_live_render_retries": int(args.phase3_live_render_retries),
+        "phase3_live_render_reanchor_on_failure": bool(args.phase3_live_render_reanchor_on_failure),
         "estimate_gating": {
             "enabled": not bool(args.disable_estimate_gating),
             "gate_far_km": float(args.gate_far_km),
@@ -1279,6 +1334,8 @@ def main() -> None:
             "vision_pixel_error_p90_px": float(np.percentile(vision_px_errors, 90)) if vision_px_errors.size else 0.0,
             "vision_gate_rejection_count": int(gate_rejections),
             "vision_gate_rejection_rate": float(gate_rejections / max(1, len(all_rows))),
+            "live_render_failure_count": int(live_render_failure_count),
+            "live_render_reanchor_count": int(live_render_reanchor_count),
             "zone_violation_total": int(violation_counts.sum()) if violation_counts.size else 0,
             "zone_violation_episode_count": int((violation_counts > 0).sum()) if violation_counts.size else 0,
             "safety_margin_violation_total": int(safety_violation_counts.sum()) if safety_violation_counts.size else 0,
