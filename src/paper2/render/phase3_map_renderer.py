@@ -262,6 +262,7 @@ class Phase3MapRenderer:
             "render_mode": "phase3_map",
             "map_scene_id": scene.scene_id,
             "background_path": scene.background_path,
+            "background_category": _infer_background_category_from_path(Path(scene.background_path)),
             "water_mask_path": scene.water_mask_path,
             "target_asset_path": scene.target_asset_path,
             "background_size_px": [int(scene.background_bgr.shape[1]), int(scene.background_bgr.shape[0])],
@@ -618,6 +619,19 @@ def _resize_bgra_to_long_side(img_bgra: np.ndarray, long_side_px: float, image_s
     new_w = max(1, int(round(w * ratio)))
     new_h = max(1, int(round(h * ratio)))
     return cv2.resize(img_bgra, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+
+def _infer_background_category_from_path(path: Path) -> str:
+    low = str(path).lower().replace("\\", "/")
+    if "/open_sea" in low:
+        return "open_sea"
+    if "/coastal" in low:
+        return "coastal"
+    if "/island_complex" in low:
+        return "island_complex"
+    if "/port" in low:
+        return "port"
+    return "unknown"
 
 
 def _alpha_water_ratio(mask_u8: np.ndarray, overlay_bgra: np.ndarray, center_x: float, center_y: float) -> float:

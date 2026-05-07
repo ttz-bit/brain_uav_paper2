@@ -196,7 +196,7 @@ def _draw_distractor_boxes(vis: np.ndarray, boxes: list[list[float]]) -> None:
 def _image_to_world(pred_xy: np.ndarray, sample) -> tuple[list[float] | None, list[float] | None, float | None]:
     meta = dict(sample.meta or {})
     crop = meta.get("crop_center_world")
-    gsd = meta.get("gsd", meta.get("gsd_m_per_px"))
+    gsd = meta.get("gsd_km_per_px", meta.get("gsd", meta.get("gsd_m_per_px")))
     truth = meta.get("target_state_world")
     if crop is None or gsd is None:
         return None, None, None
@@ -205,6 +205,8 @@ def _image_to_world(pred_xy: np.ndarray, sample) -> tuple[list[float] | None, li
     v = float(np.clip(pred_xy[1], 0.0, 1.0) * h)
     cx, cy = float(crop[0]), float(crop[1])
     g = float(gsd)
+    if "gsd_m_per_px" in meta and "gsd_km_per_px" not in meta and "gsd" not in meta:
+        g = g / 1000.0
     xw = cx + (u - w * 0.5) * g
     yw = cy + (h * 0.5 - v) * g
     pred_world = [float(xw), float(yw)]
@@ -214,7 +216,7 @@ def _image_to_world(pred_xy: np.ndarray, sample) -> tuple[list[float] | None, li
         gt_world = None
     err = None
     if gt_world is not None:
-        err = float(np.hypot(pred_world[0] - gt_world[0], pred_world[1] - gt_world[1]))
+        err = float(np.hypot(pred_world[0] - gt_world[0], pred_world[1] - gt_world[1]) * 1000.0)
     return pred_world, gt_world, err
 
 

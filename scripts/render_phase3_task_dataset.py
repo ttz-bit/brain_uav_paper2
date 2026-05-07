@@ -89,13 +89,27 @@ def _infer_split(path: Path) -> str | None:
     return None
 
 
-def _collect_backgrounds(assets_root: Path, water_mask_root: Path, skip_review: bool) -> dict[str, list[dict]]:
+def _collect_backgrounds(
+    assets_root: Path,
+    water_mask_root: Path,
+    skip_review: bool,
+    *,
+    allow_keywords: tuple[str, ...] = (),
+    reject_keywords: tuple[str, ...] = (),
+) -> dict[str, list[dict]]:
     backgrounds_root = assets_root / "backgrounds"
     review_paths = _load_review_backgrounds(water_mask_root) if skip_review else set()
     out: dict[str, list[dict]] = {"train": [], "val": [], "test": []}
     for image_path in _iter_images(backgrounds_root):
         split = _infer_split(image_path)
         if split is None:
+            continue
+        category = _infer_background_category_from_path(image_path)
+        path_text = str(image_path).lower().replace("\\", "/")
+        text = f"{category} {path_text}"
+        if allow_keywords and not any(k and k in text for k in allow_keywords):
+            continue
+        if any(k and k in text for k in reject_keywords):
             continue
         if str(image_path.resolve()) in review_paths:
             continue
@@ -956,6 +970,18 @@ def main() -> None:
     parser.add_argument("--distractor-assets-root", type=str, default=None)
     parser.add_argument("--water-mask-root", type=str, default=None)
     parser.add_argument("--include-review-backgrounds", action="store_true")
+    parser.add_argument(
+        "--background-allow-keywords",
+        type=str,
+        default="",
+        help="Comma-separated keywords required for real backgrounds. Empty string allows all non-rejected backgrounds.",
+    )
+    parser.add_argument(
+        "--background-reject-keywords",
+        type=str,
+        default="",
+        help="Comma-separated keywords rejected for real backgrounds, e.g. port.",
+    )
     parser.add_argument("--min-target-water-ratio", type=float, default=0.98)
     parser.add_argument("--min-target-visibility", type=float, default=0.35)
     parser.add_argument("--allow-relaxed-water-ratio", action="store_true")
@@ -1032,6 +1058,8 @@ def main() -> None:
             assets_root,
             water_mask_root,
             skip_review=not bool(args.include_review_backgrounds),
+            allow_keywords=_split_keywords(args.background_allow_keywords),
+            reject_keywords=_split_keywords(args.background_reject_keywords),
         )
         targets_by_split = _collect_targets(
             target_assets_root,
@@ -1250,6 +1278,10 @@ def main() -> None:
         "distractor_assets_root": str(distractor_assets_root) if args.asset_mode == "real" else None,
         "water_mask_root": str(water_mask_root) if args.asset_mode == "real" else None,
         "background_counts": {k: len(v) for k, v in backgrounds_by_split.items()} if args.asset_mode == "real" else None,
+        "background_filter": {
+            "allow_keywords": list(_split_keywords(args.background_allow_keywords)),
+            "reject_keywords": list(_split_keywords(args.background_reject_keywords)),
+        },
         "target_counts": {k: len(v) for k, v in targets_by_split.items()} if args.asset_mode == "real" else None,
         "distractor_counts": {k: len(v) for k, v in distractors_by_split.items()} if args.asset_mode == "real" else None,
         "target_template_filter": {
