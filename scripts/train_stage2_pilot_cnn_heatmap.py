@@ -492,7 +492,7 @@ def _save_checkpoint(
             "decode_method": str(args.decode_method),
             "width": int(args.width),
             "cnn_arch": str(args.cnn_arch),
-            "init_weights": init_weights,
+            "init_weights": str(args.init_weights or ""),
             "epoch": int(epoch),
             "selection_metric": str(args.selection_metric),
             "best_selection_score": float(best_score),
