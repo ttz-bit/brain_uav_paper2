@@ -45,8 +45,19 @@ def parse_args() -> argparse.Namespace:
         "--selection-metric",
         type=str,
         default="val_pixel_error",
-        choices=["val_loss", "val_pixel_error", "val_center_improve"],
+        choices=[
+            "val_loss",
+            "val_pixel_error",
+            "val_argmax_pixel_error",
+            "val_softargmax_pixel_error",
+            "val_center_improve",
+            "val_far_pixel_error",
+            "val_mid_pixel_error",
+            "val_terminal_pixel_error",
+        ],
     )
+    p.add_argument("--train-only-stage", type=str, default="", choices=["", "far", "mid", "terminal"])
+    p.add_argument("--val-only-stage", type=str, default="", choices=["", "far", "mid", "terminal"])
     p.add_argument("--train-eval-max-samples", type=int, default=2048)
     p.add_argument("--val-eval-max-samples", type=int, default=0)
     p.add_argument("--num-workers", type=int, default=0)
@@ -173,12 +184,14 @@ def main() -> None:
         split=args.train_split,
         project_root=project_root,
         max_samples=args.max_train_samples,
+        only_stage=str(args.train_only_stage) or None,
     )
     val_ds = build_stage2_rendered_dataset(
         root=dataset_root,
         split=args.val_split,
         project_root=project_root,
         max_samples=args.max_val_samples,
+        only_stage=str(args.val_only_stage) or None,
     )
 
     class _TorchDataset(Dataset):
@@ -192,7 +205,8 @@ def main() -> None:
             sample = self.ds[int(idx)]
             x = _to_tensor_image(sample.image, int(args.input_size))
             y = _target_from_sample(sample)
-            return torch.from_numpy(x), torch.from_numpy(y)
+            stage = str((sample.meta or {}).get("perception_stage", "unknown"))
+            return torch.from_numpy(x), torch.from_numpy(y), stage
 
     train_torch_ds = _TorchDataset(train_ds)
     val_torch_ds = _TorchDataset(val_ds)
@@ -263,10 +277,13 @@ def main() -> None:
         losses: list[float] = []
         px_errors: list[float] = []
         center_errors: list[float] = []
+        argmax_px_errors: list[float] = []
+        softargmax_px_errors: list[float] = []
+        per_stage: dict[str, list[float]] = {"far": [], "mid": [], "terminal": []}
         unique_pred: set[tuple[int, int]] = set()
         count = 0
         with torch.inference_mode():
-            for xb, yb in loader:
+            for xb, yb, stages in loader:
                 xb = xb.to(device, non_blocking=(device == "cuda"))
                 yb = yb.to(device, non_blocking=(device == "cuda"))
                 if bool(args.channels_last) and device == "cuda":
@@ -275,19 +292,24 @@ def main() -> None:
                     outputs = model(xb)
                     loss, _ = _loss(outputs, yb)
                 losses.append(float(loss.detach().cpu().item()))
-                if str(args.decode_method) == "softargmax":
-                    pred_xy = soft_argmax_2d(
-                        outputs["heatmap_logits"],
-                        temperature=float(args.softargmax_temperature),
-                    ).detach().cpu().numpy()
-                else:
-                    pred_xy = peak_argmax_2d(outputs["heatmap_logits"]).detach().cpu().numpy()
+                argmax_xy = peak_argmax_2d(outputs["heatmap_logits"]).detach().cpu().numpy()
+                soft_xy = soft_argmax_2d(
+                    outputs["heatmap_logits"],
+                    temperature=float(args.softargmax_temperature),
+                ).detach().cpu().numpy()
+                pred_xy = soft_xy if str(args.decode_method) == "softargmax" else argmax_xy
                 gt = yb[:, :2].detach().cpu().numpy()
-                for pred, target in zip(pred_xy, gt):
+                for arg_pred, soft_pred, pred, target, stage in zip(argmax_xy, soft_xy, pred_xy, gt, stages):
                     err = _pixel_error_norm(pred, target, int(args.input_size), int(args.input_size))
+                    arg_err = _pixel_error_norm(arg_pred, target, int(args.input_size), int(args.input_size))
+                    soft_err = _pixel_error_norm(soft_pred, target, int(args.input_size), int(args.input_size))
                     center = _pixel_error_norm(np.array([0.5, 0.5], dtype=np.float32), target, int(args.input_size), int(args.input_size))
                     px_errors.append(err)
+                    argmax_px_errors.append(arg_err)
+                    softargmax_px_errors.append(soft_err)
                     center_errors.append(center)
+                    if str(stage) in per_stage:
+                        per_stage[str(stage)].append(err)
                     unique_pred.add((int(round(pred[0] * int(args.input_size))), int(round(pred[1] * int(args.input_size)))))
                     count += 1
         px_mean = float(np.mean(px_errors)) if px_errors else 0.0
@@ -297,9 +319,15 @@ def main() -> None:
             "samples": int(count),
             "pixel_error_mean": px_mean,
             "pixel_error_p90": float(np.percentile(px_errors, 90)) if px_errors else 0.0,
+            "argmax_pixel_error_mean": float(np.mean(argmax_px_errors)) if argmax_px_errors else 0.0,
+            "argmax_pixel_error_p90": float(np.percentile(argmax_px_errors, 90)) if argmax_px_errors else 0.0,
+            "softargmax_pixel_error_mean": float(np.mean(softargmax_px_errors)) if softargmax_px_errors else 0.0,
+            "softargmax_pixel_error_p90": float(np.percentile(softargmax_px_errors, 90)) if softargmax_px_errors else 0.0,
             "center_baseline_pixel_error_mean": center_mean,
             "center_baseline_improve_ratio": float((center_mean - px_mean) / max(center_mean, 1e-12)) if center_errors else 0.0,
             "rounded_unique_pred_xy": int(len(unique_pred)),
+            "stage_pixel_error_mean": {k: float(np.mean(v)) if v else 0.0 for k, v in per_stage.items()},
+            "stage_counts": {k: int(len(v)) for k, v in per_stage.items()},
         }
 
     with torch.inference_mode():
@@ -308,10 +336,29 @@ def main() -> None:
 
     def _selection_score(metrics: dict[str, float | int]) -> float:
         metric = str(args.selection_metric)
+        def _stage_score(stage: str) -> float:
+            stage_counts = metrics.get("stage_counts", {})
+            stage_errors = metrics.get("stage_pixel_error_mean", {})
+            if not isinstance(stage_counts, dict) or not isinstance(stage_errors, dict):
+                return float("inf")
+            if int(stage_counts.get(stage, 0)) <= 0:
+                return float("inf")
+            return float(stage_errors[stage])
+
         if metric == "val_loss":
             return float(metrics["loss"])
+        if metric == "val_argmax_pixel_error":
+            return float(metrics["argmax_pixel_error_mean"])
+        if metric == "val_softargmax_pixel_error":
+            return float(metrics["softargmax_pixel_error_mean"])
         if metric == "val_center_improve":
             return -float(metrics["center_baseline_improve_ratio"])
+        if metric == "val_far_pixel_error":
+            return _stage_score("far")
+        if metric == "val_mid_pixel_error":
+            return _stage_score("mid")
+        if metric == "val_terminal_pixel_error":
+            return _stage_score("terminal")
         return float(metrics["pixel_error_mean"])
 
     best_score = float("inf")
@@ -329,7 +376,7 @@ def main() -> None:
         model.train()
         batch_losses: list[float] = []
         t_train = time.perf_counter()
-        for xb, yb in train_loader:
+        for xb, yb, _stages in train_loader:
             xb = xb.to(device, non_blocking=(device == "cuda"))
             yb = yb.to(device, non_blocking=(device == "cuda"))
             if bool(args.channels_last) and device == "cuda":
@@ -394,6 +441,8 @@ def main() -> None:
             "root": str(dataset_root),
             "train_split": str(args.train_split),
             "val_split": str(args.val_split),
+            "train_only_stage": str(args.train_only_stage),
+            "val_only_stage": str(args.val_only_stage),
             "num_train": int(len(train_ds)),
             "num_val": int(len(val_ds)),
         },
@@ -414,6 +463,8 @@ def main() -> None:
             "softargmax_temperature": float(args.softargmax_temperature),
             "decode_method": str(args.decode_method),
             "selection_metric": str(args.selection_metric),
+            "train_only_stage": str(args.train_only_stage),
+            "val_only_stage": str(args.val_only_stage),
             "eval_interval": int(eval_interval),
             "eval_batch_size": int(args.eval_batch_size),
             "train_eval_max_samples": int(train_eval_count),
@@ -480,6 +531,8 @@ def _save_checkpoint(
             "dataset_root": str(dataset_root),
             "train_split": str(args.train_split),
             "val_split": str(args.val_split),
+            "train_only_stage": str(args.train_only_stage),
+            "val_only_stage": str(args.val_only_stage),
             "num_train": int(len(train_ds)),
             "num_val": int(len(val_ds)),
             "input_size": int(args.input_size),
