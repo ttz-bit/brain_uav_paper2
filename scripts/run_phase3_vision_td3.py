@@ -957,9 +957,16 @@ def main() -> None:
         target_assets_root = Path(str(gen_cfg.get("target_assets_root") or gen_cfg["assets_root"])).resolve()
         distractor_assets_root = Path(str(gen_cfg.get("distractor_assets_root") or gen_cfg["assets_root"])).resolve()
         water_mask_root = Path(str(gen_cfg.get("water_mask_root") or (assets_root / "water_masks_auto"))).resolve()
+        background_filter = dict(gen_cfg.get("background_filter") or {})
         target_filter = dict(gen_cfg.get("target_template_filter") or {})
         distractor_filter = dict(gen_cfg.get("distractor_template_filter") or {})
-        backgrounds_by_split = _collect_backgrounds(assets_root, water_mask_root, skip_review=True)
+        backgrounds_by_split = _collect_backgrounds(
+            assets_root,
+            water_mask_root,
+            skip_review=True,
+            allow_keywords=tuple(background_filter.get("allow_keywords") or ()),
+            reject_keywords=tuple(background_filter.get("reject_keywords") or ()),
+        )
         targets_by_split = _collect_targets(
             target_assets_root,
             allow_keywords=tuple(target_filter.get("allow_keywords") or ()),
