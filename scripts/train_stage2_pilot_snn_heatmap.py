@@ -986,6 +986,10 @@ def main() -> None:
             "strict_no_leak": bool(args.strict_no_leak),
         },
         "metrics": {
+            "train_initial": train_initial,
+            "train_final": train_final,
+            "val_initial": val_initial,
+            "val_final": val_final,
             "train_initial_loss": float(train_initial["loss"]),
             "train_initial_pixel_error_mean": float(train_initial["pixel_error_mean"]),
             "train_initial_center_baseline_improve_ratio": float(train_initial["center_baseline_improve_ratio"]),
