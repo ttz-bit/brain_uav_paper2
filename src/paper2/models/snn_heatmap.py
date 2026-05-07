@@ -33,6 +33,7 @@ class HeatmapSNN(nn.Module):
         num_steps: int = 12,
         train_encoding: str = "direct",
         eval_encoding: str = "direct",
+        arch: str = "enhanced",
     ):
         super().__init__()
         try:
@@ -45,17 +46,38 @@ class HeatmapSNN(nn.Module):
         self.num_steps = int(num_steps)
         self.train_encoding = str(train_encoding)
         self.eval_encoding = str(eval_encoding)
+        self.arch = str(arch or "enhanced")
+        if self.arch not in {"legacy", "enhanced"}:
+            raise ValueError("HeatmapSNN arch must be 'legacy' or 'enhanced'.")
         self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=2, padding=1)
         self.lif1 = snn.Leaky(beta=float(beta), spike_grad=spike_grad)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)
         self.lif2 = snn.Leaky(beta=float(beta), spike_grad=spike_grad)
-        self.conv3 = nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1)
-        self.lif3 = snn.Leaky(beta=float(beta), spike_grad=spike_grad)
-        self.heatmap_head = nn.Conv2d(32, 1, kernel_size=1)
+        if self.arch == "legacy":
+            self.conv3 = nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1)
+            self.lif3 = snn.Leaky(beta=float(beta), spike_grad=spike_grad)
+            feature_channels = 32
+            self.heatmap_head = nn.Conv2d(feature_channels, 1, kernel_size=1)
+        else:
+            self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+            self.lif3 = snn.Leaky(beta=float(beta), spike_grad=spike_grad)
+            self.conv4 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)
+            self.lif4 = snn.Leaky(beta=float(beta), spike_grad=spike_grad)
+            self.conv5 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=2, dilation=2)
+            self.lif5 = snn.Leaky(beta=float(beta), spike_grad=spike_grad)
+            self.conv6 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)
+            self.lif6 = snn.Leaky(beta=float(beta), spike_grad=spike_grad)
+            self.skip2 = nn.Conv2d(32, 64, kernel_size=1)
+            feature_channels = 64
+            self.heatmap_head = nn.Sequential(
+                nn.Conv2d(feature_channels, 32, kernel_size=3, stride=1, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 1, kernel_size=1),
+            )
         self.conf_head = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(32, 1),
+            nn.Linear(feature_channels, 1),
         )
 
     def _rate_encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -77,20 +99,39 @@ class HeatmapSNN(nn.Module):
         mem1 = self.lif1.init_leaky()
         mem2 = self.lif2.init_leaky()
         mem3 = self.lif3.init_leaky()
+        mem4 = self.lif4.init_leaky() if self.arch == "enhanced" else None
+        mem5 = self.lif5.init_leaky() if self.arch == "enhanced" else None
+        mem6 = self.lif6.init_leaky() if self.arch == "enhanced" else None
         feat_acc = None
         spike1_total = None
         spike2_total = None
         spike3_total = None
+        spike4_total = None
+        spike5_total = None
+        spike6_total = None
         for _ in range(self.num_steps):
             x_t = self._encode(x, stochastic=stochastic)
             spk1, mem1 = self.lif1(self.conv1(x_t), mem1)
             spk2, mem2 = self.lif2(self.conv2(spk1), mem2)
-            spk3, mem3 = self.lif3(self.conv3(spk2), mem3)
-            feat_acc = spk3 if feat_acc is None else feat_acc + spk3
+            if self.arch == "legacy":
+                spk3, mem3 = self.lif3(self.conv3(spk2), mem3)
+                feat_t = spk3
+            else:
+                assert mem4 is not None and mem5 is not None and mem6 is not None
+                spk3, mem3 = self.lif3(self.conv3(spk2), mem3)
+                spk4, mem4 = self.lif4(self.conv4(spk3), mem4)
+                spk5, mem5 = self.lif5(self.conv5(spk4), mem5)
+                spk6, mem6 = self.lif6(self.conv6(spk5 + spk3), mem6)
+                feat_t = spk6 + self.skip2(spk2)
+            feat_acc = feat_t if feat_acc is None else feat_acc + feat_t
             if return_diagnostics:
                 spike1_total = spk1 if spike1_total is None else spike1_total + spk1
                 spike2_total = spk2 if spike2_total is None else spike2_total + spk2
                 spike3_total = spk3 if spike3_total is None else spike3_total + spk3
+                if self.arch == "enhanced":
+                    spike4_total = spk4 if spike4_total is None else spike4_total + spk4
+                    spike5_total = spk5 if spike5_total is None else spike5_total + spk5
+                    spike6_total = spk6 if spike6_total is None else spike6_total + spk6
         feat = feat_acc / max(1, self.num_steps)
         heatmap_logits = self.heatmap_head(feat)
         out = {
@@ -101,6 +142,7 @@ class HeatmapSNN(nn.Module):
             steps = max(1, self.num_steps)
             assert spike1_total is not None and spike2_total is not None and spike3_total is not None
             out["diagnostics"] = {
+                "arch": self.arch,
                 "spike_rate_l1": (spike1_total / steps).mean().detach(),
                 "spike_rate_l2": (spike2_total / steps).mean().detach(),
                 "spike_rate_l3": (spike3_total / steps).mean().detach(),
@@ -111,6 +153,15 @@ class HeatmapSNN(nn.Module):
                 "heatmap_logit_min": heatmap_logits.min().detach(),
                 "heatmap_logit_max": heatmap_logits.max().detach(),
             }
+            if self.arch == "enhanced":
+                assert spike4_total is not None and spike5_total is not None and spike6_total is not None
+                out["diagnostics"].update(
+                    {
+                        "spike_rate_l4": (spike4_total / steps).mean().detach(),
+                        "spike_rate_l5": (spike5_total / steps).mean().detach(),
+                        "spike_rate_l6": (spike6_total / steps).mean().detach(),
+                    }
+                )
         return out
 
 

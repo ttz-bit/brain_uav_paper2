@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     p.add_argument("--num-steps", type=int, default=12)
     p.add_argument("--beta", type=float, default=0.95)
+    p.add_argument("--snn-arch", type=str, default="enhanced", choices=["legacy", "enhanced"])
     p.add_argument("--input-size", type=int, default=256)
     p.add_argument("--heatmap-size", type=int, default=64)
     p.add_argument("--heatmap-sigma", type=float, default=1.5)
@@ -468,6 +469,7 @@ def main() -> None:
         num_steps=int(args.num_steps),
         train_encoding=str(args.train_encoding),
         eval_encoding=str(args.eval_encoding),
+        arch=str(args.snn_arch),
     ).to(device)
     if bool(args.channels_last) and device == "cuda":
         model = model.to(memory_format=torch.channels_last)
@@ -717,6 +719,7 @@ def main() -> None:
                     "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty_plus_water_logit_constraint",
                     "num_steps": int(args.num_steps),
                     "beta": float(args.beta),
+                    "snn_arch": str(args.snn_arch),
                     "train_encoding": str(args.train_encoding),
                     "eval_encoding": str(args.eval_encoding),
                     "init_weights": init_weights,
@@ -762,6 +765,7 @@ def main() -> None:
                     "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty_plus_water_logit_constraint",
                     "num_steps": int(args.num_steps),
                     "beta": float(args.beta),
+                    "snn_arch": str(args.snn_arch),
                     "train_encoding": str(args.train_encoding),
                     "eval_encoding": str(args.eval_encoding),
                     "init_weights": init_weights,
@@ -817,6 +821,7 @@ def main() -> None:
             "loss_kind": "spatial_cross_entropy_plus_coordinate_plus_distractor_repel_plus_land_penalty_plus_water_logit_constraint",
             "num_steps": int(args.num_steps),
             "beta": float(args.beta),
+            "snn_arch": str(args.snn_arch),
             "train_encoding": str(args.train_encoding),
             "eval_encoding": str(args.eval_encoding),
             "init_weights": init_weights,
@@ -900,6 +905,7 @@ def main() -> None:
         "device": str(device),
         "model": {
             "type": "snn_heatmap",
+            "arch": str(args.snn_arch),
             "output": "64x64 heatmap + confidence by default",
             "decode_method": str(args.decode_method),
             "water_constrained_decode": bool(water_constraint),
@@ -912,6 +918,7 @@ def main() -> None:
             "seed": int(args.seed),
             "num_steps": int(args.num_steps),
             "beta": float(args.beta),
+            "snn_arch": str(args.snn_arch),
             "train_encoding": str(args.train_encoding),
             "eval_encoding": str(args.eval_encoding),
             "init_weights": init_weights,

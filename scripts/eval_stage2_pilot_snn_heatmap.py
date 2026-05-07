@@ -352,11 +352,13 @@ def main() -> None:
     if ckpt_model_type == "cnn_heatmap":
         model = HeatmapCNN(width=int(ckpt.get("width", 32))).to(device)
     else:
+        snn_arch = str(ckpt.get("snn_arch", ckpt.get("arch", "legacy")))
         model = HeatmapSNN(
             beta=float(ckpt.get("beta", 0.95)),
             num_steps=int(ckpt.get("num_steps", 12)),
             train_encoding=ckpt_train_encoding,
             eval_encoding=eval_encoding,
+            arch=snn_arch,
         ).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
@@ -591,6 +593,7 @@ def main() -> None:
             "decode_method": str(decode_method),
             "loss_kind": str(ckpt.get("loss_kind", "unknown")),
             "checkpoint_model_type": str(ckpt_model_type),
+            "checkpoint_snn_arch": str(ckpt.get("snn_arch", ckpt.get("arch", ""))),
         },
         "metrics": {
             "eval_loss_mean": _mean(losses),
