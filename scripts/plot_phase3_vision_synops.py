@@ -219,7 +219,7 @@ def main() -> None:
     _ratio_panel(axes[1], results)
     _snn_layer_panel(axes[2], results)
     _layer_ops_panel(axes[3], results)
-    fig.suptitle("MACs and Spike-Gated SynOps Proxy Analysis", y=1.02)
+    fig.suptitle("MACs and Spike-Gated SynOps Proxy Analysis (Not Measured Energy)", y=1.02)
     out_png = out_dir / "phase3_vision_synops.png"
     out_pdf = out_dir / "phase3_vision_synops.pdf"
     fig.savefig(out_png, dpi=int(args.dpi), bbox_inches="tight")

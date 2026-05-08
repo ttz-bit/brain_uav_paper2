@@ -33,6 +33,12 @@ def parse_args() -> argparse.Namespace:
         default="far=0.020,mid=0.010,terminal=0.005",
         help="Comma-separated stage GSD map used to estimate stage world error from stage pixel error.",
     )
+    p.add_argument(
+        "--allow-protocol-mismatch",
+        action="store_true",
+        help="Allow plotting even when SNN/CNN dataset, split, eval count, decode, or water-constraint settings differ.",
+    )
+    p.add_argument("--dpi", type=int, default=300)
     return p.parse_args()
 
 
@@ -118,6 +124,17 @@ def _common_context(snn: dict[str, Any], cnn: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _protocol_failures(context: dict[str, Any]) -> list[str]:
+    required = (
+        "same_dataset_root",
+        "same_eval_split",
+        "same_num_eval",
+        "same_decode_method",
+        "same_water_logit_constraint",
+    )
+    return [key for key in required if not bool(context.get(key, False))]
+
+
 def _annotate_bars(ax: plt.Axes, bars, *, fmt: str = "{:.2f}") -> None:
     for bar in bars:
         h = float(bar.get_height())
@@ -164,6 +181,9 @@ def _bar_pair(
         ax.set_ylim(0.0, ymax * 1.18 if ymax > 0.0 else 1.0)
         _annotate_bars(ax, snn_bars)
         _annotate_bars(ax, cnn_bars)
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -282,6 +302,13 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     context = _common_context(snn, cnn)
+    failures = _protocol_failures(context)
+    if failures and not args.allow_protocol_mismatch:
+        details = ", ".join(failures)
+        raise SystemExit(
+            "SNN/CNN protocol mismatch; refusing to create a formal comparison figure. "
+            f"Failed checks: {details}. Pass --allow-protocol-mismatch only for diagnostic plots."
+        )
     labels = [args.snn_label, args.cnn_label]
 
     stage_labels = list(STAGES)
@@ -305,66 +332,67 @@ def main() -> None:
     snn_stage_world_m = [snn_stage.get(stage, float("nan")) * stage_gsd[stage] * 1000.0 for stage in stage_labels]
     cnn_stage_world_m = [cnn_stage.get(stage, float("nan")) * stage_gsd[stage] * 1000.0 for stage in stage_labels]
 
-    fig, axes = plt.subplots(2, 4, figsize=(20, 8.8), constrained_layout=True)
+    plt.rcParams.update(
+        {
+            "font.family": "DejaVu Sans",
+            "font.size": 10,
+            "axes.titlesize": 11,
+            "axes.labelsize": 10,
+            "legend.fontsize": 9,
+            "figure.titlesize": 13,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+    fig, axes = plt.subplots(2, 3, figsize=(13.2, 7.4), constrained_layout=True)
     axes = axes.flatten()
 
     _bar_pair(
         axes[0],
         stage_labels,
-        snn_stage_px,
-        cnn_stage_px,
+        snn_stage_world_m,
+        cnn_stage_world_m,
         args.snn_label,
         args.cnn_label,
-        ylabel="pixel error (px)",
-        title="Stage Mean Pixel Error",
+        ylabel="World error (m)",
+        title="(a) Stage-wise world error",
     )
 
     _bar_pair(
         axes[1],
         stage_labels,
-        snn_stage_world_m,
-        cnn_stage_world_m,
+        snn_stage_px,
+        cnn_stage_px,
         args.snn_label,
         args.cnn_label,
-        ylabel="estimated world error (m)",
-        title="Stage Mean World Error",
+        ylabel="Pixel error (px)",
+        title="(b) Stage-wise pixel error",
     )
 
     _bar_pair(
         axes[2],
         ["mean", "p90"],
-        [_metric(snn, "pixel_error_mean"), _metric(snn, "pixel_error_p90")],
-        [_metric(cnn, "pixel_error_mean"), _metric(cnn, "pixel_error_p90")],
-        args.snn_label,
-        args.cnn_label,
-        ylabel="pixel error (px)",
-        title="Overall Pixel Error",
-    )
-
-    _bar_pair(
-        axes[3],
-        ["mean", "p90"],
         [_metric(snn, "world_error_mean_m"), _metric(snn, "world_error_p90_m")],
         [_metric(cnn, "world_error_mean_m"), _metric(cnn, "world_error_p90_m")],
         args.snn_label,
         args.cnn_label,
-        ylabel="world error (m)",
-        title="World-Space Error",
+        ylabel="World error (m)",
+        title="(c) Overall world-space error",
     )
 
     _bar_pair(
-        axes[4],
+        axes[3],
         backgrounds,
         [snn_bg.get(bg, float("nan")) for bg in backgrounds],
         [cnn_bg.get(bg, float("nan")) for bg in backgrounds],
         args.snn_label,
         args.cnn_label,
-        ylabel="pixel error (px)",
-        title="Background Mean Pixel Error",
+        ylabel="Pixel error (px)",
+        title="(d) Background-wise pixel error",
     )
 
     _bar_pair(
-        axes[5],
+        axes[4],
         ["center improve", "offcenter improve", "pred on land"],
         [
             _metric(snn, "center_baseline_improve_ratio") * 100.0,
@@ -378,39 +406,38 @@ def main() -> None:
         ],
         args.snn_label,
         args.cnn_label,
-        ylabel="percent (%)",
-        title="Quality Diagnostics",
+        ylabel="Percent (%)",
+        title="(e) Localization diagnostics",
         percent=True,
     )
 
     _bar_pair(
-        axes[6],
+        axes[5],
         ["unique pred xy"],
         [float(pred_stats_snn.get("rounded_unique_pred_xy", float("nan")))],
         [float(pred_stats_cnn.get("rounded_unique_pred_xy", float("nan")))],
         args.snn_label,
         args.cnn_label,
-        ylabel="count",
-        title="Prediction Diversity",
+        ylabel="Count",
+        title="(f) Prediction diversity",
     )
 
-    axes[7].axis("off")
-    protocol_lines = [
-        "Protocol Check",
-        f"same dataset: {context['same_dataset_root']}",
-        f"same split: {context['same_eval_split']}",
-        f"same num eval: {context['same_num_eval']}",
-        f"same decode: {context['same_decode_method']}",
-        f"same water constraint: {context['same_water_logit_constraint']}",
-        f"eval split: {context.get('eval_split')}",
-        f"num eval: {context.get('num_eval')}",
-    ]
-    axes[7].text(0.02, 0.98, "\n".join(protocol_lines), va="top", ha="left", fontsize=12)
-
     axes[0].legend(loc="upper left")
-    fig.suptitle(args.title)
+    fig.suptitle(args.title, y=1.02)
+    fig.text(
+        0.5,
+        -0.015,
+        (
+            f"Protocol: same dataset/split/eval count/decode/water constraint; "
+            f"split={context.get('eval_split')}, N={context.get('num_eval')}."
+        ),
+        ha="center",
+        va="top",
+        fontsize=9,
+    )
     out_png = out_dir / "phase3_vision_eval_comparison.png"
-    fig.savefig(out_png, dpi=180)
+    fig.savefig(out_png, dpi=int(args.dpi), bbox_inches="tight")
+    fig.savefig(out_dir / "phase3_vision_eval_comparison.pdf", bbox_inches="tight")
     plt.close(fig)
 
     rows = _summary_rows(args.snn_label, snn) + _summary_rows(args.cnn_label, cnn)

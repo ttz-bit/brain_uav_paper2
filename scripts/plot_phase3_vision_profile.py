@@ -92,14 +92,24 @@ def _bar(ax: plt.Axes, labels: list[str], values: list[float], *, ylabel: str, t
     _style(ax)
 
 
+def _spike_label(raw: str) -> str:
+    text = str(raw).replace("spike_rate_", "").strip()
+    lower = text.lower()
+    if lower.startswith("l") and lower[1:].isdigit():
+        return f"conv{lower[1:]}"
+    if lower.startswith("layer") and lower[5:].isdigit():
+        return f"conv{lower[5:]}"
+    return text.replace("_", ".")
+
+
 def _spike_panel(ax: plt.Axes, snn_row: dict[str, Any]) -> None:
     diag = snn_row.get("spike_diagnostics", {})
     if not isinstance(diag, dict) or not diag:
         ax.axis("off")
         ax.text(0.02, 0.95, "No SNN spike diagnostics available.", va="top", ha="left")
         return
-    items = sorted((str(k).replace("spike_rate_", ""), float(v)) for k, v in diag.items())
-    labels = [k.upper() for k, _ in items]
+    items = sorted((_spike_label(str(k)), float(v)) for k, v in diag.items())
+    labels = [k for k, _ in items]
     values = [v * 100.0 for _, v in items]
     x = np.arange(len(labels), dtype=float)
     bars = ax.bar(x, values, color=COLORS["SNN-enhanced"], width=0.62)
@@ -174,7 +184,7 @@ def main() -> None:
     )
     snn_row = by_label.get("SNN-enhanced", rows[0])
     _spike_panel(axes[3], snn_row)
-    fig.suptitle("Computational Profile of Vision Localization Models", y=1.02)
+    fig.suptitle("Computational Profile of Vision Localization Models (Conventional GPU)", y=1.02)
     out_png = out_dir / "phase3_vision_profile.png"
     out_pdf = out_dir / "phase3_vision_profile.pdf"
     fig.savefig(out_png, dpi=int(args.dpi), bbox_inches="tight")

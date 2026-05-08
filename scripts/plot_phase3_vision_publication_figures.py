@@ -28,7 +28,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--snn-label", type=str, default="SNN-enhanced")
     p.add_argument("--cnn-label", type=str, default="CNN-enhanced")
     p.add_argument("--output-dir", type=str, default="outputs/reports/phase3_vision_publication")
-    p.add_argument("--max-cdf-error-m", type=float, default=250.0)
+    p.add_argument("--max-cdf-error-m", type=float, default=1000.0)
+    p.add_argument(
+        "--allow-protocol-mismatch",
+        action="store_true",
+        help="Allow plotting even if SNN/CNN dataset, split, eval count, decode, or water-constraint settings differ.",
+    )
     p.add_argument("--dpi", type=int, default=300)
     return p.parse_args()
 
@@ -59,6 +64,34 @@ def _read_records_from_report(report: dict[str, Any]) -> list[dict[str, Any]]:
 def _metrics(report: dict[str, Any]) -> dict[str, Any]:
     value = report.get("metrics", {})
     return value if isinstance(value, dict) else {}
+
+
+def _common_context(snn: dict[str, Any], cnn: dict[str, Any]) -> dict[str, Any]:
+    snn_dataset = snn.get("dataset", {}) if isinstance(snn.get("dataset", {}), dict) else {}
+    cnn_dataset = cnn.get("dataset", {}) if isinstance(cnn.get("dataset", {}), dict) else {}
+    snn_cfg = snn.get("eval_config", {}) if isinstance(snn.get("eval_config", {}), dict) else {}
+    cnn_cfg = cnn.get("eval_config", {}) if isinstance(cnn.get("eval_config", {}), dict) else {}
+    return {
+        "same_dataset_root": snn_dataset.get("root") == cnn_dataset.get("root"),
+        "same_eval_split": snn_dataset.get("eval_split") == cnn_dataset.get("eval_split"),
+        "same_num_eval": snn_dataset.get("num_eval") == cnn_dataset.get("num_eval"),
+        "same_decode_method": snn_cfg.get("decode_method") == cnn_cfg.get("decode_method"),
+        "same_water_logit_constraint": snn_cfg.get("water_logit_constraint") == cnn_cfg.get("water_logit_constraint"),
+        "dataset_root": snn_dataset.get("root"),
+        "eval_split": snn_dataset.get("eval_split"),
+        "num_eval": snn_dataset.get("num_eval"),
+    }
+
+
+def _protocol_failures(context: dict[str, Any]) -> list[str]:
+    keys = (
+        "same_dataset_root",
+        "same_eval_split",
+        "same_num_eval",
+        "same_decode_method",
+        "same_water_logit_constraint",
+    )
+    return [key for key in keys if not bool(context.get(key, False))]
 
 
 def _metric(report: dict[str, Any], key: str) -> float:
@@ -151,6 +184,10 @@ def _bar_with_points(
     ax.set_xticklabels([s.capitalize() for s in stage_labels])
     ax.set_ylabel("World localization error (m)")
     ax.set_title("(a) Stage-wise mean error with P90 markers", loc="left", fontsize=11)
+    finite = np.asarray([*snn_mean, *cnn_mean, *snn_p90, *cnn_p90], dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size and float(finite.max()) / max(float(np.percentile(finite, 50)), 1.0e-9) > 20.0:
+        ax.set_yscale("log")
     ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
     _style_axes(ax)
 
@@ -198,16 +235,14 @@ def _boxplot(ax: plt.Axes, *, snn_stage: dict[str, np.ndarray], cnn_stage: dict[
 
 
 def _diagnostic_panel(ax: plt.Axes, snn: dict[str, Any], cnn: dict[str, Any], snn_label: str, cnn_label: str) -> None:
-    labels = ["Mean", "P90", "Land pred."]
+    labels = ["Mean", "P90"]
     snn_vals = [
         _metric(snn, "world_error_mean_m"),
         _metric(snn, "world_error_p90_m"),
-        _metric(snn, "pred_on_land_ratio") * 100.0,
     ]
     cnn_vals = [
         _metric(cnn, "world_error_mean_m"),
         _metric(cnn, "world_error_p90_m"),
-        _metric(cnn, "pred_on_land_ratio") * 100.0,
     ]
     x = np.arange(len(labels), dtype=float)
     width = 0.34
@@ -215,15 +250,42 @@ def _diagnostic_panel(ax: plt.Axes, snn: dict[str, Any], cnn: dict[str, Any], sn
     ax.bar(x + width / 2, cnn_vals, width, color=COLORS.get(cnn_label, "#c55a11"), label=cnn_label)
     ax.set_xticks(x)
     ax.set_xticklabels(labels)
-    ax.set_ylabel("m for errors; % for land predictions")
-    ax.set_title("(d) Overall metrics", loc="left", fontsize=11)
+    ax.set_ylabel("World localization error (m)")
+    ax.set_title("(d) Overall error and land predictions", loc="left", fontsize=11)
     _style_axes(ax)
+
+    ax2 = ax.twinx()
+    land_vals = [_metric(snn, "pred_on_land_ratio") * 100.0, _metric(cnn, "pred_on_land_ratio") * 100.0]
+    land_x = np.array([len(labels) + 0.15, len(labels) + 0.55], dtype=float)
+    ax2.scatter(
+        land_x,
+        land_vals,
+        marker="D",
+        s=42,
+        color=[COLORS.get(snn_label, "#2f5597"), COLORS.get(cnn_label, "#c55a11")],
+        zorder=3,
+    )
+    for xi, value in zip(land_x, land_vals):
+        if np.isfinite(value):
+            ax2.text(xi, value, f"{value:.2f}%", ha="center", va="bottom", fontsize=8)
+    ax2.set_ylabel("Predicted-on-land ratio (%)")
+    ax2.spines["top"].set_visible(False)
+    ax.set_xlim(-0.55, len(labels) + 0.95)
+    ax.set_xticks([*x, float(np.mean(land_x))])
+    ax.set_xticklabels([*labels, "Land pred."])
 
 
 def main() -> None:
     args = parse_args()
     snn = _read_json(args.snn_report)
     cnn = _read_json(args.cnn_report)
+    protocol = _common_context(snn, cnn)
+    failures = _protocol_failures(protocol)
+    if failures and not args.allow_protocol_mismatch:
+        raise SystemExit(
+            "SNN/CNN protocol mismatch; refusing to create a formal publication figure. "
+            f"Failed checks: {', '.join(failures)}. Pass --allow-protocol-mismatch only for diagnostics."
+        )
     snn_records = _read_records_from_report(snn)
     cnn_records = _read_records_from_report(cnn)
     snn_stage = _stage_values(snn_records)
@@ -277,6 +339,15 @@ def main() -> None:
     axes[1].set_xlim(0.0, float(args.max_cdf_error_m))
     axes[1].set_ylim(0.0, 1.0)
     axes[1].legend(frameon=False, loc="lower right")
+    axes[1].text(
+        0.02,
+        0.04,
+        f"Errors > {float(args.max_cdf_error_m):.0f} m clipped for display",
+        transform=axes[1].transAxes,
+        fontsize=8,
+        ha="left",
+        va="bottom",
+    )
     _style_axes(axes[1])
     _boxplot(axes[2], snn_stage=snn_stage, cnn_stage=cnn_stage)
     _diagnostic_panel(axes[3], snn, cnn, args.snn_label, args.cnn_label)
@@ -301,6 +372,7 @@ def main() -> None:
             "snn": {stage: int(snn_stage[stage].size) for stage in STAGES},
             "cnn": {stage: int(cnn_stage[stage].size) for stage in STAGES},
         },
+        "protocol": protocol,
         "note": "All stage panels use per-sample world_error_m from sample_errors_all.json.",
     }
     (out_dir / "phase3_vision_world_error_context.json").write_text(
