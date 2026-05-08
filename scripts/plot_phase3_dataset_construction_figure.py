@@ -28,6 +28,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-root", type=str, required=True)
     p.add_argument("--project-root", type=str, default=str(Path(__file__).resolve().parents[1]))
     p.add_argument("--split", type=str, default="test")
+    p.add_argument(
+        "--sequence-id",
+        type=str,
+        default="",
+        help="Optional sequence id. When provided, far/mid/terminal panels are selected from this sequence.",
+    )
+    p.add_argument(
+        "--no-title",
+        action="store_true",
+        help="Omit the figure-level title for compact paper layouts.",
+    )
     p.add_argument("--output-dir", type=str, default="outputs/reports/phase3_dataset_construction")
     p.add_argument("--dpi", type=int, default=300)
     return p.parse_args()
@@ -115,16 +126,19 @@ def _score_row(row: dict[str, Any], stage: str) -> float:
     return center_score + size_score + category_bonus + water_bonus + stage_bonus
 
 
-def _select_stage(rows: list[dict[str, Any]], *, split: str, stage: str) -> dict[str, Any]:
-    candidates = [
+def _valid_rows(rows: list[dict[str, Any]], *, split: str) -> list[dict[str, Any]]:
+    return [
         r
         for r in rows
         if str(r.get("split")) == split
-        and str(r.get("stage")) == stage
         and bool(r.get("obs_valid", True))
         and int(r.get("meta", {}).get("distractor_count", r.get("distractor_count", 0))) == 0
         and float(r.get("land_overlap_ratio", 0.0)) <= 1.0e-9
     ]
+
+
+def _select_stage(rows: list[dict[str, Any]], *, split: str, stage: str) -> dict[str, Any]:
+    candidates = [r for r in _valid_rows(rows, split=split) if str(r.get("stage")) == stage]
     if not candidates:
         candidates = [r for r in rows if str(r.get("stage")) == stage]
     if not candidates:
@@ -132,11 +146,54 @@ def _select_stage(rows: list[dict[str, Any]], *, split: str, stage: str) -> dict
     return max(candidates, key=lambda r: _score_row(r, stage))
 
 
+def _select_stage_triplet(
+    rows: list[dict[str, Any]],
+    *,
+    split: str,
+    sequence_id: str = "",
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    usable = _valid_rows(rows, split=split)
+    if sequence_id:
+        seq_rows = [r for r in usable if str(r.get("sequence_id")) == sequence_id]
+        if not seq_rows:
+            raise ValueError(f"No valid rows for sequence_id={sequence_id!r} in split={split!r}")
+    else:
+        by_seq: dict[str, list[dict[str, Any]]] = {}
+        for row in usable:
+            by_seq.setdefault(str(row.get("sequence_id", "")), []).append(row)
+        complete: list[tuple[float, str, list[dict[str, Any]]]] = []
+        for seq, seq_rows_candidate in by_seq.items():
+            stages = {str(r.get("stage")) for r in seq_rows_candidate}
+            if {"far", "mid", "terminal"}.issubset(stages):
+                stage_best = [
+                    max([r for r in seq_rows_candidate if str(r.get("stage")) == st], key=lambda r: _score_row(r, st))
+                    for st in ("far", "mid", "terminal")
+                ]
+                score = sum(_score_row(r, str(r.get("stage"))) for r in stage_best)
+                complete.append((float(score), seq, seq_rows_candidate))
+        if complete:
+            complete.sort(reverse=True, key=lambda item: item[0])
+            seq_rows = complete[0][2]
+        else:
+            return (
+                _select_stage(rows, split=split, stage="far"),
+                _select_stage(rows, split=split, stage="mid"),
+                _select_stage(rows, split=split, stage="terminal"),
+            )
+    selected = []
+    for stage in ("far", "mid", "terminal"):
+        candidates = [r for r in seq_rows if str(r.get("stage")) == stage]
+        if not candidates:
+            raise ValueError(f"Sequence {sequence_id!r} does not contain stage={stage!r}")
+        selected.append(max(candidates, key=lambda r: _score_row(r, stage)))
+    return selected[0], selected[1], selected[2]
+
+
 def _draw_label(ax: plt.Axes, row: dict[str, Any], *, color: str = "#c00000", show_text: bool = True) -> None:
     cx, cy = [float(v) for v in row["target_center_px"]]
     x, y, w, h = [float(v) for v in row["bbox_xywh"]]
-    ax.add_patch(Rectangle((x, y), w, h, fill=False, edgecolor=color, linewidth=1.4))
-    ax.add_patch(Circle((cx, cy), radius=3.0, facecolor=color, edgecolor="white", linewidth=0.7, zorder=4))
+    ax.add_patch(Rectangle((x, y), w, h, fill=False, edgecolor=color, linewidth=1.1))
+    ax.add_patch(Circle((cx, cy), radius=2.5, facecolor=color, edgecolor="white", linewidth=0.6, zorder=4))
     if show_text:
         ax.text(
             0.03,
@@ -145,9 +202,9 @@ def _draw_label(ax: plt.Axes, row: dict[str, Any], *, color: str = "#c00000", sh
             transform=ax.transAxes,
             ha="left",
             va="top",
-            fontsize=8,
+            fontsize=7.5,
             color=color,
-            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.82, "pad": 1.5},
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.76, "pad": 1.2},
         )
 
 
@@ -169,9 +226,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows = _load_manifest(dataset_root)
-    far = _select_stage(rows, split=str(args.split), stage="far")
-    mid = _select_stage(rows, split=str(args.split), stage="mid")
-    terminal = _select_stage(rows, split=str(args.split), stage="terminal")
+    far, mid, terminal = _select_stage_triplet(rows, split=str(args.split), sequence_id=str(args.sequence_id))
     flow_row = mid
 
     rendered_path = _resolve_path(str(flow_row["image_path"]), project_root=project_root, dataset_root=dataset_root)
@@ -189,12 +244,12 @@ def main() -> None:
             "font.family": "DejaVu Sans",
             "font.size": 9,
             "axes.titlesize": 10,
-            "figure.titlesize": 13,
+            "figure.titlesize": 11,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
     )
-    fig, axes = plt.subplots(2, 4, figsize=(11.6, 6.0), constrained_layout=True)
+    fig, axes = plt.subplots(2, 4, figsize=(11.2, 5.55), constrained_layout=True)
     axes = axes.ravel()
 
     _imshow(axes[0], background, "(a) Maritime background crop")
@@ -205,8 +260,8 @@ def main() -> None:
         transform=axes[0].transAxes,
         ha="left",
         va="top",
-        fontsize=8,
-        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.82, "pad": 1.5},
+        fontsize=7.3,
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.74, "pad": 1.2},
     )
 
     _imshow(axes[1], target, "(b) Target crop and mask")
@@ -217,8 +272,8 @@ def main() -> None:
         transform=axes[1].transAxes,
         ha="left",
         va="top",
-        fontsize=8,
-        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.82, "pad": 1.5},
+        fontsize=7.3,
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.74, "pad": 1.2},
     )
 
     _imshow(axes[2], rendered, "(c) Copy-paste composition")
@@ -249,8 +304,8 @@ def main() -> None:
             transform=ax.transAxes,
             ha="left",
             va="top",
-            fontsize=7.5,
-            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.84, "pad": 1.5},
+            fontsize=7.0,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.74, "pad": 1.2},
         )
 
     axes[7].axis("off")
@@ -274,7 +329,7 @@ def main() -> None:
     axes[7].text(
         0.5,
         0.42,
-        "UAV pose\ncamera geometry",
+        "UAV pose +\ncamera geometry",
         ha="center",
         va="center",
         fontsize=9,
@@ -297,7 +352,8 @@ def main() -> None:
         bbox={"boxstyle": "round,pad=0.35", "facecolor": "#eaf7ea", "edgecolor": "#548235"},
     )
 
-    fig.suptitle("Task-oriented Maritime Dataset Construction and Stage-aware Samples", y=1.02)
+    if not bool(args.no_title):
+        fig.suptitle("Task-oriented Maritime Dataset Construction and Stage-aware Samples", y=1.015)
     fig.savefig(out_dir / "phase3_dataset_construction.png", dpi=int(args.dpi), bbox_inches="tight")
     fig.savefig(out_dir / "phase3_dataset_construction.pdf", bbox_inches="tight")
 
