@@ -27,6 +27,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weights", type=str, required=True, help="Formal Phase3 heatmap checkpoint.")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--max-samples", type=int, default=None)
+    p.add_argument("--shuffle-samples", action="store_true", help="Shuffle filtered samples before max-samples.")
+    p.add_argument("--sample-seed", type=int, default=20260508, help="Seed used when --shuffle-samples is enabled.")
+    p.add_argument(
+        "--require-jitter-applied",
+        action="store_true",
+        help="Evaluate only records whose preprocessing metadata says jitter_applied=true.",
+    )
+    p.add_argument(
+        "--min-center-error-px",
+        type=float,
+        default=0.0,
+        help="Evaluate only samples whose center-prior error is at least this many crop pixels.",
+    )
+    p.add_argument(
+        "--success-thresholds-px",
+        type=str,
+        default="5,10,20,40,80",
+        help="Comma-separated pixel thresholds for PCK/success rates.",
+    )
+    p.add_argument(
+        "--offset-bins-px",
+        type=str,
+        default="0,16,32,48,64,96,1000000",
+        help="Comma-separated center-prior error bin edges for stratified metrics.",
+    )
     p.add_argument("--input-size", type=int, default=0)
     p.add_argument("--decode-method", choices=["auto", "argmax", "softargmax"], default="auto")
     p.add_argument("--visual-audit-count", type=int, default=24)
@@ -152,6 +177,97 @@ def _metric_array(rows: list[dict[str, Any]], key: str) -> np.ndarray:
     return np.asarray([float(r[key]) for r in rows if np.isfinite(float(r[key]))], dtype=float)
 
 
+def _parse_float_list(text: str) -> list[float]:
+    vals: list[float] = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if part:
+            vals.append(float(part))
+    return vals
+
+
+def _row_center_error_px(row: dict[str, Any]) -> float:
+    crop_size = row.get("crop_size", [0, 0])
+    if isinstance(crop_size, (list, tuple)) and len(crop_size) >= 2:
+        w = float(crop_size[0])
+        h = float(crop_size[1])
+    else:
+        w = h = float(crop_size)
+    center = np.asarray(row["center_px_crop"], dtype=float).reshape(2)
+    return float(np.hypot(center[0] - 0.5 * w, center[1] - 0.5 * h))
+
+
+def _select_indices(ds: Any, args: argparse.Namespace) -> list[int]:
+    rows = getattr(ds, "_rows", None)
+    if rows is None:
+        indices = list(range(len(ds)))
+    else:
+        indices = []
+        for idx, row in enumerate(rows):
+            meta = dict(row.get("meta", {}))
+            if bool(args.require_jitter_applied) and not bool(meta.get("jitter_applied", False)):
+                continue
+            if _row_center_error_px(row) < float(args.min_center_error_px):
+                continue
+            indices.append(idx)
+
+    if bool(args.shuffle_samples):
+        rng = np.random.default_rng(int(args.sample_seed))
+        indices = list(rng.permutation(np.asarray(indices, dtype=int)).tolist())
+    if args.max_samples is not None:
+        indices = indices[: max(0, int(args.max_samples))]
+    return indices
+
+
+def _summary_stats(values: np.ndarray) -> dict[str, float | int]:
+    if values.size == 0:
+        return {
+            "count": 0,
+            "mean": 0.0,
+            "median": 0.0,
+            "p90": 0.0,
+        }
+    return {
+        "count": int(values.size),
+        "mean": float(values.mean()),
+        "median": float(np.median(values)),
+        "p90": float(np.percentile(values, 90)),
+    }
+
+
+def _success_rates(values: np.ndarray, thresholds: list[float]) -> dict[str, float]:
+    if values.size == 0:
+        return {f"pck_{thr:g}px": 0.0 for thr in thresholds}
+    return {f"pck_{thr:g}px": float(np.mean(values <= float(thr))) for thr in thresholds}
+
+
+def _stratified_metrics(rows: list[dict[str, Any]], edges: list[float]) -> list[dict[str, Any]]:
+    if len(edges) < 2:
+        return []
+    out: list[dict[str, Any]] = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        selected = [
+            r
+            for r in rows
+            if float(lo) <= float(r["center_baseline_pixel_error"]) < float(hi)
+        ]
+        px = _metric_array(selected, "pixel_error")
+        center = _metric_array(selected, "center_baseline_pixel_error")
+        item: dict[str, Any] = {
+            "offset_bin_px": f"[{lo:g},{hi:g})",
+            "count": int(len(selected)),
+        }
+        item.update({f"model_{k}": v for k, v in _summary_stats(px).items() if k != "count"})
+        item.update({f"center_{k}": v for k, v in _summary_stats(center).items() if k != "count"})
+        item["center_improve_ratio"] = (
+            float(1.0 - px.mean() / max(center.mean(), 1.0e-12))
+            if px.size and center.size
+            else 0.0
+        )
+        out.append(item)
+    return out
+
+
 def main() -> None:
     args = parse_args()
     torch = _import_torch()
@@ -176,12 +292,17 @@ def main() -> None:
         root=root,
         split=str(args.split),
         project_root=project_root,
-        max_samples=args.max_samples,
+        max_samples=None,
     )
+    eval_indices = _select_indices(ds, args)
+    if not eval_indices:
+        raise ValueError("No samples left after SeaDronesSee evaluation filters.")
+    success_thresholds = _parse_float_list(str(args.success_thresholds_px))
+    offset_bins = _parse_float_list(str(args.offset_bins_px))
 
     rows: list[dict[str, Any]] = []
     with torch.inference_mode():
-        for idx in range(len(ds)):
+        for out_idx, idx in enumerate(eval_indices):
             sample = ds[idx]
             x_np = _to_tensor_image(sample.image, input_size=input_size)
             x = torch.from_numpy(x_np).unsqueeze(0).to(device)
@@ -205,15 +326,18 @@ def main() -> None:
                 "gt_x_norm": float(gt[0]),
                 "gt_y_norm": float(gt[1]),
                 "pred_conf": float(conf),
+                "jitter_applied": bool(sample.meta.get("jitter_applied", False)),
             }
             rows.append(row)
-            if idx < int(args.visual_audit_count):
+            if out_idx < int(args.visual_audit_count):
                 vis = _make_visual(sample.image, pred_xy, gt[:2], err=err, label=model_type)
-                cv2.imwrite(str(audit_dir / f"{idx:04d}_{sample.sequence_id}_{sample.frame_id}.jpg"), vis)
+                cv2.imwrite(str(audit_dir / f"{out_idx:04d}_{sample.sequence_id}_{sample.frame_id}.jpg"), vis)
 
     px = _metric_array(rows, "pixel_error")
     center = _metric_array(rows, "center_baseline_pixel_error")
     valid_px = np.asarray([float(r["pixel_error"]) for r in rows if bool(r["valid"])], dtype=float)
+    model_stats = _summary_stats(px)
+    center_stats = _summary_stats(center)
     report = {
         "task": "eval_phase3_heatmap_on_seadronessee",
         "purpose": "frozen_external_validation",
@@ -222,7 +346,12 @@ def main() -> None:
             "root": str(root),
             "split": str(args.split),
             "num_eval": int(len(rows)),
+            "num_available": int(len(ds)),
             "max_samples": args.max_samples,
+            "shuffle_samples": bool(args.shuffle_samples),
+            "sample_seed": int(args.sample_seed),
+            "require_jitter_applied": bool(args.require_jitter_applied),
+            "min_center_error_px": float(args.min_center_error_px),
         },
         "checkpoint": {
             "weights": str(weights),
@@ -232,21 +361,27 @@ def main() -> None:
             "decode_method": str(args.decode_method),
         },
         "metrics": {
-            "pixel_error_mean": float(px.mean()) if px.size else 0.0,
-            "pixel_error_median": float(np.median(px)) if px.size else 0.0,
-            "pixel_error_p90": float(np.percentile(px, 90)) if px.size else 0.0,
+            "pixel_error_mean": float(model_stats["mean"]),
+            "pixel_error_median": float(model_stats["median"]),
+            "pixel_error_p90": float(model_stats["p90"]),
             "valid_pixel_error_mean": float(valid_px.mean()) if valid_px.size else 0.0,
             "valid_pixel_error_p90": float(np.percentile(valid_px, 90)) if valid_px.size else 0.0,
-            "center_baseline_pixel_error_mean": float(center.mean()) if center.size else 0.0,
+            "center_baseline_pixel_error_mean": float(center_stats["mean"]),
+            "center_baseline_pixel_error_median": float(center_stats["median"]),
+            "center_baseline_pixel_error_p90": float(center_stats["p90"]),
             "center_baseline_improve_ratio": float(1.0 - px.mean() / max(center.mean(), 1.0e-12))
             if px.size and center.size
             else 0.0,
+            "model_success_rates": _success_rates(px, success_thresholds),
+            "center_success_rates": _success_rates(center, success_thresholds),
+            "stratified_by_center_offset": _stratified_metrics(rows, offset_bins),
             "valid_count": int(sum(1 for r in rows if bool(r["valid"]))),
+            "jitter_applied_count": int(sum(1 for r in rows if bool(r.get("jitter_applied", False)))),
         },
         "caveats": [
             "This is frozen zero-shot evaluation of the formal Phase3 heatmap checkpoint; no training is performed.",
             "SeaDronesSee crops do not provide Phase3 world coordinates or GSD, so metrics are reported in crop pixels.",
-            "If crops are centered on the object, center-baseline comparison should be interpreted cautiously.",
+            "Center-prior and offset-stratified metrics are reported to separate visual localization from crop-center bias.",
         ],
         "artifacts": {
             "report_path": str(out_dir / "report.json"),
