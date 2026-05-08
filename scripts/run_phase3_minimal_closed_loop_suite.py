@@ -11,12 +11,18 @@ from typing import Any
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Run the minimal Paper2 closed-loop comparison suite: oracle, SNN no-KF, and KF ablations."
+        description="Run the Paper2 closed-loop ablation suite: oracle, SNN state-estimation ablations, and CNN baseline."
     )
     p.add_argument("--project-root", type=str, default=str(Path(__file__).resolve().parents[1]))
     p.add_argument("--config", type=str, default="configs/env.yaml")
     p.add_argument("--dataset-root", type=str, required=True)
     p.add_argument("--vision-weights", type=str, required=True)
+    p.add_argument(
+        "--cnn-vision-weights",
+        type=str,
+        default=None,
+        help="Optional CNN heatmap checkpoint for the CNN + KF/raw architecture baseline.",
+    )
     p.add_argument("--td3-checkpoint", type=str, required=True)
     p.add_argument("--vision-source", choices=["replay_dataset", "live_render", "phase3_map_live"], default="replay_dataset")
     p.add_argument("--render-config", type=str, default="configs/render_stage2_c_v1.yaml")
@@ -43,7 +49,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-oracle", action="store_true")
     p.add_argument("--skip-no-kf", action="store_true")
     p.add_argument("--skip-kf-raw", action="store_true")
-    p.add_argument("--skip-kf-pure", action="store_true")
+    p.add_argument("--skip-full-kf", action="store_true")
+    p.add_argument("--skip-cnn-kf-raw", action="store_true")
     p.add_argument("--skip-plot", action="store_true")
     return p.parse_args()
 
@@ -187,10 +194,10 @@ def main() -> None:
         cmd = _build_oracle_cmd(project_root=project_root, args=args, out_dir=oracle_dir)
         plan.append({"label": "oracle_true_target_v1", "out_dir": str(oracle_dir), "cmd": cmd})
         _run(cmd, cwd=project_root)
-        runs.append(("Oracle", oracle_dir))
+        runs.append(("Oracle-GT", oracle_dir))
 
     if not args.skip_no_kf:
-        no_kf_dir = out_root / "snn_no_kf_v2"
+        no_kf_dir = out_root / "snn_no_kf_v1"
         cmd = _build_vision_cmd(
             project_root=project_root,
             args=args,
@@ -198,12 +205,12 @@ def main() -> None:
             estimate_filter="none",
             terminal_controller="td3",
         )
-        plan.append({"label": "snn_no_kf_v2", "out_dir": str(no_kf_dir), "cmd": cmd})
+        plan.append({"label": "snn_no_kf_v1", "out_dir": str(no_kf_dir), "cmd": cmd})
         _run(cmd, cwd=project_root)
         runs.append(("SNN no KF", no_kf_dir))
 
     if not args.skip_kf_raw:
-        kf_raw_dir = out_root / "snn_kf_terminal_raw_v3"
+        kf_raw_dir = out_root / "snn_kf_raw_v1"
         cmd = _build_vision_cmd(
             project_root=project_root,
             args=args,
@@ -212,23 +219,42 @@ def main() -> None:
             terminal_controller="td3",
             kf_terminal_mode="raw",
         )
-        plan.append({"label": "snn_kf_terminal_raw_v3", "out_dir": str(kf_raw_dir), "cmd": cmd})
+        plan.append({"label": "snn_kf_raw_v1", "out_dir": str(kf_raw_dir), "cmd": cmd})
         _run(cmd, cwd=project_root)
-        runs.append(("SNN KF terminal raw", kf_raw_dir))
+        runs.append(("SNN KF/raw", kf_raw_dir))
 
-    if not args.skip_kf_pure:
-        kf_pure_dir = out_root / "snn_kf_terminal_pure_v1"
+    if not args.skip_full_kf:
+        full_kf_dir = out_root / "snn_full_kf_v1"
         cmd = _build_vision_cmd(
             project_root=project_root,
             args=args,
-            out_dir=kf_pure_dir,
+            out_dir=full_kf_dir,
             estimate_filter="kalman",
-            terminal_controller="pure_pursuit",
+            terminal_controller="td3",
+            kf_terminal_mode="kalman",
+        )
+        plan.append({"label": "snn_full_kf_v1", "out_dir": str(full_kf_dir), "cmd": cmd})
+        _run(cmd, cwd=project_root)
+        runs.append(("SNN full-KF", full_kf_dir))
+
+    if not args.skip_cnn_kf_raw:
+        if args.cnn_vision_weights is None:
+            raise ValueError("--cnn-vision-weights is required unless --skip-cnn-kf-raw is set.")
+        cnn_args = argparse.Namespace(**vars(args))
+        cnn_args.vision_weights = args.cnn_vision_weights
+        cnn_args.vision_model = "cnn_heatmap"
+        cnn_dir = out_root / "cnn_kf_raw_v1"
+        cmd = _build_vision_cmd(
+            project_root=project_root,
+            args=cnn_args,
+            out_dir=cnn_dir,
+            estimate_filter="kalman",
+            terminal_controller="td3",
             kf_terminal_mode="raw",
         )
-        plan.append({"label": "snn_kf_terminal_pure_v1", "out_dir": str(kf_pure_dir), "cmd": cmd})
+        plan.append({"label": "cnn_kf_raw_v1", "out_dir": str(cnn_dir), "cmd": cmd})
         _run(cmd, cwd=project_root)
-        runs.append(("SNN KF terminal pure pursuit", kf_pure_dir))
+        runs.append(("CNN KF/raw", cnn_dir))
 
     (out_root / "run_plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
 
