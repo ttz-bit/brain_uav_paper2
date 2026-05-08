@@ -23,6 +23,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--splits", nargs="+", default=["train", "val"], choices=["train", "val", "test"])
     parser.add_argument("--crop-size", type=int, default=128, help="Square crop size")
+    parser.add_argument(
+        "--crop-mode",
+        type=str,
+        default="center",
+        choices=["center", "jitter"],
+        help="center keeps the object at crop center; jitter offsets the crop center for localization evaluation.",
+    )
+    parser.add_argument(
+        "--jitter-max-ratio",
+        type=float,
+        default=0.35,
+        help="Max absolute crop-center jitter as a fraction of crop size when --crop-mode=jitter.",
+    )
+    parser.add_argument(
+        "--jitter-min-ratio",
+        type=float,
+        default=0.08,
+        help="Min jitter radius as a fraction of crop size when --crop-mode=jitter.",
+    )
+    parser.add_argument("--seed", type=int, default=20260508, help="Seed used for deterministic jitter crops")
     parser.add_argument("--max-sequences", type=int, default=None, help="Process first N sequences only")
     parser.add_argument("--qc-per-split", type=int, default=30, help="Save at most N QC samples per split")
     parser.add_argument(
@@ -117,6 +137,44 @@ def make_center_crop(
     if crop.shape[0] != crop_size or crop.shape[1] != crop_size:
         crop = cv2.resize(crop, (crop_size, crop_size), interpolation=cv2.INTER_LINEAR)
     return crop, crop_box_xyxy
+
+
+def sample_jittered_crop_center(
+    center_x: float,
+    center_y: float,
+    *,
+    bbox_w: float,
+    bbox_h: float,
+    crop_size: int,
+    img_w: int,
+    img_h: int,
+    rng: np.random.Generator,
+    min_ratio: float,
+    max_ratio: float,
+) -> tuple[float, float, bool]:
+    """Sample a crop center that keeps the object visible but away from dead center."""
+    half = float(crop_size) * 0.5
+    min_j = max(0.0, float(min_ratio) * float(crop_size))
+    max_j = max(min_j, float(max_ratio) * float(crop_size))
+    obj_half_diag = 0.5 * float(np.hypot(float(bbox_w), float(bbox_h)))
+    max_visible_offset = max(0.0, half - obj_half_diag - 2.0)
+    max_j = min(max_j, max_visible_offset)
+    if max_j <= 1e-6:
+        return float(center_x), float(center_y), False
+
+    for _ in range(64):
+        radius = float(rng.uniform(min_j, max_j))
+        theta = float(rng.uniform(-np.pi, np.pi))
+        # Crop center is shifted away from the object center; object appears at the opposite offset in the crop.
+        crop_cx = float(center_x) + radius * float(np.cos(theta))
+        crop_cy = float(center_y) + radius * float(np.sin(theta))
+        x1 = crop_cx - half
+        y1 = crop_cy - half
+        x2 = crop_cx + half
+        y2 = crop_cy + half
+        if x1 >= 0.0 and y1 >= 0.0 and x2 <= float(img_w) and y2 <= float(img_h):
+            return crop_cx, crop_cy, True
+    return float(center_x), float(center_y), False
 
 
 def draw_bbox_overlay(img: np.ndarray, bbox_xywh: tuple[int, int, int, int]) -> np.ndarray:
@@ -230,6 +288,10 @@ def process_split(
     qc_per_split: int,
     length_mismatch_policy: str,
     overwrite: bool,
+    crop_mode: str,
+    jitter_min_ratio: float,
+    jitter_max_ratio: float,
+    seed: int,
 ) -> tuple[dict[str, Any], set[str]]:
     json_path = raw_root / "sot" / f"SeaDronesSee_{split}.json"
     ann_dir = raw_root / "sot" / ("test_annotations_first_frame" if split == "test" else f"{split}_annotations")
@@ -266,7 +328,13 @@ def process_split(
         "length_mismatch_total_extra_frames": 0,
         "length_mismatch_total_extra_annotations": 0,
         "length_mismatch_policy": length_mismatch_policy,
+        "crop_mode": crop_mode,
+        "jitter_min_ratio": float(jitter_min_ratio),
+        "jitter_max_ratio": float(jitter_max_ratio),
+        "jitter_fallback_center_count": 0,
     }
+    split_seed = int(seed) + sum(ord(ch) for ch in str(split))
+    rng = np.random.default_rng(split_seed)
 
     for seq_id in tqdm(seq_ids, desc=f"Processing {split}"):
         seq_map = data[seq_id]
@@ -357,14 +425,33 @@ def process_split(
             ):
                 summary["boundary_crop_count"] += 1
 
-            crop, crop_box_xyxy = make_center_crop(img, center_x, center_y, crop_size)
+            crop_center_x = center_x
+            crop_center_y = center_y
+            jitter_applied = False
+            if str(crop_mode) == "jitter":
+                crop_center_x, crop_center_y, jitter_applied = sample_jittered_crop_center(
+                    center_x,
+                    center_y,
+                    bbox_w=float(w),
+                    bbox_h=float(h),
+                    crop_size=int(crop_size),
+                    img_w=int(img_w),
+                    img_h=int(img_h),
+                    rng=rng,
+                    min_ratio=float(jitter_min_ratio),
+                    max_ratio=float(jitter_max_ratio),
+                )
+                if not jitter_applied:
+                    summary["jitter_fallback_center_count"] += 1
+
+            crop, crop_box_xyxy = make_center_crop(img, crop_center_x, crop_center_y, crop_size)
             crop_x1, crop_y1, _, _ = crop_box_xyxy
             center_crop = (center_x - float(crop_x1), center_y - float(crop_y1))
             bbox_crop = (x - float(crop_x1), y - float(crop_y1), float(w), float(h))
             frame_id = Path(local_frame_name).stem
             crop_name = f"seq_{int(seq_id):04d}_frame_{frame_id}.png"
             crop_path = crops_dir / crop_name
-            crop_rel = f"data/processed/seadronessee/crops/{split}/{crop_name}"
+            crop_rel = str(crop_path.resolve()).replace("\\", "/")
             if overwrite or (not crop_path.exists()):
                 cv2.imwrite(str(crop_path), crop)
 
@@ -384,6 +471,18 @@ def process_split(
                 crop_box_xyxy=crop_box_xyxy,
                 img_w=img_w,
                 img_h=img_h,
+            )
+            record.setdefault("meta", {})
+            record["meta"].update(
+                {
+                    "crop_mode": str(crop_mode),
+                    "jitter_applied": bool(jitter_applied),
+                    "crop_center_px_source": [float(crop_center_x), float(crop_center_y)],
+                    "target_offset_from_crop_center_px": [
+                        float(center_crop[0]) - 0.5 * float(crop_size),
+                        float(center_crop[1]) - 0.5 * float(crop_size),
+                    ],
+                }
             )
             try:
                 validate_record(record)
@@ -470,6 +569,10 @@ def main() -> None:
             qc_per_split=args.qc_per_split,
             length_mismatch_policy=args.length_mismatch_policy,
             overwrite=args.overwrite,
+            crop_mode=str(args.crop_mode),
+            jitter_min_ratio=float(args.jitter_min_ratio),
+            jitter_max_ratio=float(args.jitter_max_ratio),
+            seed=int(args.seed),
         )
         split_to_sequences[split] = seqs
         split_summaries[split] = summary
