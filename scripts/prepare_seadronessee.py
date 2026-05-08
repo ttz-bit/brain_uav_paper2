@@ -159,7 +159,7 @@ def sample_jittered_crop_center(
     obj_half_diag = 0.5 * float(np.hypot(float(bbox_w), float(bbox_h)))
     max_visible_offset = max(0.0, half - obj_half_diag - 2.0)
     max_j = min(max_j, max_visible_offset)
-    if max_j <= 1e-6:
+    if max_j <= 1e-6 or max_j < min_j:
         return float(center_x), float(center_y), False
 
     for _ in range(64):
