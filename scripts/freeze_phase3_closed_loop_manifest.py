@@ -120,6 +120,11 @@ def _as_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
+def _is_boundary_failure(row: dict[str, Any]) -> bool:
+    reason = str(row.get("done_reason", "")).strip().lower()
+    return (not _as_bool(row.get("captured", False))) and reason in {"out_of_bounds", "target_out_of_bounds"}
+
+
 def _reason_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for row in rows:
@@ -144,6 +149,30 @@ def _non_captured(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def _valid_capture_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(rows)
+    captured = sum(1 for row in rows if _as_bool(row.get("captured", False)))
+    valid_rows = [row for row in rows if not _is_boundary_failure(row)]
+    valid_captured = sum(1 for row in valid_rows if _as_bool(row.get("captured", False)))
+    boundary_failures = [
+        {
+            "episode": int(row.get("episode", -1)),
+            "seed": int(row.get("seed", -1)),
+            "done_reason": str(row.get("done_reason", "unknown")),
+        }
+        for row in rows
+        if _is_boundary_failure(row)
+    ]
+    return {
+        "capture": f"{captured}/{total}",
+        "capture_rate": float(captured / max(1, total)),
+        "valid_capture": f"{valid_captured}/{len(valid_rows)}",
+        "valid_capture_rate": float(valid_captured / max(1, len(valid_rows))),
+        "boundary_failure_count": int(len(boundary_failures)),
+        "boundary_failure_episodes": boundary_failures,
+    }
 
 
 def _metric(report: dict[str, Any], key: str) -> Any:
@@ -211,6 +240,7 @@ def _run_manifest(label: str, run_dir: Path, *, hash_large_files: bool) -> dict[
         "episode_outcomes": {
             "done_reason_counts": _reason_counts(summary_rows),
             "non_captured_episodes": _non_captured(summary_rows),
+            "valid_capture_summary": _valid_capture_summary(summary_rows),
         },
         "acceptance": report.get("acceptance", {}),
     }

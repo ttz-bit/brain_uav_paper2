@@ -126,6 +126,11 @@ def _as_bool(value: Any) -> bool:
     return text in {"1", "true", "yes", "y"}
 
 
+def _is_boundary_failure(row: dict[str, Any]) -> bool:
+    reason = str(row.get("done_reason", "")).strip().lower()
+    return (not _as_bool(row.get("captured", False))) and reason in {"out_of_bounds", "target_out_of_bounds"}
+
+
 def _reason_counts(run: RunAudit) -> dict[str, int]:
     counts: dict[str, int] = {}
     for row in run.summary_rows:
@@ -150,6 +155,30 @@ def _non_captured_episodes(run: RunAudit) -> list[dict[str, Any]]:
             }
         )
     return episodes
+
+
+def _valid_capture_summary(run: RunAudit) -> dict[str, Any]:
+    total = len(run.summary_rows)
+    captured = sum(1 for row in run.summary_rows if _as_bool(row.get("captured", False)))
+    valid_rows = [row for row in run.summary_rows if not _is_boundary_failure(row)]
+    valid_captured = sum(1 for row in valid_rows if _as_bool(row.get("captured", False)))
+    boundary_failures = [
+        {
+            "episode": int(row.get("episode", -1)),
+            "seed": int(row.get("seed", -1)),
+            "done_reason": str(row.get("done_reason", "unknown")),
+        }
+        for row in run.summary_rows
+        if _is_boundary_failure(row)
+    ]
+    return {
+        "capture": f"{captured}/{total}",
+        "capture_rate": float(captured / max(1, total)),
+        "valid_capture": f"{valid_captured}/{len(valid_rows)}",
+        "valid_capture_rate": float(valid_captured / max(1, len(valid_rows))),
+        "boundary_failure_count": int(len(boundary_failures)),
+        "boundary_failure_episodes": boundary_failures,
+    }
 
 
 def _metric(report: dict[str, Any], key: str) -> Any:
@@ -243,11 +272,21 @@ def main() -> None:
 
     vision_runs = [r for r in runs if r.report.get("task") == "run_phase3_vision_td3"]
     if vision_runs:
+        missing_capture_mode = [r.label for r in vision_runs if "capture_mode" not in r.report]
+        if missing_capture_mode:
+            _add_check(
+                checks,
+                "vision_capture_mode_present",
+                False,
+                {"missing_in": missing_capture_mode},
+                severity="warning",
+            )
+        vision_runs_with_capture_mode = [r for r in vision_runs if "capture_mode" in r.report]
         _add_check(
             checks,
             "vision_capture_mode",
-            all(str(r.report.get("capture_mode", "")) == str(args.expected_capture_mode) for r in vision_runs),
-            {r.label: r.report.get("capture_mode") for r in vision_runs},
+            all(str(r.report.get("capture_mode", "")) == str(args.expected_capture_mode) for r in vision_runs_with_capture_mode),
+            {r.label: r.report.get("capture_mode") for r in vision_runs_with_capture_mode},
         )
         _add_check(
             checks,
@@ -303,6 +342,18 @@ def main() -> None:
         non_captured_episode_sets,
         severity="warning",
     )
+    boundary_failure_sets = {
+        r.label: [int(item["episode"]) for item in _valid_capture_summary(r)["boundary_failure_episodes"]]
+        for r in runs
+    }
+    first_boundary_failures = next(iter(boundary_failure_sets.values()))
+    _add_check(
+        checks,
+        "boundary_failure_episode_sets_identical",
+        all(v == first_boundary_failures for v in boundary_failure_sets.values()),
+        boundary_failure_sets,
+        severity="warning",
+    )
 
     for r in runs:
         metrics = dict(r.report.get("metrics", {}))
@@ -347,6 +398,7 @@ def main() -> None:
                 "live_render_failure_count": _metric(r.report, "live_render_failure_count"),
                 "live_render_reanchor_count": _metric(r.report, "live_render_reanchor_count"),
                 "vision_gate_rejection_rate": _metric(r.report, "vision_gate_rejection_rate"),
+                "valid_capture_summary": _valid_capture_summary(r),
                 "done_reason_counts": _reason_counts(r),
                 "non_captured_episodes": non_captured_by_run[r.label],
             }

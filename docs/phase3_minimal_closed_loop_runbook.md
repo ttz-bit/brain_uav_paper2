@@ -110,6 +110,11 @@ Recommended table columns:
 
 `Method`, `Capture`, `Valid Capture`, `Est. Err. (m)`, `Vision Err. (m)`, `Hard Viol.`, `Safety Margin`.
 
+`Capture` is the overall true-target capture over all paired episodes, e.g. `62/64`.
+`Valid Capture` excludes common non-captured boundary failures with `done_reason` equal to
+`out_of_bounds` or `target_out_of_bounds`, e.g. `62/62`. It is not a hard-zone safety metric.
+Hard no-fly-zone violations remain reported separately as `Hard Viol.`.
+
 ## What to write in the paper
 
 - Filtering slightly improves SNN estimation accuracy, if the measured gain is small.
