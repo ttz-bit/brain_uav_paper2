@@ -1,0 +1,6 @@
+method,capture,total,valid_capture,valid_total,est_err_m,vision_err_m,hard_viol,safety_margin,role
+Oracle-GT,62,64,62,62,0.00,,0,1687,upper_bound
+SNN no-KF,62,64,62,62,39.22,39.22,0,1675,raw_visual
+SNN KF/raw,62,64,62,62,37.48,42.88,0,1667,main
+SNN full-KF,62,64,62,62,37.42,42.88,0,1667,terminal_sensitivity
+CNN KF/raw,62,64,62,62,26.40,29.93,0,1705,architecture_baseline
