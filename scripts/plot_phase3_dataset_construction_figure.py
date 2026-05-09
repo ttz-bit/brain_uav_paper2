@@ -39,6 +39,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Omit the figure-level title for compact paper layouts.",
     )
+    p.add_argument(
+        "--show-range-label",
+        action="store_true",
+        help="Include target range in the stage panels. Disabled by default for cleaner paper figures.",
+    )
+    p.add_argument(
+        "--show-composition-arrow",
+        action="store_true",
+        help="Draw a dashed arrow in the rendered-composition panel. Disabled by default for cleaner paper figures.",
+    )
     p.add_argument("--output-dir", type=str, default="outputs/reports/phase3_dataset_construction")
     p.add_argument("--dpi", type=int, default=300)
     return p.parse_args()
@@ -189,7 +199,7 @@ def _select_stage_triplet(
     return selected[0], selected[1], selected[2]
 
 
-def _draw_label(ax: plt.Axes, row: dict[str, Any], *, color: str = "#c00000", show_text: bool = True) -> None:
+def _draw_label(ax: plt.Axes, row: dict[str, Any], *, color: str = "#b22222", show_text: bool = True) -> None:
     cx, cy = [float(v) for v in row["target_center_px"]]
     x, y, w, h = [float(v) for v in row["bbox_xywh"]]
     ax.add_patch(Rectangle((x, y), w, h, fill=False, edgecolor=color, linewidth=1.1))
@@ -252,7 +262,7 @@ def main() -> None:
     fig, axes = plt.subplots(2, 4, figsize=(11.2, 5.55), constrained_layout=True)
     axes = axes.ravel()
 
-    _imshow(axes[0], background, "(a) Maritime background crop")
+    _imshow(axes[0], background, "(a) Maritime map crop")
     axes[0].text(
         0.03,
         0.95,
@@ -260,7 +270,7 @@ def main() -> None:
         transform=axes[0].transAxes,
         ha="left",
         va="top",
-        fontsize=7.3,
+        fontsize=7.0,
         bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.74, "pad": 1.2},
     )
 
@@ -276,14 +286,15 @@ def main() -> None:
         bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.74, "pad": 1.2},
     )
 
-    _imshow(axes[2], rendered, "(c) Copy-paste composition")
+    _imshow(axes[2], rendered, "(c) Rendered composition")
     _draw_label(axes[2], flow_row, show_text=False)
-    axes[2].annotate(
-        "",
-        xy=tuple(float(v) for v in flow_row["target_center_px"]),
-        xytext=(35, 35),
-        arrowprops={"arrowstyle": "->", "color": "#c00000", "lw": 1.2, "linestyle": "--"},
-    )
+    if bool(args.show_composition_arrow):
+        axes[2].annotate(
+            "",
+            xy=tuple(float(v) for v in flow_row["target_center_px"]),
+            xytext=(35, 35),
+            arrowprops={"arrowstyle": "->", "color": "#b22222", "lw": 1.0, "linestyle": "--"},
+        )
 
     _imshow(axes[3], rendered, "(d) Pixel annotation")
     _draw_label(axes[3], flow_row)
@@ -297,14 +308,17 @@ def main() -> None:
         scale = float(row.get("scale_px", row.get("target_length_px", 0.0)))
         gsd = float(row.get("gsd_m_per_px", 0.0))
         rng = float(row.get("meta", {}).get("range_xy_km", float("nan")))
+        stage_lines = [f"GSD {gsd:.0f} m/px", f"length {scale:.0f} px"]
+        if bool(args.show_range_label):
+            stage_lines.insert(1, f"range {rng:.0f} km")
         ax.text(
             0.03,
             0.95,
-            f"GSD {gsd:.1f} m/px\nrange {rng:.0f} km\nlength {scale:.0f} px",
+            "\n".join(stage_lines),
             transform=ax.transAxes,
             ha="left",
             va="top",
-            fontsize=7.0,
+            fontsize=6.9,
             bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.74, "pad": 1.2},
         )
 
@@ -329,10 +343,10 @@ def main() -> None:
     axes[7].text(
         0.5,
         0.42,
-        "UAV pose +\ncamera geometry",
+        r"$\Pi^{-1}(p_t,\mathrm{pose}_t,K)$",
         ha="center",
         va="center",
-        fontsize=9,
+        fontsize=10,
         bbox={"boxstyle": "round,pad=0.30", "facecolor": "#f7f7f7", "edgecolor": "#999999"},
     )
     axes[7].annotate(
