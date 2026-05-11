@@ -17,3 +17,11 @@ build/
 *.egg-info/
 data/raw/
 data/processed/
+.claude/
+.pycache_tmp/
+tmp_render/
+tmp_render_node/
+tmp_render_node2/
+_paper2_render/
+_paper2_render_verbose/
+deepseek_test.py

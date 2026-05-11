@@ -14,6 +14,17 @@ Current focus:
 - generate and freeze the Stage 2C formal rendered dataset for Paper 2;
 - keep closed-loop bridge as placeholder until Paper 1 physical calibration is finalized.
 
+## Paper 2 Manuscript Note
+
+The current Paper 2 manuscript in `C:\Users\24104\Desktop\论文2.docx` follows the same story as this repo:
+
+- a frozen downstream TD3 planner;
+- a visual heatmap front end plus stage-aware state estimation;
+- a task-style test split with the reported 23.86 m vs 148.45 m overall vision error;
+- a closed-loop result set that keeps capture at 62/64 while showing the CNN baseline is still competitive in the current aggregation.
+
+The detailed consistency check and submission notes live in `docs/paper2_draft_consistency_review.md`.
+
 ## Current Milestone Status
 
 - Phase 1A: interface/protocol freeze in place.
